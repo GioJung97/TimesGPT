@@ -160,9 +160,9 @@ if subsample_size != None:
     test_subset = Subset(test_dataset, test_subset_indices)
     test_dataloader = DataLoader(test_subset, batch_size=batch_size)
 
-    print("DWBUG len(train_dataloader): ", len(train_dataloader))
-    print("DWBUG len(val_dataloader): ", len(val_dataloader))
-    print("DWBUG len(test_dataloader): ", len(test_dataloader))
+    print("DEBUG len(train_dataloader): ", len(train_dataloader))
+    print("DEBUG len(val_dataloader): ", len(val_dataloader))
+    print("DEBUG len(test_dataloader): ", len(test_dataloader))
 
 # Train and Val
 for epoch in range(num_epochs):
@@ -216,7 +216,6 @@ ground_truth_captions = []
 ground_truth_tokens = []
 all_filenames = []
 
-# BLEUScore, Perplexity, WordErrorRate, WordInformationLost, WordInformationPreserved
 bleu1_metric = BLEUScore(n_gram=1)
 bleu2_metric = BLEUScore(n_gram=2)
 bleu3_metric = BLEUScore(n_gram=3)
@@ -229,19 +228,6 @@ cider_metric = Cider()
 meteor_metric = Meteor()
 rouge_metric = Rouge()
 spice_metric = Spice()
-
-# bleu1_metric_accumulator = 0
-# bleu2_metric_accumulator = 0
-# bleu3_metric_accumulator = 0
-# bleu4_metric_accumulator = 0
-# perplexity_metric_accumulator = 0
-# word_error_rate_accumulator = 0
-# word_info_lost_accumulator = 0
-# word_info_preserved_accumulator = 0
-# cider_accumulator = 0
-# meteor_accumulator = 0
-# rouge_accumulator = 0
-# spice_accumulator = 0
 
 gen_kwargs = {
     "min_length": min_caption_length,
@@ -262,40 +248,20 @@ for batch in test_dataloader:
         loss = outputs.loss
         total_val_loss += loss.item()
 
-        # print("DEBUG type(batch):", type(batch))
-        # print("DEBUG type(batch['labels']):", type(batch['labels']))
-        # print("DEBUG batch['labels'].shape:", batch['labels'].shape)
-        # print("DEBUG inputs['labels'].shape:", inputs['labels'].shape)
-        # Caption predictions on test set
-        
-        # print("DEBUG tokenizer.pad_token: ", tokenizer.pad_token)
         tokens = model.generate(**inputs, **gen_kwargs)
-        # model
-        # tokens = F.pad(tokens, (0, 1024 - tokens.shape[1]), "constant", 50256)
-
         predicted_tokens.extend(tokens)
         
         decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
         predicted_captions.extend(decoded_predicted_caption)
-        # print("DEBUG tokens.shape:", tokens.shape)
         
-        # ground_truth_caption = batch["labels"].squeeze()
         ground_truth_caption = inputs['labels'].squeeze()
         ground_truth_tokens.extend(ground_truth_caption)
         
-        # print("DEBUG type(ground_truth_caption):", type(ground_truth_caption))
         decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
         ground_truth_captions.extend(decoded_ground_truth_caption)
 
         all_filenames.extend(batch['filenames'])
 
-# print("DEBUG ground_truth_tokens:", ground_truth_tokens)        
-# print("DEBUG predicted_tokens:", predicted_tokens)
-# print("DEBUG len predicted_captions:", predicted_captions)
-# print("DEBUG len ground_truth_captions:", ground_truth_captions)
-# print("DEBUG len ground_truth_tokens:", ground_truth_tokens)        
-# print("DEBUG len predicted_tokens:", predicted_tokens)
-# print(dict(zip(all_filenames, ground_truth_captions)).keys())
 print("DEBUG predicted_captions:", predicted_captions)
 print("DEBUG ground_truth_captions:", ground_truth_captions)
 metrics_dict = {}       
@@ -304,27 +270,15 @@ metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_tru
 metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
 metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
 metrics_dict["blue4_score"] = bleu4_metric.update(predicted_captions, ground_truth_captions).compute().item()
-
-# predicted_tokens = torch.stack([x for x in predicted_tokens], dim=0).unsqueeze(dim=-1)
-# ground_truth_tokens = torch.stack([x for x in ground_truth_tokens], dim=0)
-# print("DEBUG predicted_tokens.shape:", predicted_tokens.shape)
-# print("DEBUG ground_truth_tokens.shape:", ground_truth_tokens.shape)
 # metrics_dict["perplexity_score"] = perplexity_metric.update(predicted_tokens, ground_truth_tokens).compute()
-
-
 metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(predicted_captions, ground_truth_captions).compute().item()
 metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(predicted_captions, ground_truth_captions).compute().item()
 metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(predicted_captions, ground_truth_captions).compute().item()
 
-
 ground_truth_captions = [[x] for x in ground_truth_captions]
 predicted_captions = [[x] for x in predicted_captions]
-# print("DEBUG predicted_captions:", predicted_captions)
-# print("DEBUG ground_truth_captions:", ground_truth_captions)
 ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions))
 predicted_captions_dict = dict((zip(all_filenames, predicted_captions)))
-# print("DEBUG ground_truth_captions_dict: ", ground_truth_captions_dict)
-# print("DEBUG predicted_captions_dict: ", predicted_captions_dict)
 metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
 metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
 metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
