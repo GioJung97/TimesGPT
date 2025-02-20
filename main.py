@@ -11,10 +11,12 @@ from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoder
 # from transformers import AutoModelForSequenceClassification, AutoTokenizer, AdamW
 from datasets import load_dataset
 from torcheval.metrics.text import BLEUScore, Perplexity, WordErrorRate, WordInformationLost, WordInformationPreserved
+
 from pycocoevalcap.meteor.meteor import Meteor
 from pycocoevalcap.rouge.rouge import Rouge
 from pycocoevalcap.cider.cider import Cider
 from pycocoevalcap.spice.spice import Spice
+import torch.nn.functional as F
 
 # parse command line args here
 parser = argparse.ArgumentParser()
@@ -83,17 +85,17 @@ class NPZDataset(Dataset):
         file_path = os.path.join(self.data_dir, self.file_names[idx])
         data = np.load(file_path)
         # Each .npz file contains 'arr_o' and 'arr_1', images and captions
-        sample = {'filenames': file_path, 
+        sample = {'filenames': self.file_names[idx], 
                   'pixel_values': torch.from_numpy(data['arr_0']), 
                   'labels': torch.from_numpy(data['arr_1'])}
         return sample
 
 seed = 8675309
-num_epochs = 20
+num_epochs = 3
 batch_size = 12
 learning_rate = 0.001
-learning_rate_decay = 0.10
-subsample_size = .5 # None disables
+learning_rate_decay = 0.5
+subsample_size = .1 # None disables
 max_caption_length = 500
 min_caption_length = 10
 num_beams = 3
@@ -138,7 +140,6 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.model_max_length = max_caption_length
 tokenizer.max_length = max_caption_length
-
 model.config.decoder_start_token_id = tokenizer.bos_token_id
 model.config.pad_token_id = tokenizer.pad_token_id
 model.config.max_length = max_caption_length
@@ -158,6 +159,10 @@ if subsample_size != None:
     test_subset_indices = range(0, int(len(test_dataloader) * subsample_size))
     test_subset = Subset(test_dataset, test_subset_indices)
     test_dataloader = DataLoader(test_subset, batch_size=batch_size)
+
+    print("DWBUG len(train_dataloader): ", len(train_dataloader))
+    print("DWBUG len(val_dataloader): ", len(val_dataloader))
+    print("DWBUG len(test_dataloader): ", len(test_dataloader))
 
 # Train and Val
 for epoch in range(num_epochs):
@@ -180,7 +185,7 @@ for epoch in range(num_epochs):
         print(f"Step: {step_num}/{steps_total}, Training Loss: {loss.item()}")
         wandb.log({"train_loss": loss.item(), 'train_learning_rate': learning_rate})
         step_num += 1
-    learning_rate *= learning_rate_decay
+    learning_rate = learning_rate - (learning_rate * learning_rate_decay)
 
     # Validation
     model.eval()
@@ -260,37 +265,70 @@ for batch in test_dataloader:
         # print("DEBUG type(batch):", type(batch))
         # print("DEBUG type(batch['labels']):", type(batch['labels']))
         # print("DEBUG batch['labels'].shape:", batch['labels'].shape)
+        # print("DEBUG inputs['labels'].shape:", inputs['labels'].shape)
         # Caption predictions on test set
+        
+        # print("DEBUG tokenizer.pad_token: ", tokenizer.pad_token)
         tokens = model.generate(**inputs, **gen_kwargs)
-        # print("DEBUG tokens:", tokens)
+        # model
+        # tokens = F.pad(tokens, (0, 1024 - tokens.shape[1]), "constant", 50256)
+
         predicted_tokens.extend(tokens)
+        
         decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
         predicted_captions.extend(decoded_predicted_caption)
+        # print("DEBUG tokens.shape:", tokens.shape)
         
-        ground_truth_caption = batch["labels"].squeeze()
+        # ground_truth_caption = batch["labels"].squeeze()
+        ground_truth_caption = inputs['labels'].squeeze()
         ground_truth_tokens.extend(ground_truth_caption)
+        
         # print("DEBUG type(ground_truth_caption):", type(ground_truth_caption))
         decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
         ground_truth_captions.extend(decoded_ground_truth_caption)
 
         all_filenames.extend(batch['filenames'])
 
+# print("DEBUG ground_truth_tokens:", ground_truth_tokens)        
+# print("DEBUG predicted_tokens:", predicted_tokens)
+# print("DEBUG len predicted_captions:", predicted_captions)
+# print("DEBUG len ground_truth_captions:", ground_truth_captions)
+# print("DEBUG len ground_truth_tokens:", ground_truth_tokens)        
+# print("DEBUG len predicted_tokens:", predicted_tokens)
+# print(dict(zip(all_filenames, ground_truth_captions)).keys())
 print("DEBUG predicted_captions:", predicted_captions)
-# print("DEBUG ground_truth_captions:", ground_truth_captions)
+print("DEBUG ground_truth_captions:", ground_truth_captions)
 metrics_dict = {}       
 metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
 metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
 metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
 metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
 metrics_dict["blue4_score"] = bleu4_metric.update(predicted_captions, ground_truth_captions).compute().item()
-# metrics_dict["perplexity_score"] = perplexity_metric.update(np.asarray([predicted_tokens]), np.asarray([ground_truth_tokens])).compute()
+
+# predicted_tokens = torch.stack([x for x in predicted_tokens], dim=0).unsqueeze(dim=-1)
+# ground_truth_tokens = torch.stack([x for x in ground_truth_tokens], dim=0)
+# print("DEBUG predicted_tokens.shape:", predicted_tokens.shape)
+# print("DEBUG ground_truth_tokens.shape:", ground_truth_tokens.shape)
+# metrics_dict["perplexity_score"] = perplexity_metric.update(predicted_tokens, ground_truth_tokens).compute()
+
+
 metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(predicted_captions, ground_truth_captions).compute().item()
 metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(predicted_captions, ground_truth_captions).compute().item()
 metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(predicted_captions, ground_truth_captions).compute().item()
-# metrics_dict["cider_score"] = Cider().compute_score(dict(zip(all_filenames, ground_truth_tokens)), dict((zip(all_filenames, predicted_tokens))))
-# metrics_dict["meteor_score"] = Meteor().compute_score(dict(zip(all_filenames, ground_truth_tokens)), dict((zip(all_filenames, predicted_tokens))))
-# metrics_dict["rouge_score"] = Rouge().compute_score(dict(zip(all_filenames, ground_truth_tokens)), dict((zip(all_filenames, predicted_tokens))))
-# metrics_dict["spice_score"] = Spice().compute_score(dict(zip(all_filenames, ground_truth_tokens)), dict((zip(all_filenames, predicted_tokens))))
+
+
+ground_truth_captions = [[x] for x in ground_truth_captions]
+predicted_captions = [[x] for x in predicted_captions]
+# print("DEBUG predicted_captions:", predicted_captions)
+# print("DEBUG ground_truth_captions:", ground_truth_captions)
+ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions))
+predicted_captions_dict = dict((zip(all_filenames, predicted_captions)))
+# print("DEBUG ground_truth_captions_dict: ", ground_truth_captions_dict)
+# print("DEBUG predicted_captions_dict: ", predicted_captions_dict)
+metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+metrics_dict["spice_score"], _ = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
 
 print(f"Epoch {epoch+1} completed, average test loss: {metrics_dict['avg_test_loss']}")
 print(metrics_dict)
