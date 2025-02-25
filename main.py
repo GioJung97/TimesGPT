@@ -18,6 +18,7 @@ from pycocoevalcap.cider.cider import Cider
 from pycocoevalcap.spice.spice import Spice
 import torch.nn.functional as F
 
+
 # parse command line args here
 parser = argparse.ArgumentParser()
 parser.add_argument('-ep', '--epochs', type=int, default=2, 
@@ -95,11 +96,13 @@ num_epochs = 3
 batch_size = 12
 learning_rate = 0.001
 learning_rate_decay = 0.5
-subsample_size = .1 # None disables
+subsample_size = .02 # 1 or None disables
 max_caption_length = 500
 min_caption_length = 10
-num_beams = 3
+num_beams = 4
+pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 data_dir = '/data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/'
+output_dir = "./output"
 train_data_dir = os.path.join(data_dir, 'train') 
 val_data_dir = os.path.join(data_dir, 'val')
 test_data_dir = os.path.join(data_dir, 'test')
@@ -107,18 +110,27 @@ random.seed(seed)
 torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+experiment_name = 'fine_tuning_bs'+str(batch_size)+"_lr_"+str(learning_rate)+"_dec_"+str(learning_rate_decay)+"_size_"+str(subsample_size)+"_beams_"+str(num_beams)+"_seed_"+str(seed)
 
 # start a new wandb run to track this script
 wandb.init(
     # set the wandb project where this run will be logged
     project="nairr",
-    name='hp tuning',
+    name=experiment_name,
     # track hyperparameters and run metadata
     config={
     "learning_rate": learning_rate,
     "architecture": "SpaceTimeGPT",
     "dataset": "YD3",
     "epochs": num_epochs,
+    "seed": seed,
+    "beams": num_beams,
+    "decay": learning_rate_decay,
+    "subsample_size": subsample_size,
+    "batch_size": batch_size,
+    "min_caption_length": min_caption_length,
+    "max_caption_length": max_caption_length,
+    "pretrained_model": pretrained_model,
     }
 )
 
@@ -134,7 +146,8 @@ test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
 # load pretrained processor, tokenizer, and model
 image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
-model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
+# model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
+model = VisionEncoderDecoderModel.from_pretrained(pretrained_model).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 tokenizer.pad_token = tokenizer.eos_token
@@ -262,8 +275,9 @@ for batch in test_dataloader:
 
         all_filenames.extend(batch['filenames'])
 
-print("DEBUG predicted_captions:", predicted_captions)
-print("DEBUG ground_truth_captions:", ground_truth_captions)
+print("DEBUG ground_truth_captions (10):", ground_truth_captions[:10])
+
+print("DEBUG predicted_captions (10):", predicted_captions[:10])
 metrics_dict = {}       
 metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
 metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
@@ -280,13 +294,19 @@ predicted_captions = [[x] for x in predicted_captions]
 ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions))
 predicted_captions_dict = dict((zip(all_filenames, predicted_captions)))
 metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+# metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
 metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-metrics_dict["spice_score"], _ = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+# metrics_dict["spice_score"], metrics_dict['spice_scores'] = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
 
 print(f"Epoch {epoch+1} completed, average test loss: {metrics_dict['avg_test_loss']}")
 print(metrics_dict)
 wandb.log(metrics_dict)
+wandb.finish()
 
 # Run the qualitative if we are doing that
-wandb.finish()
+os.makedirs(output_dir, exist_ok=True)
+with open(os.path.join(output_dir, experiment_name +".csv"), 'w') as f:
+    for i,filename in enumerate(ground_truth_captions_dict):
+        f.writelines(filename + "," + predicted_captions[i][0] + "," + ground_truth_captions[i][0] + "\n")
+
+model.save_pretrained(os.path.join(output_dir, experiment_name))
