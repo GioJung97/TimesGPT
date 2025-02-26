@@ -11,12 +11,9 @@ import argparse
 import glob
 
 parser = argparse.ArgumentParser(description="Download YouTube videos listed in a CSV file.")
-parser.add_argument('-i', '--input_file', type=str, required=True,
-                    help="Path to the CSV file containing a 'youtube_id' column.")
-parser.add_argument('-o', '--output_dir', type=str, required=True,
-                    help="Directory where the downloaded videos will be stored.")
-parser.add_argument('-q', '--quiet', action="store_true",
-                    help="Reduce output from the download process.")
+parser.add_argument('-i', '--input_file', type=str, required=True, help="Path to the CSV file containing a 'youtube_id' column.")
+parser.add_argument('-o', '--output_dir', type=str, required=True, help="Directory where the downloaded videos will be stored.")
+parser.add_argument('-q', '--quiet', action="store_true", help="Reduce output from the download process.")
 args = parser.parse_args()
 
 YOUTUBE_LINK = "https://www.youtube.com/watch?v="
