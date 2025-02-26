@@ -50,13 +50,14 @@ from transformers import AutoTokenizer, AutoImageProcessor
 SOURCE_VIDEO_PATH = "/data1/juve/datasets/youdescribe/videos/source"
 # OUTPUT_CLIP_PATH = "/data1/juve/datasets/youdescribe/videos/clips/duration_leq_10"
 # PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/youdescribe/hf_datasets/arrow"
-PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/youdescribe/npz_datasets"
+PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/juve-optimization-1-open-videos"
 NUM_FRAMES = 8
 BATCH_SIZE = 500
 TIME_ENCODING = False
 DATASET_NAME = "YD3_" + str(NUM_FRAMES) + "_frames"
 csv_file = "/home/922053012/youdescribe-dataset/dataset/youdescribe_classic_dataset_cleaned_processed_videos_2024-10-26.csv" # 80505 datapoints
 output_csv_file = PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/index.csv"
+OPEN_VIDEOS = {}
 # rand_seed = 23
 
 # Init models
@@ -118,14 +119,22 @@ def calculate_boundaries(start, end, audio_clip_duration, video_len):
     return new_start, new_end
 
 def process_n_frames_from_source_video(video_path, start_time_ms, end_time_ms, num_frames):
-    container = av.open(video_path)
+    # open video and store this information in
+    # our global dict OPEN_VIDEOS
+    if video_path not in OPEN_VIDEOS:
+        print(f"[DEBUG] Recording open video status for {video_path}")
+        OPEN_VIDEOS[video_path] = av.open(video_path)
+    container = OPEN_VIDEOS[video_path]
+
+    # container = av.open(video_path)
     video_stream = container.streams.video[0]
 
     # retrieve fps if possible
-    if video_stream.average_rate is not None:
-        fps = float(video_stream.average_rate)
-    else:
-        fps = None
+    fps = float(video_stream.average_rate) if video_stream.average_rate is not None else None
+    # if video_stream.average_rate is not None:
+    #     fps = float(video_stream.average_rate)
+    # else:
+    #     fps = None
 
     # convert ms to seconds
     start_time_s = start_time_ms / 1000.0
@@ -177,7 +186,7 @@ def process_n_frames_from_source_video(video_path, start_time_ms, end_time_ms, n
 
     processed_frames = image_processor(selected_frames).pixel_values[0]
     # print(f"fps: {fps}")
-    container.close()
+    # container.close()
 
     return processed_frames, fps
 
@@ -219,22 +228,22 @@ def main():
             continue
 
         # if theres not a video for the current youtube_id
-        video_search_results = glob.glob(str(youtube_id_video_path) + ".*")
+        source_video_path = glob.glob(str(youtube_id_video_path) + ".*")
 
         # skip, if we didn't find a file for this youtube_id
-        if not video_search_results:
+        if not source_video_path:
             print(f"ERROR: Could not find video on disk: {yid}")
             continue
 
         # skip the .mhtml files        
-        if video_search_results[0][-6:] == ".mhtml":
-            print(f"[WARNING] {video_search_results[0][-6:]} file format does not work..")
+        if source_video_path[0][-6:] == ".mhtml":
+            print(f"[WARNING] {source_video_path[0][-6:]} file format does not work..")
             continue
 
-        # video_search_results returns a list, so has to be indexed to retrieve path
-        processed_frames, fps = process_n_frames_from_source_video(video_search_results[0], new_start, new_end, NUM_FRAMES)
+        # source_video_path returns a list, so has to be indexed to retrieve path
+        processed_frames, fps = process_n_frames_from_source_video(source_video_path[0], new_start, new_end, NUM_FRAMES)
         if processed_frames == None or fps == None:
-            print(f"[WARNING] Skipping over {video_search_results[0]} because missing frames or fps..")
+            print(f"[WARNING] Skipping over {source_video_path[0]} because missing frames or fps..")
             continue
 
         # print("processing captions..")
@@ -248,9 +257,22 @@ def main():
 
         np.savez(PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/" + vid + ".npz", processed_frames, processed_captions)
         videoIDS_index.append(vid)
+
+        # close video that we opened if we are at the last datapoint,
+        # or if we dont have consecutive datapoints with the same youtube_id
+        if i == len(df) - 1 or df.iloc[i+1]["youtube_id"] != yid:
+            print(f"[DEBUG] Closing video: {source_video_path[0]}")
+            OPEN_VIDEOS[source_video_path[0]].close()
+            del OPEN_VIDEOS[source_video_path[0]]
     
     with open(output_csv_file, 'w') as f:
         for videoID in videoIDS_index:
             f.write(videoID+"\n")
+
+    # close all open videos just in case
+    print("[DEBUG] Closing all videos")
+    for open_vid in list(OPEN_VIDEOS.values()):
+        open_vid.close()
+    OPEN_VIDEOS.clear()
 
 main()
