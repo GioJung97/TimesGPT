@@ -55,7 +55,9 @@ NUM_FRAMES = 8
 BATCH_SIZE = 500
 TIME_ENCODING = False
 DATASET_NAME = "YD3_" + str(NUM_FRAMES) + "_frames"
+# csv_file = "/home/922053012/youdescribe-dataset/dataset/youdescribe_classic_dataset_cleaned_processed_videos_2024-10-26.csv" # 80505 datapoints
 csv_file = "/home/922053012/youdescribe-dataset/dataset/youdescribe_classic_dataset_cleaned_processed_videos_2024-10-26.csv" # 80505 datapoints
+
 output_csv_file = PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/index.csv"
 OPEN_VIDEOS = {}
 # rand_seed = 23
@@ -65,58 +67,132 @@ tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
 
-def calculate_boundaries(start, end, audio_clip_duration, video_len):
+def keyframe_mechanism(start, end, video_len, clip_window_duration, extraction_type):
     """
-    Returns the start & end time corresponding to the clip,
-    ensuring times are within the video boundaries.
+    Extracts clip segment
+    returns the start & end time corresponding to our mechanism
     """
-    # if start exceeds video_len for some reason
-    if start > video_len:
-        print("[WARNING] Start exceeds video_len")
-        return None, None
-    
-    is_extended = (end - start) == 0.0
-    
-    if is_extended:
-        # handle extended clips: generate a clip of length audio_clip_duration
-        # centered around the start time
-        half_duration = audio_clip_duration / 2.0
-        new_start = start - half_duration
-        new_end = start + half_duration
+    middle = ((end - start) / 2.0) + start
 
-        # ensure new_start and new_end are within video boundaries
-        if new_start < 0.0:
-            # adjust new_end to maintain the desired duration
-            new_start = 0.0
-            new_end = new_start + audio_clip_duration
-            if new_end > video_len:
-                new_end = video_len
-        elif new_end > video_len:
-            # adjust new_start to maintain the desired duration
-            new_end = video_len
-            new_start = new_end - audio_clip_duration
-            if new_start < 0.0:
-                new_start = 0.0
+    # case 0: video < 10 secs
+    if video_len < 10.0:
+        # if video_len < end:
+        #     end = video_len
+        # return 0.0, end, extraction_type
+        return 0.0, video_len, extraction_type
+    # case 1: the unused time goes into negative time of the video
+    elif start - clip_window_duration < 0.0:
+        if extraction_type.lower() == "before":
+            start = 0.0
+            end = start + clip_window_duration
+        elif extraction_type.lower() == "balanced":
+            if middle - (clip_window_duration / 2.0) < 0.0:
+                start = 0.0
+                end = start + clip_window_duration
+            else:
+                start = middle - (clip_window_duration / 2.0)
+                end = start + clip_window_duration
+        elif extraction_type.lower() == "after":
+            start = middle
+            end = start + clip_window_duration
+        else:
+            print(f"DEBUG: case 1 Something went wrong")
+    # case 2: the unused time goes over the length of the video
+    elif end + clip_window_duration > video_len:
+        if extraction_type.lower() == "after":
+            end = video_len
+            start = end - clip_window_duration
+        elif extraction_type.lower() == "balanced":
+            if middle + (clip_window_duration / 2.0) > video_len:
+                end = video_len
+                start = end - clip_window_duration
+            else:
+                start = middle - (clip_window_duration / 2.0)
+                end = start + clip_window_duration   
+        elif extraction_type.lower() == "before":
+            end = middle
+            start = end - clip_window_duration
+        else:
+            print(f"DEBUG: case 2 Something went wrong")
+    # case 3: balanced amount of time on each side of the clip
     else:
-        # inline clips: use the entire clip in the general case
-        new_start = start
-        new_end = end
+        if extraction_type.lower() == "after":
+            if middle + (clip_window_duration / 2.0) > video_len:
+                end = video_len
+                start = end - clip_window_duration
+            else:
+                start = middle
+                end = start + clip_window_duration
+        elif extraction_type.lower() == "balanced":
+            start = middle - (clip_window_duration / 2.0)
+            end = start + clip_window_duration
+        elif extraction_type.lower() == "before":
+            if middle - (clip_window_duration / 2.0) < 0.0:
+                start = 0
+                end = start + clip_window_duration
+            else:
+                start = middle - clip_window_duration
+                end = middle
+        else:
+            print(f"DEBUG: case 3 Something went wrong")
+    start = int(round(start))
+    end = int(round(end))
+    
+    assert end - start >= 10.0, f"keyframe_mechanism() Assertion failed: end - start not >= 10\nend: {end}\tstart: {start}\nend - start: {end - start}"
+    return start, end, extraction_type
 
-        # ensure new_start and new_end are within video boundaries
-        new_start = max(0.0, new_start)
-        new_end = min(video_len, new_end)
+# def calculate_boundaries(start, end, audio_clip_duration, video_len):
+#     """
+#     Returns the start & end time corresponding to the clip,
+#     ensuring times are within the video boundaries.
+#     """
+#     # if start exceeds video_len for some reason
+#     if start > video_len:
+#         print("[WARNING] Start exceeds video_len")
+#         return None, None
+    
+#     is_extended = (end - start) == 0.0
+    
+#     if is_extended:
+#         # handle extended clips: generate a clip of length audio_clip_duration
+#         # centered around the start time
+#         half_duration = audio_clip_duration / 2.0
+#         new_start = start - half_duration
+#         new_end = start + half_duration
 
-    # ensure that start is less than end
-    # print(f"[SECONDS] original_start: {start}\toriginal_end: {end}\nnew_start: {int(round(new_start))}\tnew_end: {int(round(new_end))}\nis_extended: {is_extended}\t audio_clip_duration: {audio_clip_duration}\t video_len: {video_len}")
-    if new_start >= new_end:
-        print(f"DEBUG: Invalid clip duration. Start: {new_start}, End: {new_end}")
-        return None, None
+#         # ensure new_start and new_end are within video boundaries
+#         if new_start < 0.0:
+#             # adjust new_end to maintain the desired duration
+#             new_start = 0.0
+#             new_end = new_start + audio_clip_duration
+#             if new_end > video_len:
+#                 new_end = video_len
+#         elif new_end > video_len:
+#             # adjust new_start to maintain the desired duration
+#             new_end = video_len
+#             new_start = new_end - audio_clip_duration
+#             if new_start < 0.0:
+#                 new_start = 0.0
+#     else:
+#         # inline clips: use the entire clip in the general case
+#         new_start = start
+#         new_end = end
 
-    # round start and end times
-    # new_start = int(round(new_start))
-    # new_end = int(round(new_end))
+#         # ensure new_start and new_end are within video boundaries
+#         new_start = max(0.0, new_start)
+#         new_end = min(video_len, new_end)
 
-    return new_start, new_end
+#     # ensure that start is less than end
+#     # print(f"[SECONDS] original_start: {start}\toriginal_end: {end}\nnew_start: {int(round(new_start))}\tnew_end: {int(round(new_end))}\nis_extended: {is_extended}\t audio_clip_duration: {audio_clip_duration}\t video_len: {video_len}")
+#     if new_start >= new_end:
+#         print(f"DEBUG: Invalid clip duration. Start: {new_start}, End: {new_end}")
+#         return None, None
+
+#     # round start and end times
+#     # new_start = int(round(new_start))
+#     # new_end = int(round(new_end))
+
+#     return new_start, new_end
 
 def process_n_frames_from_source_video(video_path, start_time_ms, end_time_ms, num_frames):
     # open video and store this information in
@@ -222,7 +298,8 @@ def main():
         youtube_id_video_path = os.path.join(SOURCE_VIDEO_PATH, yid)
 
         # calculate boundaries
-        new_start, new_end = calculate_boundaries(start, end, audio_clip_dur, video_dur)
+        # new_start, new_end = calculate_boundaries(start, end, audio_clip_dur, video_dur)
+        new_start, new_end = keyframe_mechanism(start, end, audio_clip_dur, video_dur, extraction_type='balanced')
 
         if new_start == None or new_end == None:
             continue
