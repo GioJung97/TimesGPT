@@ -272,6 +272,7 @@ def process_n_captions(captions):
 ########################################################
 ## MAIN
 ########################################################
+vids = [] # keep track of vids we've seen in case of overlapping clip_ids
 def main():
     YD_csv_file = pd.read_csv(csv_file)
 
@@ -330,6 +331,13 @@ def main():
         new_start = int(new_start)
         new_end = int(new_end)
         vid = f"{yid}_{new_start}_{new_end}"
+
+        # this is kind of heavy-handed brute force way to first check
+        # if we already have a vid in vids, and if so, count how many startswith that and add one more
+        if vid in vids:
+            count = len([x.startswith(vid) for x in vids])
+            vid += "_" + str(count)
+            
         print(f"processing {vid}: {i}/{len(df)}")
 
         np.savez(PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/" + vid + ".npz", processed_frames, processed_captions)
