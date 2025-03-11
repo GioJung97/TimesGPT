@@ -59,7 +59,8 @@ DATASET_NAME = "YD3_" + str(NUM_FRAMES) + "_frames"
 csv_file = "/home/922053012/youdescribe-dataset/dataset/youdescribe_classic_dataset_cleaned_processed_videos_2024-10-26.csv" # 80505 datapoints
 output_csv_file = PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/index.csv"
 OPEN_VIDEOS = {}
-NUM_WORKERS = 2
+NUM_WORKERS = 20
+CLIP_LENGTH = 10
 # rand_seed = 23
 
 # Init models
@@ -119,6 +120,80 @@ def calculate_boundaries(start, end, audio_clip_duration, video_len):
     # new_end = int(round(new_end))
 
     return new_start, new_end
+
+def calculate_boundaries_old(start, end, video_len, clip_window_duration, extraction_type="balanced"):
+    """
+    Extracts clip segment
+    returns the start & end time corresponding to our mechanism
+    """
+    middle = ((end - start) / 2.0) + start
+
+    # case 0: video < 10 secs
+    if video_len < 10.0:
+        # if video_len < end:
+        #     end = video_len
+        # return 0.0, end, extraction_type
+        return 0.0, video_len
+    # case 1: the unused time goes into negative time of the video
+    elif start - clip_window_duration < 0.0:
+        if extraction_type.lower() == "before":
+            start = 0.0
+            end = start + clip_window_duration
+        elif extraction_type.lower() == "balanced":
+            if middle - (clip_window_duration / 2.0) < 0.0:
+                start = 0.0
+                end = start + clip_window_duration
+            else:
+                start = middle - (clip_window_duration / 2.0)
+                end = start + clip_window_duration
+        elif extraction_type.lower() == "after":
+            start = middle
+            end = start + clip_window_duration
+        else:
+            print(f"DEBUG: case 1 Something went wrong")
+    # case 2: the unused time goes over the length of the video
+    elif end + clip_window_duration > video_len:
+        if extraction_type.lower() == "after":
+            end = video_len
+            start = end - clip_window_duration
+        elif extraction_type.lower() == "balanced":
+            if middle + (clip_window_duration / 2.0) > video_len:
+                end = video_len
+                start = end - clip_window_duration
+            else:
+                start = middle - (clip_window_duration / 2.0)
+                end = start + clip_window_duration   
+        elif extraction_type.lower() == "before":
+            end = middle
+            start = end - clip_window_duration
+        else:
+            print(f"DEBUG: case 2 Something went wrong")
+    # case 3: balanced amount of time on each side of the clip
+    else:
+        if extraction_type.lower() == "after":
+            if middle + (clip_window_duration / 2.0) > video_len:
+                end = video_len
+                start = end - clip_window_duration
+            else:
+                start = middle
+                end = start + clip_window_duration
+        elif extraction_type.lower() == "balanced":
+            start = middle - (clip_window_duration / 2.0)
+            end = start + clip_window_duration
+        elif extraction_type.lower() == "before":
+            if middle - (clip_window_duration / 2.0) < 0.0:
+                start = 0
+                end = start + clip_window_duration
+            else:
+                start = middle - clip_window_duration
+                end = middle
+        else:
+            print(f"DEBUG: case 3 Something went wrong")
+    # start = int(round(start))
+    # end = int(round(end))
+    
+    assert end - start >= 10.0, f"calculate_boundaries() Assertion failed: end - start not >= 10\nend: {end}\tstart: {start}\nend - start: {end - start}"
+    return start, end
 
 def process_n_frames_from_source_video(video_path, start_time_ms, end_time_ms, num_frames, open_videos):
     # open video and store this information in
@@ -215,6 +290,7 @@ def process_chunk(df_chunk, source_video_path, output_dir, dataset_name, num_fra
         audio_clip_dur   = float(row["audio_clip_duration"])    * 1000
         video_dur        = float(row["video_duration"])         * 1000
         captions         = row["audio_clip_transcript"]
+        audio_clip_id = row["audio_clip_id"]
 
         new_start, new_end = calculate_boundaries(audio_clip_start, audio_clip_end, audio_clip_dur, video_dur)
         if new_start is None or new_end is None:
@@ -247,7 +323,7 @@ def process_chunk(df_chunk, source_video_path, output_dir, dataset_name, num_fra
 
         new_start = int(new_start)
         new_end   = int(new_end)
-        vid_id  = f"{yid}_{new_start}_{new_end}"
+        vid_id  = f"{yid}_{new_start}_{new_end}_{audio_clip_id}"
         output_npz_filename = os.path.join(output_dir, dataset_name, vid_id + ".npz")
 
         np.savez(output_npz_filename, frames, processed_captions)
@@ -342,14 +418,14 @@ if __name__ == "__main__":
     YD_csv_file = pd.read_csv(csv_file)
 
     # Filter data and take a list of unique youtube_ids to split the data on.
-    df_leq_ten_second_clips = YD_csv_file[YD_csv_file["audio_clip_duration"] <= 10].reset_index(drop=True)
+    df_leq_ten_second_clips = YD_csv_file[YD_csv_file["audio_clip_duration"] <= CLIP_LENGTH].reset_index(drop=True)
     df_only_english = df_leq_ten_second_clips[df_leq_ten_second_clips["is_predicted_language_english"] == True].reset_index(drop=True)
     youtube_ids = list(df_only_english["youtube_id"].unique())
     df = YD_csv_file[YD_csv_file["youtube_id"].isin(youtube_ids)].reset_index()
     
     # chunking dataset by youtube_ids
     # np.array_split: splits an array into NUM_WORKERS sub arrays.
-    chunked_youtube_ids = np.array_split(youtube_ids[:4], NUM_WORKERS)
+    chunked_youtube_ids = np.array_split(youtube_ids[:100], NUM_WORKERS)
 
     # for each chunk of youtube_ids, create a chunk DataFrame
     chunks = []
