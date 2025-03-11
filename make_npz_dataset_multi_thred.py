@@ -59,7 +59,7 @@ DATASET_NAME = "YD3_" + str(NUM_FRAMES) + "_frames"
 csv_file = "/home/922053012/youdescribe-dataset/dataset/youdescribe_classic_dataset_cleaned_processed_videos_2024-10-26.csv" # 80505 datapoints
 output_csv_file = PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/index.csv"
 OPEN_VIDEOS = {}
-NUM_WORKERS = 5
+NUM_WORKERS = 2
 # rand_seed = 23
 
 # Init models
@@ -253,7 +253,7 @@ def process_chunk(df_chunk, source_video_path, output_dir, dataset_name, num_fra
         np.savez(output_npz_filename, frames, processed_captions)
         videoIDS_index.append(vid_id)
 
-        if i == len(df_chunk):
+        if i == len(df_chunk)-1:
             # close video that we opened if we are at the last datapoint
             if source_video_path[0] in open_videos:
                 # print(f"[DEBUG] Closing video: {source_video_path[0]}")
@@ -280,7 +280,65 @@ def process_chunk(df_chunk, source_video_path, output_dir, dataset_name, num_fra
 ########################################################
 ## MAIN
 ########################################################
-def main():
+# def main():
+    # YD_csv_file = pd.read_csv(csv_file)
+
+    # # Filter data and take a list of unique youtube_ids to split the data on.
+    # df_leq_ten_second_clips = YD_csv_file[YD_csv_file["audio_clip_duration"] <= 10].reset_index(drop=True)
+    # df_only_english = df_leq_ten_second_clips[df_leq_ten_second_clips["is_predicted_language_english"] == True].reset_index(drop=True)
+    # youtube_ids = list(df_only_english["youtube_id"].unique())
+    # df = YD_csv_file[YD_csv_file["youtube_id"].isin(youtube_ids)].reset_index()
+    
+    # # chunking dataset by youtube_ids
+    # # np.array_split: splits an array into NUM_WORKERS sub arrays.
+    # chunked_youtube_ids = np.array_split(youtube_ids[:4], NUM_WORKERS)
+
+    # # for each chunk of youtube_ids, create a chunk DataFrame
+    # chunks = []
+    # for id_list in chunked_youtube_ids:
+    #     df_chunk = df[df["youtube_id"].isin(id_list)]
+    #     chunks.append(df_chunk)
+
+    # os.makedirs(PROCESSED_DATA_OUTPUT_PATH, exist_ok=True)
+    # os.makedirs(os.path.join(PROCESSED_DATA_OUTPUT_PATH, DATASET_NAME), exist_ok=True)
+    
+    # partial_csv_files = []
+    # workers = []
+    # with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+    #     for i, chunk_df in enumerate(chunks):
+    #         partial_csv = os.path.join(PROCESSED_DATA_OUTPUT_PATH, f"partial_{i}.csv")
+    #         partial_csv_files.append(partial_csv)
+
+    #         job = executor.submit(
+    #             process_chunk,
+    #             chunk_df,
+    #             SOURCE_VIDEO_PATH,
+    #             PROCESSED_DATA_OUTPUT_PATH,
+    #             DATASET_NAME,
+    #             NUM_FRAMES,
+    #             partial_csv
+    #         )
+    #         workers.append(job)
+
+    # # gather results
+    # all_video_ids = []
+    # # as_completed(): yields workers as they finish execution
+    # # regardless of the order in which they were submitted.
+    # for fut in as_completed(workers):
+    #     result_videoIDS_index = fut.result()  # list of videoIDS_index processed by that worker
+    #     all_video_ids.extend(result_videoIDS_index)
+
+    # # combine partial CSVs into one final CSV
+    # with open(output_csv_file, 'w') as out_f:
+    #     for partial_file in partial_csv_files:
+    #         if os.path.exists(partial_file):
+    #             with open(partial_file, 'r') as pcsv:
+    #                 for line in pcsv:
+    #                     out_f.write(line)
+    #             # remove partial CSV
+    #             os.remove(partial_file)
+
+if __name__ == "__main__":
     YD_csv_file = pd.read_csv(csv_file)
 
     # Filter data and take a list of unique youtube_ids to split the data on.
@@ -291,7 +349,7 @@ def main():
     
     # chunking dataset by youtube_ids
     # np.array_split: splits an array into NUM_WORKERS sub arrays.
-    chunked_youtube_ids = np.array_split(youtube_ids, NUM_WORKERS)
+    chunked_youtube_ids = np.array_split(youtube_ids[:4], NUM_WORKERS)
 
     # for each chunk of youtube_ids, create a chunk DataFrame
     chunks = []
@@ -337,6 +395,3 @@ def main():
                         out_f.write(line)
                 # remove partial CSV
                 os.remove(partial_file)
-
-if __name__ == "__main__":
-    main()
