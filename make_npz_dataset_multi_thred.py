@@ -1,5 +1,6 @@
 import os
 import av
+import ast
 import glob
 import numpy as np
 import pandas as pd
@@ -51,17 +52,20 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 SOURCE_VIDEO_PATH = "/data1/juve/datasets/youdescribe/videos/source"
 # OUTPUT_CLIP_PATH = "/data1/juve/datasets/youdescribe/videos/clips/duration_leq_10"
 # PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/youdescribe/hf_datasets/arrow"
-PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/juve-optimization-2-multi-thread"
+# PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/juve-optimization-2-multi-thread"
+PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/youdescribe/npz_datasets"
 NUM_FRAMES = 8
-BATCH_SIZE = 500
+BATCH_SIZE = 1
 TIME_ENCODING = False
 DATASET_NAME = "YD3_" + str(NUM_FRAMES) + "_frames"
-csv_file = "/home/922053012/youdescribe-dataset/dataset/youdescribe_classic_dataset_cleaned_processed_videos_2024-10-26.csv" # 80505 datapoints
+# csv_file = "/home/922053012/youdescribe-dataset/dataset/youdescribe_classic_dataset_cleaned_processed_videos_2024-10-26.csv" # 80505 datapoints
+csv_file = "/home/922053012/vd_aug/data_aug_datasets/youdescribe_classic_dataset_with_data_aug_lte10s_2024-10-26.csv"
 output_csv_file = PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/index.csv"
 OPEN_VIDEOS = {}
-NUM_WORKERS = 20
+NUM_WORKERS = 1
 CLIP_LENGTH = 10
 # rand_seed = 23
+SUBSET_OF_DATASET = 1
 
 # Init models
 tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
@@ -247,9 +251,11 @@ def process_chunk(df_chunk, source_video_path, output_dir, dataset_name, num_fra
         audio_clip_end   = float(row["audio_clip_end_time"])   * 1000
         # audio_clip_dur   = float(row["audio_clip_duration"])    * 1000
         video_dur        = float(row["video_duration"])         * 1000
-        captions         = row["audio_clip_transcript"]
+        captions         = [row["audio_clip_transcript"]]
         audio_clip_id    = row["audio_clip_id"]
-        gpt_captions     = row["gpt4o-captions"]
+        if "gpt-4o_captions" in list(row.keys()):
+            gpt4o_captions   = row["gpt-4o_captions"]
+            captions = captions + ast.literal_eval(gpt4o_captions)
 
         new_start, new_end = calculate_boundaries(audio_clip_start, audio_clip_end, 10*1000, video_dur)
         if new_start is None or new_end is None:
@@ -318,7 +324,7 @@ if __name__ == "__main__":
     
     # chunking dataset by youtube_ids
     # np.array_split: splits an array into NUM_WORKERS sub arrays.
-    chunked_youtube_ids = np.array_split(youtube_ids[:100], NUM_WORKERS)
+    chunked_youtube_ids = np.array_split(youtube_ids[:SUBSET_OF_DATASET], NUM_WORKERS)
 
     # for each chunk of youtube_ids, create a chunk DataFrame
     chunks = []
