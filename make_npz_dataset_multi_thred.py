@@ -55,14 +55,13 @@ SOURCE_VIDEO_PATH = "/data1/juve/datasets/youdescribe/videos/source"
 # PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/juve-optimization-2-multi-thread"
 PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/youdescribe/npz_datasets"
 NUM_FRAMES = 8
-BATCH_SIZE = 1
 TIME_ENCODING = False
 DATASET_NAME = "YD3_" + str(NUM_FRAMES) + "_frames"
 # csv_file = "/home/922053012/youdescribe-dataset/dataset/youdescribe_classic_dataset_cleaned_processed_videos_2024-10-26.csv" # 80505 datapoints
 csv_file = "/home/922053012/vd_aug/data_aug_datasets/youdescribe_classic_dataset_with_data_aug_lte10s_2024-10-26.csv"
 output_csv_file = PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/index.csv"
 OPEN_VIDEOS = {}
-NUM_WORKERS = 1
+NUM_WORKERS = 20
 CLIP_LENGTH = 10
 # rand_seed = 23
 SUBSET_OF_DATASET = 1
@@ -154,14 +153,14 @@ def calculate_boundaries(start, end, clip_window_duration, video_len):
     # end = int(round(end))
     
     assert end - start >= 10.0, f"calculate_boundaries() Assertion failed: end - start not >= 10\nend: {end}\tstart: {start}\nend - start: {end - start}"
-    print(f"[DEBUG] end - start = {end - start}")
+    # print(f"[DEBUG] end - start = {end - start}")
     return start, end
 
 def process_n_frames_from_source_video(video_path, start_time_ms, end_time_ms, num_frames, open_videos):
     # open video and store this information in
     # our open_videos dict
     if video_path not in open_videos:
-        print(f"[DEBUG] Recording open video status for {video_path}")
+        # print(f"[DEBUG] Recording open video status for {video_path}")
         open_videos[video_path] = av.open(video_path)
     container = open_videos[video_path]
 
@@ -297,7 +296,7 @@ def process_chunk(df_chunk, source_video_path, output_dir, dataset_name, num_fra
         # close the video if we dont have consecutive datapoints with the same youtube_id
         if i == len(df_chunk) - 1 or df_chunk.iloc[i + 1]["youtube_id"] != yid:
             if source_video_path[0] in open_videos:
-                print(f"[DEBUG] Closing video: {source_video_path[0]}")
+                # print(f"[DEBUG] Closing video: {source_video_path[0]}")
                 open_videos[source_video_path[0]].close()
                 del open_videos[source_video_path[0]]
 
@@ -324,7 +323,7 @@ if __name__ == "__main__":
     
     # chunking dataset by youtube_ids
     # np.array_split: splits an array into NUM_WORKERS sub arrays.
-    chunked_youtube_ids = np.array_split(youtube_ids[:SUBSET_OF_DATASET], NUM_WORKERS)
+    chunked_youtube_ids = np.array_split(youtube_ids, NUM_WORKERS)
 
     # for each chunk of youtube_ids, create a chunk DataFrame
     chunks = []
