@@ -68,60 +68,55 @@ tokenizer = AutoTokenizer.from_pretrained("openai-community/gpt2")
 tokenizer.pad_token = tokenizer.eos_token
 image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
 
-def calculate_boundaries(start, end, audio_clip_duration, video_len):
-    """
-    Returns the start & end time corresponding to the clip,
-    ensuring times are within the video boundaries.
-    """
-    # if start exceeds video_len for some reason
-    if start > video_len:
-        print("[WARNING] Start exceeds video_len")
-        return None, None
+# def calculate_boundaries_fast(start, end, audio_clip_duration, video_len):
+#     """
+#     Returns the start & end time corresponding to the clip,
+#     ensuring times are within the video boundaries.
+#     """
+#     # if start exceeds video_len for some reason
+#     if start > video_len:
+#         print("[WARNING] Start exceeds video_len")
+#         return None, None
     
-    is_extended = (end - start) == 0.0
+#     is_extended = (end - start) == 0.0
     
-    if is_extended:
-        # handle extended clips: generate a clip of length audio_clip_duration
-        # centered around the start time
-        half_duration = audio_clip_duration / 2.0
-        new_start = start - half_duration
-        new_end = start + half_duration
+#     if is_extended:
+#         # handle extended clips: generate a clip of length audio_clip_duration
+#         # centered around the start time
+#         half_duration = audio_clip_duration / 2.0
+#         new_start = start - half_duration
+#         new_end = start + half_duration
 
-        # ensure new_start and new_end are within video boundaries
-        if new_start < 0.0:
-            # adjust new_end to maintain the desired duration
-            new_start = 0.0
-            new_end = new_start + audio_clip_duration
-            if new_end > video_len:
-                new_end = video_len
-        elif new_end > video_len:
-            # adjust new_start to maintain the desired duration
-            new_end = video_len
-            new_start = new_end - audio_clip_duration
-            if new_start < 0.0:
-                new_start = 0.0
-    else:
-        # inline clips: use the entire clip in the general case
-        new_start = start
-        new_end = end
+#         # ensure new_start and new_end are within video boundaries
+#         if new_start < 0.0:
+#             # adjust new_end to maintain the desired duration
+#             new_start = 0.0
+#             new_end = new_start + audio_clip_duration
+#             if new_end > video_len:
+#                 new_end = video_len
+#         elif new_end > video_len:
+#             # adjust new_start to maintain the desired duration
+#             new_end = video_len
+#             new_start = new_end - audio_clip_duration
+#             if new_start < 0.0:
+#                 new_start = 0.0
+#     else:
+#         # inline clips: use the entire clip in the general case
+#         new_start = start
+#         new_end = end
 
-        # ensure new_start and new_end are within video boundaries
-        new_start = max(0.0, new_start)
-        new_end = min(video_len, new_end)
+#         # ensure new_start and new_end are within video boundaries
+#         new_start = max(0.0, new_start)
+#         new_end = min(video_len, new_end)
 
-    # ensure that start is less than end
-    # print(f"[SECONDS] original_start: {start}\toriginal_end: {end}\nnew_start: {int(round(new_start))}\tnew_end: {int(round(new_end))}\nis_extended: {is_extended}\t audio_clip_duration: {audio_clip_duration}\t video_len: {video_len}")
-    if new_start >= new_end:
-        print(f"DEBUG: Invalid clip duration. Start: {new_start}, End: {new_end}")
-        return None, None
+#     # ensure that start is less than end
+#     if new_start >= new_end:
+#         print(f"DEBUG: Invalid clip duration. Start: {new_start}, End: {new_end}")
+#         return None, None
 
-    # round start and end times
-    # new_start = int(round(new_start))
-    # new_end = int(round(new_end))
+#     return new_start, new_end
 
-    return new_start, new_end
-
-def calculate_boundaries_old(start, end, video_len, clip_window_duration, extraction_type="balanced"):
+def calculate_boundaries(start, end, clip_window_duration, video_len):
     """
     Extracts clip segment
     returns the start & end time corresponding to our mechanism
@@ -130,76 +125,39 @@ def calculate_boundaries_old(start, end, video_len, clip_window_duration, extrac
 
     # case 0: video < 10 secs
     if video_len < 10.0:
-        # if video_len < end:
-        #     end = video_len
-        # return 0.0, end, extraction_type
         return 0.0, video_len
     # case 1: the unused time goes into negative time of the video
     elif start - clip_window_duration < 0.0:
-        if extraction_type.lower() == "before":
+        if middle - (clip_window_duration / 2.0) < 0.0:
             start = 0.0
             end = start + clip_window_duration
-        elif extraction_type.lower() == "balanced":
-            if middle - (clip_window_duration / 2.0) < 0.0:
-                start = 0.0
-                end = start + clip_window_duration
-            else:
-                start = middle - (clip_window_duration / 2.0)
-                end = start + clip_window_duration
-        elif extraction_type.lower() == "after":
-            start = middle
-            end = start + clip_window_duration
         else:
-            print(f"DEBUG: case 1 Something went wrong")
-    # case 2: the unused time goes over the length of the video
-    elif end + clip_window_duration > video_len:
-        if extraction_type.lower() == "after":
-            end = video_len
-            start = end - clip_window_duration
-        elif extraction_type.lower() == "balanced":
-            if middle + (clip_window_duration / 2.0) > video_len:
-                end = video_len
-                start = end - clip_window_duration
-            else:
-                start = middle - (clip_window_duration / 2.0)
-                end = start + clip_window_duration   
-        elif extraction_type.lower() == "before":
-            end = middle
-            start = end - clip_window_duration
-        else:
-            print(f"DEBUG: case 2 Something went wrong")
-    # case 3: balanced amount of time on each side of the clip
-    else:
-        if extraction_type.lower() == "after":
-            if middle + (clip_window_duration / 2.0) > video_len:
-                end = video_len
-                start = end - clip_window_duration
-            else:
-                start = middle
-                end = start + clip_window_duration
-        elif extraction_type.lower() == "balanced":
             start = middle - (clip_window_duration / 2.0)
             end = start + clip_window_duration
-        elif extraction_type.lower() == "before":
-            if middle - (clip_window_duration / 2.0) < 0.0:
-                start = 0
-                end = start + clip_window_duration
-            else:
-                start = middle - clip_window_duration
-                end = middle
+    # case 2: the unused time goes over the length of the video
+    elif end + clip_window_duration > video_len:
+        if middle + (clip_window_duration / 2.0) > video_len:
+            end = video_len
+            start = end - clip_window_duration
         else:
-            print(f"DEBUG: case 3 Something went wrong")
+            start = middle - (clip_window_duration / 2.0)
+            end = start + clip_window_duration   
+    # case 3: balanced amount of time on each side of the clip
+    else:
+        start = middle - (clip_window_duration / 2.0)
+        end = start + clip_window_duration
     # start = int(round(start))
     # end = int(round(end))
     
     assert end - start >= 10.0, f"calculate_boundaries() Assertion failed: end - start not >= 10\nend: {end}\tstart: {start}\nend - start: {end - start}"
+    print(f"[DEBUG] end - start = {end - start}")
     return start, end
 
 def process_n_frames_from_source_video(video_path, start_time_ms, end_time_ms, num_frames, open_videos):
     # open video and store this information in
     # our open_videos dict
     if video_path not in open_videos:
-        # print(f"[DEBUG] Recording open video status for {video_path}")
+        print(f"[DEBUG] Recording open video status for {video_path}")
         open_videos[video_path] = av.open(video_path)
     container = open_videos[video_path]
 
@@ -287,12 +245,13 @@ def process_chunk(df_chunk, source_video_path, output_dir, dataset_name, num_fra
         yid              = row["youtube_id"]
         audio_clip_start = float(row["audio_clip_start_time"]) * 1000
         audio_clip_end   = float(row["audio_clip_end_time"])   * 1000
-        audio_clip_dur   = float(row["audio_clip_duration"])    * 1000
+        # audio_clip_dur   = float(row["audio_clip_duration"])    * 1000
         video_dur        = float(row["video_duration"])         * 1000
         captions         = row["audio_clip_transcript"]
-        audio_clip_id = row["audio_clip_id"]
+        audio_clip_id    = row["audio_clip_id"]
+        gpt_captions     = row["gpt4o-captions"]
 
-        new_start, new_end = calculate_boundaries(audio_clip_start, audio_clip_end, audio_clip_dur, video_dur)
+        new_start, new_end = calculate_boundaries(audio_clip_start, audio_clip_end, 10*1000, video_dur)
         if new_start is None or new_end is None:
             continue
         
@@ -318,7 +277,7 @@ def process_chunk(df_chunk, source_video_path, output_dir, dataset_name, num_fra
         if frames is None or fps is None:
             print(f"[WARNING] Skipping clip: {yid} => no frames or fps..")
             continue
-
+        
         processed_captions = process_n_captions(captions)
 
         new_start = int(new_start)
@@ -329,22 +288,17 @@ def process_chunk(df_chunk, source_video_path, output_dir, dataset_name, num_fra
         np.savez(output_npz_filename, frames, processed_captions)
         videoIDS_index.append(vid_id)
 
-        if i == len(df_chunk)-1:
-            # close video that we opened if we are at the last datapoint
+        # close the video if we dont have consecutive datapoints with the same youtube_id
+        if i == len(df_chunk) - 1 or df_chunk.iloc[i + 1]["youtube_id"] != yid:
             if source_video_path[0] in open_videos:
-                # print(f"[DEBUG] Closing video: {source_video_path[0]}")
+                print(f"[DEBUG] Closing video: {source_video_path[0]}")
                 open_videos[source_video_path[0]].close()
                 del open_videos[source_video_path[0]]
-        else:
-            # close the video if we dont have consecutive datapoints with the same youtube_id
-            if df_chunk.iloc[i + 1]["youtube_id"] != yid:
-                if source_video_path[0] in open_videos:
-                    # print(f"[DEBUG] Closing video: {source_video_path[0]}")
-                    open_videos[source_video_path[0]].close()
-                    del open_videos[source_video_path[0]]
+
     # close all open videos in this process
-    for path, container in open_videos.items():
+    for _, container in open_videos.items():
         container.close()
+        del container
 
     # write partial CSV
     with open(partial_csv_name, 'w') as f:
@@ -352,67 +306,6 @@ def process_chunk(df_chunk, source_video_path, output_dir, dataset_name, num_fra
             f.write(vid_id + "\n")
 
     return videoIDS_index
-
-########################################################
-## MAIN
-########################################################
-# def main():
-    # YD_csv_file = pd.read_csv(csv_file)
-
-    # # Filter data and take a list of unique youtube_ids to split the data on.
-    # df_leq_ten_second_clips = YD_csv_file[YD_csv_file["audio_clip_duration"] <= 10].reset_index(drop=True)
-    # df_only_english = df_leq_ten_second_clips[df_leq_ten_second_clips["is_predicted_language_english"] == True].reset_index(drop=True)
-    # youtube_ids = list(df_only_english["youtube_id"].unique())
-    # df = YD_csv_file[YD_csv_file["youtube_id"].isin(youtube_ids)].reset_index()
-    
-    # # chunking dataset by youtube_ids
-    # # np.array_split: splits an array into NUM_WORKERS sub arrays.
-    # chunked_youtube_ids = np.array_split(youtube_ids[:4], NUM_WORKERS)
-
-    # # for each chunk of youtube_ids, create a chunk DataFrame
-    # chunks = []
-    # for id_list in chunked_youtube_ids:
-    #     df_chunk = df[df["youtube_id"].isin(id_list)]
-    #     chunks.append(df_chunk)
-
-    # os.makedirs(PROCESSED_DATA_OUTPUT_PATH, exist_ok=True)
-    # os.makedirs(os.path.join(PROCESSED_DATA_OUTPUT_PATH, DATASET_NAME), exist_ok=True)
-    
-    # partial_csv_files = []
-    # workers = []
-    # with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-    #     for i, chunk_df in enumerate(chunks):
-    #         partial_csv = os.path.join(PROCESSED_DATA_OUTPUT_PATH, f"partial_{i}.csv")
-    #         partial_csv_files.append(partial_csv)
-
-    #         job = executor.submit(
-    #             process_chunk,
-    #             chunk_df,
-    #             SOURCE_VIDEO_PATH,
-    #             PROCESSED_DATA_OUTPUT_PATH,
-    #             DATASET_NAME,
-    #             NUM_FRAMES,
-    #             partial_csv
-    #         )
-    #         workers.append(job)
-
-    # # gather results
-    # all_video_ids = []
-    # # as_completed(): yields workers as they finish execution
-    # # regardless of the order in which they were submitted.
-    # for fut in as_completed(workers):
-    #     result_videoIDS_index = fut.result()  # list of videoIDS_index processed by that worker
-    #     all_video_ids.extend(result_videoIDS_index)
-
-    # # combine partial CSVs into one final CSV
-    # with open(output_csv_file, 'w') as out_f:
-    #     for partial_file in partial_csv_files:
-    #         if os.path.exists(partial_file):
-    #             with open(partial_file, 'r') as pcsv:
-    #                 for line in pcsv:
-    #                     out_f.write(line)
-    #             # remove partial CSV
-    #             os.remove(partial_file)
 
 if __name__ == "__main__":
     YD_csv_file = pd.read_csv(csv_file)
