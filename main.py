@@ -6,7 +6,9 @@ import torch
 import argparse
 import random
 import wandb
+from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data.dataloader import default_collate
 from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoderModel
 # from transformers import AutoModelForSequenceClassification, AutoTokenizer, AdamW
 from datasets import load_dataset
@@ -74,32 +76,18 @@ parser.add_argument('-pt', '--architecture_grammar', type=str,
                     help="Grammar to define a custom network")
 args = parser.parse_args()
 
-class NPZDataset(Dataset):
-    def __init__(self, data_dir):
-        self.data_dir = data_dir
-        self.file_names = os.listdir(data_dir)
 
-    def __len__(self):
-        return len(self.file_names)
-
-    def __getitem__(self, idx):
-        file_path = os.path.join(self.data_dir, self.file_names[idx])
-        data = np.load(file_path)
-        # Each .npz file contains 'arr_o' and 'arr_1', images and captions
-        sample = {'filenames': self.file_names[idx], 
-                  'pixel_values': torch.from_numpy(data['arr_0']), 
-                  'labels': torch.from_numpy(data['arr_1'])}
-        return sample
 
 seed = 8675309
-num_epochs = 3
-batch_size = 12
+num_epochs = 20
+batch_size = 1
 learning_rate = 0.001
 learning_rate_decay = 0.5
-subsample_size = .02 # 1 or None disables
+subsample_size = .2 # 1 or None disables
 max_caption_length = 500
 min_caption_length = 10
 num_beams = 4
+num_captions = 11
 pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 data_dir = '/data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/'
 output_dir = "./output"
@@ -134,14 +122,44 @@ wandb.init(
     }
 )
 
+class NPZDataset(Dataset):
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.file_names = os.listdir(data_dir)
+
+    def __len__(self):
+        return len(self.file_names)
+
+    def __getitem__(self, idx):
+        file_path = os.path.join(self.data_dir, self.file_names[idx])
+        data = np.load(file_path)
+        # Each .npz file contains 'arr_o' and 'arr_1', images and captions
+        sample = {'filenames': self.file_names[idx], 
+                  'pixel_values': torch.from_numpy(data['arr_0']), 
+                  'labels': torch.from_numpy(data['arr_1'])}
+        return sample
+
+def data_collator(batch):
+    col = defaultdict(list)
+    for sample in batch:
+        for i in range(num_captions):
+            col['pixel_values'].append(sample['pixel_values'])
+            col['filenames'].append(sample['filenames'])
+            col['labels'].append(sample['labels'][i])
+    col['pixel_values'] = default_collate(col['pixel_values'])
+    col['filenames'] = default_collate(col['filenames'])
+    col['labels'] = default_collate(col['labels'])
+    return(dict(col))
+
+
 train_dataset = NPZDataset(train_data_dir)
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=data_collator, shuffle=True)
 
 val_dataset = NPZDataset(val_data_dir)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=data_collator, shuffle=True)
 
 test_dataset = NPZDataset(test_data_dir)
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=data_collator, shuffle=True)
 
 # load pretrained processor, tokenizer, and model
 image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
@@ -163,15 +181,15 @@ model.to(device)
 if subsample_size != None:
     train_subset_indices = range(0, int(len(train_dataloader) * subsample_size))
     train_subset = Subset(train_dataset, train_subset_indices)
-    train_dataloader = DataLoader(train_subset, batch_size=batch_size)
+    train_dataloader = DataLoader(train_subset, batch_size=batch_size, collate_fn=data_collator)
 
     val_subset_indices = range(0, int(len(val_dataloader) * subsample_size))
     val_subset = Subset(val_dataset, val_subset_indices)
-    val_dataloader = DataLoader(val_subset, batch_size=batch_size)
+    val_dataloader = DataLoader(val_subset, batch_size=batch_size, collate_fn=data_collator)
 
     test_subset_indices = range(0, int(len(test_dataloader) * subsample_size))
     test_subset = Subset(test_dataset, test_subset_indices)
-    test_dataloader = DataLoader(test_subset, batch_size=batch_size)
+    test_dataloader = DataLoader(test_subset, batch_size=batch_size, collate_fn=data_collator)
 
     print("DEBUG len(train_dataloader): ", len(train_dataloader))
     print("DEBUG len(val_dataloader): ", len(val_dataloader))
