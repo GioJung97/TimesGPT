@@ -24,14 +24,15 @@ import torch.nn.functional as F
 # parse command line args here
 parser = argparse.ArgumentParser()
 parser.add_argument('-ep', '--epochs', type=int, default=2, 
-                    help="The number of epochs to run. (default: 2)")
-parser.add_argument('-lr', '--learning_rate', type=float, default=0.001, 
-                    help="Initial earning rate. (default: 0.001)")
-parser.add_argument('-dc', '--decay', type=float, default=0.9, 
-                    help="Decay for linear learning rate scheduler.")
+                    help="The number of epochs to run. (default: 20)")
+parser.add_argument('-lr', '--learning_rate', type=float, default=0.0000005, 
+                    help="Initial earning rate. (default: 0.0000005)")
+parser.add_argument('-dc', '--decay', type=float, default=0.000000005, 
+                    help="Decay for linear learning rate scheduler. (default: 0.000000005)")
 parser.add_argument('-sc', '--schedular', type=str, default='linear', 
                     help="The type of scheduler to use.")
-parser.add_argument('-bs', '--batch_size', type=int, help="The batchsize")
+parser.add_argument('-bs', '--batch_size', type=int, default=1,
+                    help="The batchsize. (default: 1)")
 parser.add_argument('-ds', '--dataset_size', type=float, 
                     help="Percentage of dataset subsets to use")
 parser.add_argument('-do', '--dropout', type=str, 
@@ -78,18 +79,21 @@ args = parser.parse_args()
 
 # Juve's best : early stopped at 3rd epoch
 # polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/tensorboard_logs
-# Caelen's report
+# Caelen's best learning rate and decay
+# learning_rate = 0.0000005
+# learning_rate_decay = 0.000000005
 
-seed = 8675309
-num_epochs = 1
-batch_size = 2
-learning_rate = 0.0000005
-learning_rate_decay = 0.000000005
-subsample_size = .01 # 1 or None disables
+seed = args.random_seed
+num_epochs = args.epochs
+batch_size = args.batch_size
+learning_rate = args.learning_rate
+learning_rate_decay = args.decay
+subsample_size = .2 # 1 or None disables
 max_caption_length = 500
 min_caption_length = 10
 num_beams = 4
-num_captions = 1
+no_repeat_ngram_size = 3 # don't repeat same word more than this many times
+num_captions = 5
 # pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 data_dir = '/data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/'
@@ -176,10 +180,12 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.model_max_length = max_caption_length
 tokenizer.max_length = max_caption_length
+
 model.config.decoder_start_token_id = tokenizer.bos_token_id
 model.config.pad_token_id = tokenizer.pad_token_id
 model.config.max_length = max_caption_length
 model.config.num_beams = num_beams
+model.config.no_repeat_ngram_size = no_repeat_ngram_size
 
 model.to(device)
 
@@ -272,6 +278,7 @@ gen_kwargs = {
     "min_length": min_caption_length,
     "max_length": max_caption_length,
     "num_beams": num_beams,
+    "no_repeat_ngram_size": no_repeat_ngram_size,
 }
 
 for batch in test_dataloader:
