@@ -76,21 +76,25 @@ parser.add_argument('-pt', '--architecture_grammar', type=str,
                     help="Grammar to define a custom network")
 args = parser.parse_args()
 
-
+# Juve's best : early stopped at 3rd epoch
+# polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/tensorboard_logs
+# Caelen's report
 
 seed = 8675309
-num_epochs = 20
-batch_size = 1
-learning_rate = 0.001
-learning_rate_decay = 0.5
-subsample_size = .2 # 1 or None disables
+num_epochs = 1
+batch_size = 2
+learning_rate = 0.0000005
+learning_rate_decay = 0.000000005
+subsample_size = .01 # 1 or None disables
 max_caption_length = 500
 min_caption_length = 10
 num_beams = 4
-num_captions = 11
+num_captions = 1
+# pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 data_dir = '/data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/'
 output_dir = "./output"
+training_artifacts = '/data2/juve/training_artifacts/'
 train_data_dir = os.path.join(data_dir, 'train') 
 val_data_dir = os.path.join(data_dir, 'val')
 test_data_dir = os.path.join(data_dir, 'test')
@@ -151,7 +155,6 @@ def data_collator(batch):
     col['labels'] = default_collate(col['labels'])
     return(dict(col))
 
-
 train_dataset = NPZDataset(train_data_dir)
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=data_collator, shuffle=True)
 
@@ -165,7 +168,9 @@ test_dataloader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=dat
 image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 # model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
+# /data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3
 model = VisionEncoderDecoderModel.from_pretrained(pretrained_model).to(device)
+
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 tokenizer.pad_token = tokenizer.eos_token
@@ -238,6 +243,9 @@ for epoch in range(num_epochs):
     print(f"Epoch {epoch+1} completed, average val loss: {avg_val_loss}")
     wandb.log({"ave_val_loss": avg_val_loss})
 
+    # Save checkpoint every epoch
+    model.save_pretrained(os.path.join(training_artifacts, experiment_name + f"_checkpoint_{epoch}"))
+
 # Run the test set and print statistics if we're doing a test
 model.eval()
 total_test_loss = 0
@@ -294,7 +302,6 @@ for batch in test_dataloader:
         all_filenames.extend(batch['filenames'])
 
 print("DEBUG ground_truth_captions (10):", ground_truth_captions[:10])
-
 print("DEBUG predicted_captions (10):", predicted_captions[:10])
 metrics_dict = {}       
 metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
