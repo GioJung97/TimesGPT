@@ -359,6 +359,10 @@ with open(os.path.join(output_dir, experiment_name +".csv"), 'w') as f:
 mean = torch.tensor(image_processor.image_mean).view(1, 3, 1, 1)
 std = torch.tensor(image_processor.image_std).view(1, 3, 1, 1)
 
+path_to_8_frames = '/data1/juve/datasets/youdescribe/videos/8-framed_images/'
+# /data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/G_QWtUFFAFQ_100000_110000_58e7cf3e46e13dfd851a2932.npz
+# /data1/juve/datasets/youdescribe/videos/8-framed_images/00-u98sOE4s_000049_000059.png
+
 # make a qualitative report, don't print all test set (could be too big)
 with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
     f.write(f"""<!DOCTYPE html>
@@ -366,25 +370,49 @@ with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
                 <body>
             """)
     for i,filename in enumerate(ground_truth_captions_dict):
-        npz_data = np.load(os.path.join(data_dir, "test", filename))
-        processed_images = torch.tensor(npz_data['arr_0'])
-        unprocessed_images = processed_images * std + mean
+        clip_id = filename.split("_")[-1]
+        end_time = int(float(filename.split("_")[-2]) / 1000)
+        start_time = int(float(filename.split("_")[-3]) / 1000)
+        video_id = filename[:11]
+        new_filename = f"{video_id}_{start_time:06}_{end_time:06}.png"
 
-        f.write(f"<p>{i}, {filename}<br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
-        # for j in range(npz_data['arr_0'].shape[0]):
-        for j in range(unprocessed_images.shape[0]):
-            an_image = unprocessed_images[j]
-            transform = transforms.ToPILImage()
-            pil_image = transform(an_image)
-            buffer = io.BytesIO()
-            pil_image.save(buffer, format="PNG")
-            buffer.seek(0) # Rewind the buffer to the beginning
-            base64_string = base64.b64encode(buffer.read()).decode()
-            img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
-            f.write(f"{img_tag}\n")
+        f.write(f"<p>{i}, {filename} {new_filename} <br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
+        f.write(f'<img loading="lazy" src="8-framed_images/{new_filename}">')
         f.write("<br>\n")
         if i > num_qualitative:
             break
     f.write(f"</body></html>")
+
+
+# good working code, but does not scale 
+
+# with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
+#     f.write(f"""<!DOCTYPE html>
+#                 <html><head></head>
+#                 <body>
+#             """)
+#     for i,filename in enumerate(ground_truth_captions_dict):
+#         npz_data = np.load(os.path.join(data_dir, "test", filename))
+#         processed_images = torch.tensor(npz_data['arr_0'])
+#         unprocessed_images = processed_images * std + mean
+
+#         f.write(f"<p>{i}, {filename}<br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
+#         # for j in range(npz_data['arr_0'].shape[0]):
+#         for j in range(unprocessed_images.shape[0]):
+#             an_image = unprocessed_images[j]
+#             transform = transforms.ToPILImage()
+#             pil_image = transform(an_image)
+#             buffer = io.BytesIO()
+#             pil_image.save(buffer, format="PNG")
+#             buffer.seek(0) # Rewind the buffer to the beginning
+#             base64_string = base64.b64encode(buffer.read()).decode()
+#             img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
+#             f.write(f"{img_tag}\n")
+#         f.write("<br>\n")
+#         if i > num_qualitative:
+#             break
+#     f.write(f"</body></html>")
+
+
 
 model.save_pretrained(os.path.join(output_dir, experiment_name))
