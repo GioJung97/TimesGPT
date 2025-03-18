@@ -1,4 +1,5 @@
 import os
+import io
 import av
 import pathlib
 import numpy as np
@@ -13,26 +14,28 @@ from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoder
 # from transformers import AutoModelForSequenceClassification, AutoTokenizer, AdamW
 from datasets import load_dataset
 from torcheval.metrics.text import BLEUScore, Perplexity, WordErrorRate, WordInformationLost, WordInformationPreserved
-
-from pycocoevalcap.meteor.meteor import Meteor
+from torchvision import transforms
+# from pycocoevalcap.meteor.meteor import Meteor
 from pycocoevalcap.rouge.rouge import Rouge
 from pycocoevalcap.cider.cider import Cider
 from pycocoevalcap.spice.spice import Spice
 import torch.nn.functional as F
+from PIL import Image
+import base64
 
 
 # parse command line args here
 parser = argparse.ArgumentParser()
-parser.add_argument('-ep', '--epochs', type=int, default=2, 
-                    help="The number of epochs to run. (default: 20)")
+parser.add_argument('-ep', '--epochs', type=int, default=1, 
+                    help="The number of epochs to run. (default: 1)")
 parser.add_argument('-lr', '--learning_rate', type=float, default=0.0000005, 
                     help="Initial earning rate. (default: 0.0000005)")
 parser.add_argument('-dc', '--decay', type=float, default=0.000000005, 
                     help="Decay for linear learning rate scheduler. (default: 0.000000005)")
 parser.add_argument('-sc', '--schedular', type=str, default='linear', 
                     help="The type of scheduler to use.")
-parser.add_argument('-bs', '--batch_size', type=int, default=1,
-                    help="The batchsize. (default: 1)")
+parser.add_argument('-bs', '--batch_size', type=int, default=12,
+                    help="The batchsize. (default: 12)")
 parser.add_argument('-ds', '--dataset_size', type=float, 
                     help="Percentage of dataset subsets to use")
 parser.add_argument('-do', '--dropout', type=str, 
@@ -88,12 +91,12 @@ num_epochs = args.epochs
 batch_size = args.batch_size
 learning_rate = args.learning_rate
 learning_rate_decay = args.decay
-subsample_size = .2 # 1 or None disables
+subsample_size = .01 # 1 or None disables
 max_caption_length = 500
 min_caption_length = 10
 num_beams = 4
 no_repeat_ngram_size = 3 # don't repeat same word more than this many times
-num_captions = 5
+num_captions = 1
 # pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 data_dir = '/data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/'
@@ -107,6 +110,7 @@ torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 experiment_name = 'fine_tuning_bs'+str(batch_size)+"_lr_"+str(learning_rate)+"_dec_"+str(learning_rate_decay)+"_size_"+str(subsample_size)+"_beams_"+str(num_beams)+"_seed_"+str(seed)
+num_qualitative = 100
 
 # start a new wandb run to track this script
 wandb.init(
@@ -131,42 +135,49 @@ wandb.init(
 )
 
 class NPZDataset(Dataset):
-    def __init__(self, data_dir):
+    def __init__(self, data_dir, num_captions):
         self.data_dir = data_dir
         self.file_names = os.listdir(data_dir)
+        self.total_captions = len(self.file_names) * num_captions
+        self.num_caption = num_captions
 
     def __len__(self):
-        return len(self.file_names)
+        return self.total_captions
 
     def __getitem__(self, idx):
-        file_path = os.path.join(self.data_dir, self.file_names[idx])
+        # 10 - 20
+        # calculate the right index into full list of ordered captions
+        # 20
+        # if bs is 10
+        filename_index = idx // self.num_caption
+        labels_offset = idx % self.num_caption  
+    
+        file_path = os.path.join(self.data_dir, self.file_names[filename_index])
         data = np.load(file_path)
+
         # Each .npz file contains 'arr_o' and 'arr_1', images and captions
-        sample = {'filenames': self.file_names[idx], 
+        sample = {'filenames': self.file_names[filename_index], 
                   'pixel_values': torch.from_numpy(data['arr_0']), 
-                  'labels': torch.from_numpy(data['arr_1'])}
+                  'labels': torch.from_numpy(data['arr_1'][labels_offset])}
         return sample
 
-def data_collator(batch):
-    col = defaultdict(list)
-    for sample in batch:
-        for i in range(num_captions):
-            col['pixel_values'].append(sample['pixel_values'])
-            col['filenames'].append(sample['filenames'])
-            col['labels'].append(sample['labels'][i])
-    col['pixel_values'] = default_collate(col['pixel_values'])
-    col['filenames'] = default_collate(col['filenames'])
-    col['labels'] = default_collate(col['labels'])
-    return(dict(col))
+# def data_collator(batch):
+#     col = defaultdict(list)
+#     for sample in batch: 
+#         for key, value in sample.items():           
+#             col['pixel_values'] = default_collate(col['pixel_values'])
+#             col['filenames'] = default_collate(col['filenames'])
+#             col['labels'] = default_collate(col['labels'])
+#     return(dict(col))
 
-train_dataset = NPZDataset(train_data_dir)
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, collate_fn=data_collator, shuffle=True)
+train_dataset = NPZDataset(train_data_dir, num_captions)
+train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-val_dataset = NPZDataset(val_data_dir)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=data_collator, shuffle=True)
+val_dataset = NPZDataset(val_data_dir, num_captions)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
 
-test_dataset = NPZDataset(test_data_dir)
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, collate_fn=data_collator, shuffle=True)
+test_dataset = NPZDataset(test_data_dir, num_captions)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
 
 # load pretrained processor, tokenizer, and model
 image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
@@ -192,15 +203,15 @@ model.to(device)
 if subsample_size != None:
     train_subset_indices = range(0, int(len(train_dataloader) * subsample_size))
     train_subset = Subset(train_dataset, train_subset_indices)
-    train_dataloader = DataLoader(train_subset, batch_size=batch_size, collate_fn=data_collator)
+    train_dataloader = DataLoader(train_subset, batch_size=batch_size)
 
     val_subset_indices = range(0, int(len(val_dataloader) * subsample_size))
     val_subset = Subset(val_dataset, val_subset_indices)
-    val_dataloader = DataLoader(val_subset, batch_size=batch_size, collate_fn=data_collator)
+    val_dataloader = DataLoader(val_subset, batch_size=batch_size)
 
     test_subset_indices = range(0, int(len(test_dataloader) * subsample_size))
     test_subset = Subset(test_dataset, test_subset_indices)
-    test_dataloader = DataLoader(test_subset, batch_size=batch_size, collate_fn=data_collator)
+    test_dataloader = DataLoader(test_subset, batch_size=batch_size)
 
     print("DEBUG len(train_dataloader): ", len(train_dataloader))
     print("DEBUG len(val_dataloader): ", len(val_dataloader))
@@ -218,6 +229,7 @@ for epoch in range(num_epochs):
             if idx in ['pixel_values', 'labels']:
                 inputs[idx] = values.to(device)
 
+        # print("DEBUG inputs.shape:", inputs['labels'].shape)
         with torch.autocast(device_type='cuda', dtype=torch.float16):
             outputs = model(**inputs)
             loss = outputs.loss
@@ -270,7 +282,7 @@ word_error_rate_metric = WordErrorRate()
 word_info_lost_metric = WordInformationLost()
 word_info_preserved_metric = WordInformationPreserved()
 cider_metric = Cider()
-meteor_metric = Meteor()
+# meteor_metric = Meteor()
 rouge_metric = Rouge()
 spice_metric = Spice()
 
@@ -312,23 +324,26 @@ print("DEBUG ground_truth_captions (10):", ground_truth_captions[:10])
 print("DEBUG predicted_captions (10):", predicted_captions[:10])
 metrics_dict = {}       
 metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
-metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
-metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
-metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
-metrics_dict["blue4_score"] = bleu4_metric.update(predicted_captions, ground_truth_captions).compute().item()
-# metrics_dict["perplexity_score"] = perplexity_metric.update(predicted_tokens, ground_truth_tokens).compute()
-metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(predicted_captions, ground_truth_captions).compute().item()
-metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(predicted_captions, ground_truth_captions).compute().item()
-metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(predicted_captions, ground_truth_captions).compute().item()
 
 ground_truth_captions = [[x] for x in ground_truth_captions]
 predicted_captions = [[x] for x in predicted_captions]
 ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions))
 predicted_captions_dict = dict((zip(all_filenames, predicted_captions)))
-metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-# metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-# metrics_dict["spice_score"], metrics_dict['spice_scores'] = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+
+if subsample_size > 0.2:
+    metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
+    metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
+    metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
+    metrics_dict["blue4_score"] = bleu4_metric.update(predicted_captions, ground_truth_captions).compute().item()
+    # metrics_dict["perplexity_score"] = perplexity_metric.update(predicted_tokens, ground_truth_tokens).compute()
+    metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(predicted_captions, ground_truth_captions).compute().item()
+    metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(predicted_captions, ground_truth_captions).compute().item()
+    metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(predicted_captions, ground_truth_captions).compute().item()
+
+    metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+    # metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+    metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+    # metrics_dict["spice_score"], metrics_dict['spice_scores'] = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
 
 print(f"Epoch {epoch+1} completed, average test loss: {metrics_dict['avg_test_loss']}")
 print(metrics_dict)
@@ -340,5 +355,36 @@ os.makedirs(output_dir, exist_ok=True)
 with open(os.path.join(output_dir, experiment_name +".csv"), 'w') as f:
     for i,filename in enumerate(ground_truth_captions_dict):
         f.writelines(filename + "," + predicted_captions[i][0] + "," + ground_truth_captions[i][0] + "\n")
+
+mean = torch.tensor(image_processor.image_mean).view(1, 3, 1, 1)
+std = torch.tensor(image_processor.image_std).view(1, 3, 1, 1)
+
+# make a qualitative report, don't print all test set (could be too big)
+with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
+    f.write(f"""<!DOCTYPE html>
+                <html><head></head>
+                <body>
+            """)
+    for i,filename in enumerate(ground_truth_captions_dict):
+        npz_data = np.load(os.path.join(data_dir, "test", filename))
+        processed_images = torch.tensor(npz_data['arr_0'])
+        unprocessed_images = processed_images * std + mean
+
+        f.write(f"<p>{i}, {filename}<br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
+        # for j in range(npz_data['arr_0'].shape[0]):
+        for j in range(unprocessed_images.shape[0]):
+            an_image = unprocessed_images[j]
+            transform = transforms.ToPILImage()
+            pil_image = transform(an_image)
+            buffer = io.BytesIO()
+            pil_image.save(buffer, format="PNG")
+            buffer.seek(0) # Rewind the buffer to the beginning
+            base64_string = base64.b64encode(buffer.read()).decode()
+            img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
+            f.write(f"{img_tag}\n")
+        f.write("<br>\n")
+        if i > num_qualitative:
+            break
+    f.write(f"</body></html>")
 
 model.save_pretrained(os.path.join(output_dir, experiment_name))
