@@ -10,7 +10,7 @@ import wandb
 from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.data.dataloader import default_collate
-from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoderModel
+from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoderModel, VisionEncoderDecoderConfig
 # from transformers import AutoModelForSequenceClassification, AutoTokenizer, AdamW
 from datasets import load_dataset
 from torcheval.metrics.text import BLEUScore, Perplexity, WordErrorRate, WordInformationLost, WordInformationPreserved
@@ -78,7 +78,44 @@ parser.add_argument('-en', '--experiment_name', type=str,
                     + "will be automatically generated.")
 parser.add_argument('-pt', '--architecture_grammar', type=str, 
                     help="Grammar to define a custom network")
+parser.add_argument('-nhle', '--num_hidden_layers_encoder', type=int, default=12, 
+                    help="Number of layers in the encoder (default: 12)")
+parser.add_argument('-nahe', '--num_attention_heads_encoder', type=int, default=12, 
+                    help="Number of hidden layers in the encoder (default: 12)")
+
+parser.add_argument('-nld', '--num_layers_decoder', type=int, default=12, 
+                    help="Number of layers in the decoder (default: 12)")
+parser.add_argument('-nhd', '--num_heads_decoder', type=int, default=12, 
+                    help="Number of heads in the decoder (default: 12)")
+
+parser.add_argument('--attention_type_encoder', type=str, 
+                    choices=['divided_space_time', 'space_only', 'joint_space_time'], 
+                    default=str("divided_space_time"),
+                    help="""Type of attention for the encoder. Choose from: 'divided_space_time', 
+                    'space_only', 'joint_space_time'.""")
+parser.add_argument('--hidden_size_encoder', type=int, default=768,
+                    help="Dimensionality of the encoder layers and the pooler layer. (default: 768)")
+parser.add_argument('--image_size_encoder', type=int, default=224,
+                    help="The size (resolution) of each image. (default: 224)")
+parser.add_argument('--intermediate_size_encoder', type=int, default=3072,
+                    help="""Dimensionality of the 'intermediate' (i.e., feed-forward) layer in the 
+                    Transformer encoder. (default: 3072)""")
+
+parser.add_argument('--num_frames_encoder', type=int, default=8,
+                    help="The number of frames in each video. (default: 8)")
+parser.add_argument('--patch_size_encoder', type=int, default=16,
+                    help="The size (resolution) of each patch. (default: 16)")
+parser.add_argument('-frz', '--freeze_encoder_decoder', type=bool, default=True,
+                    help="Whether or not to freeze the encoder and decoder (all except cross attention, default: True).")
+parser.add_argument('-ss', '--subsample_size', default=0.25, type=float,
+                    help="The percentage of data to use from train, val, and test. 1.0 is all (default: 0.25)")
+
 args = parser.parse_args()
+
+# Config docs for GPT2 and Timesformer
+# https://huggingface.co/docs/transformers/en/model_doc/gpt2#transformers.GPT2Config
+# https://huggingface.co/docs/transformers/en/model_doc/timesformer
+
 
 # Juve's best : early stopped at 3rd epoch
 # polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/tensorboard_logs
@@ -91,12 +128,18 @@ num_epochs = args.epochs
 batch_size = args.batch_size
 learning_rate = args.learning_rate
 learning_rate_decay = args.decay
-subsample_size = .01 # 1 or None disables
+
+
+
+subsample_size = args.subsample_size
 max_caption_length = 500
 min_caption_length = 10
 num_beams = 4
 no_repeat_ngram_size = 3 # don't repeat same word more than this many times
-num_captions = 1
+num_captions = 11
+
+
+
 # pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 data_dir = '/data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/'
@@ -145,10 +188,6 @@ class NPZDataset(Dataset):
         return self.total_captions
 
     def __getitem__(self, idx):
-        # 10 - 20
-        # calculate the right index into full list of ordered captions
-        # 20
-        # if bs is 10
         filename_index = idx // self.num_caption
         labels_offset = idx % self.num_caption  
     
@@ -160,15 +199,6 @@ class NPZDataset(Dataset):
                   'pixel_values': torch.from_numpy(data['arr_0']), 
                   'labels': torch.from_numpy(data['arr_1'][labels_offset])}
         return sample
-
-# def data_collator(batch):
-#     col = defaultdict(list)
-#     for sample in batch: 
-#         for key, value in sample.items():           
-#             col['pixel_values'] = default_collate(col['pixel_values'])
-#             col['filenames'] = default_collate(col['filenames'])
-#             col['labels'] = default_collate(col['labels'])
-#     return(dict(col))
 
 train_dataset = NPZDataset(train_data_dir, num_captions)
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -184,8 +214,24 @@ image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 # model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
 # /data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3
-model = VisionEncoderDecoderModel.from_pretrained(pretrained_model).to(device)
 
+config = VisionEncoderDecoderConfig.from_pretrained(pretrained_model)
+config.encoder.num_hidden_layers = args.num_hidden_layers_encoder
+config.encoder.num_attention_heads = args.num_attention_heads_encoder
+config.decoder.n_layer = args.num_layers_decoder
+config.decoder.n_heads = args.num_heads_decoder
+
+config.encoder.attention_type = args.attention_type_encoder
+config.encoder.hidden_size = args.hidden_size_encoder
+config.encoder.intermediate_size = args.intermediate_size_encoder
+config.encoder.image_size = args.image_size_encoder
+config.encoder.num_frames = args.num_frames_encoder
+config.encoder.path_size = args.patch_size_encoder
+
+
+
+
+model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 tokenizer.pad_token = tokenizer.eos_token
@@ -197,6 +243,34 @@ model.config.pad_token_id = tokenizer.pad_token_id
 model.config.max_length = max_caption_length
 model.config.num_beams = num_beams
 model.config.no_repeat_ngram_size = no_repeat_ngram_size
+
+
+if args.freeze_encoder_decoder:
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    for block in model.decoder.transformer.h:
+        for name, param in block.named_parameters():
+            if "crossatt" in name or 'ln_cross_attn' in name or 'mlp' in name:
+                param.requires_grad = True
+    
+    # model.decoder.transformer.ln_f.requires_grad = True
+    # model.decoder.lm_head.requires_grad = True
+
+
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print("Number of trainable parameters: ", trainable_params)
+
+# if args.freeze_encoder_decoder:
+#     for parameter in model.parameters():
+#         parameter.requires_grad = False
+
+#     for block in model.decoder.transformer.h:
+#         for name, param in block.named_parameters():
+#             if "crossatt" in name or 'ln_cross_attn' in name:
+#                 param.requires_grad = True
+
+
 
 model.to(device)
 
@@ -320,8 +394,8 @@ for batch in test_dataloader:
 
         all_filenames.extend(batch['filenames'])
 
-print("DEBUG ground_truth_captions (10):", ground_truth_captions[:10])
-print("DEBUG predicted_captions (10):", predicted_captions[:10])
+print("DEBUG ground_truth_captions:", ground_truth_captions)
+print("DEBUG predicted_captions:", predicted_captions)
 metrics_dict = {}       
 metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
 
@@ -330,7 +404,7 @@ predicted_captions = [[x] for x in predicted_captions]
 ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions))
 predicted_captions_dict = dict((zip(all_filenames, predicted_captions)))
 
-if subsample_size > 0.2:
+if subsample_size > 0.25:
     metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
     metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
     metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
@@ -363,55 +437,56 @@ path_to_8_frames = '/data1/juve/datasets/youdescribe/videos/8-framed_images/'
 # /data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/G_QWtUFFAFQ_100000_110000_58e7cf3e46e13dfd851a2932.npz
 # /data1/juve/datasets/youdescribe/videos/8-framed_images/00-u98sOE4s_000049_000059.png
 
-# make a qualitative report, don't print all test set (could be too big)
-with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
-    f.write(f"""<!DOCTYPE html>
-                <html><head></head>
-                <body>
-            """)
-    for i,filename in enumerate(ground_truth_captions_dict):
-        clip_id = filename.split("_")[-1]
-        end_time = int(float(filename.split("_")[-2]) / 1000)
-        start_time = int(float(filename.split("_")[-3]) / 1000)
-        video_id = filename[:11]
-        new_filename = f"{video_id}_{start_time:06}_{end_time:06}.png"
-
-        f.write(f"<p>{i}, {filename} {new_filename} <br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
-        f.write(f'<img loading="lazy" src="8-framed_images/{new_filename}">')
-        f.write("<br>\n")
-        if i > num_qualitative:
-            break
-    f.write(f"</body></html>")
-
-
-# good working code, but does not scale 
-
+# in progress
+# # make a qualitative report, don't print all test set (could be too big)
 # with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
 #     f.write(f"""<!DOCTYPE html>
 #                 <html><head></head>
 #                 <body>
 #             """)
 #     for i,filename in enumerate(ground_truth_captions_dict):
-#         npz_data = np.load(os.path.join(data_dir, "test", filename))
-#         processed_images = torch.tensor(npz_data['arr_0'])
-#         unprocessed_images = processed_images * std + mean
+#         clip_id = filename.split("_")[-1]
+#         end_time = int(float(filename.split("_")[-2]) / 1000)
+#         start_time = int(float(filename.split("_")[-3]) / 1000)
+#         video_id = filename[:11]
+#         new_filename = f"{video_id}_{start_time:06}_{end_time:06}.png"
 
-#         f.write(f"<p>{i}, {filename}<br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
-#         # for j in range(npz_data['arr_0'].shape[0]):
-#         for j in range(unprocessed_images.shape[0]):
-#             an_image = unprocessed_images[j]
-#             transform = transforms.ToPILImage()
-#             pil_image = transform(an_image)
-#             buffer = io.BytesIO()
-#             pil_image.save(buffer, format="PNG")
-#             buffer.seek(0) # Rewind the buffer to the beginning
-#             base64_string = base64.b64encode(buffer.read()).decode()
-#             img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
-#             f.write(f"{img_tag}\n")
+#         f.write(f"<p>{i}, {filename} {new_filename} <br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
+#         f.write(f'<img loading="lazy" src="8-framed_images/{new_filename}">')
 #         f.write("<br>\n")
 #         if i > num_qualitative:
 #             break
 #     f.write(f"</body></html>")
+
+
+# good working code, but does not scale 
+
+with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
+    f.write(f"""<!DOCTYPE html>
+                <html><head></head>
+                <body>
+            """)
+    for i,filename in enumerate(ground_truth_captions_dict):
+        npz_data = np.load(os.path.join(data_dir, "test", filename))
+        processed_images = torch.tensor(npz_data['arr_0'])
+        unprocessed_images = processed_images * std + mean
+
+        f.write(f"<p>{i}, {filename}<br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
+        # for j in range(npz_data['arr_0'].shape[0]):
+        for j in range(unprocessed_images.shape[0]):
+            an_image = unprocessed_images[j]
+            transform = transforms.ToPILImage()
+            pil_image = transform(an_image)
+            buffer = io.BytesIO()
+            pil_image.save(buffer, format="PNG")
+            buffer.seek(0) # Rewind the buffer to the beginning
+            base64_string = base64.b64encode(buffer.read()).decode()
+            img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
+            f.write(f"{img_tag}\n")
+        f.write("<br>\n")
+        if i > num_qualitative:
+            break
+    f.write(f"</body></html>")
 
 
 
