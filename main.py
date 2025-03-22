@@ -15,7 +15,7 @@ from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoder
 from datasets import load_dataset
 from torcheval.metrics.text import BLEUScore, Perplexity, WordErrorRate, WordInformationLost, WordInformationPreserved
 from torchvision import transforms
-# from pycocoevalcap.meteor.meteor import Meteor
+from pycocoevalcap.meteor.meteor import Meteor
 from pycocoevalcap.rouge.rouge import Rouge
 from pycocoevalcap.cider.cider import Cider
 from pycocoevalcap.spice.spice import Spice
@@ -105,8 +105,8 @@ parser.add_argument('--num_frames_encoder', type=int, default=8,
                     help="The number of frames in each video. (default: 8)")
 parser.add_argument('--patch_size_encoder', type=int, default=16,
                     help="The size (resolution) of each patch. (default: 16)")
-parser.add_argument('-frz', '--freeze_encoder_decoder', type=bool, default=True,
-                    help="Whether or not to freeze the encoder and decoder (all except cross attention, default: True).")
+parser.add_argument('-frz', '--freeze_encoder_decoder', action='store_true',
+                    help="Whether or not to freeze the encoder and decoder (all except cross attention, default: Off).")
 parser.add_argument('-ss', '--subsample_size', default=0.25, type=float,
                     help="The percentage of data to use from train, val, and test. 1.0 is all (default: 0.25)")
 
@@ -351,12 +351,12 @@ bleu1_metric = BLEUScore(n_gram=1)
 bleu2_metric = BLEUScore(n_gram=2)
 bleu3_metric = BLEUScore(n_gram=3)
 bleu4_metric = BLEUScore(n_gram=4)
-perplexity_metric = Perplexity()
+perplexity_metric = Perplexity().to(device)
 word_error_rate_metric = WordErrorRate()
 word_info_lost_metric = WordInformationLost()
 word_info_preserved_metric = WordInformationPreserved()
 cider_metric = Cider()
-# meteor_metric = Meteor()
+meteor_metric = Meteor()
 rouge_metric = Rouge()
 spice_metric = Spice()
 
@@ -378,7 +378,9 @@ for batch in test_dataloader:
         with torch.no_grad():
             outputs = model(**inputs)
         loss = outputs.loss
-        total_val_loss += loss.item()
+        total_test_loss += loss.item()
+
+        perplexity_metric.update(outputs.logits, inputs['labels'])
 
         tokens = model.generate(**inputs, **gen_kwargs)
         predicted_tokens.extend(tokens)
@@ -386,7 +388,7 @@ for batch in test_dataloader:
         decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
         predicted_captions.extend(decoded_predicted_caption)
         
-        ground_truth_caption = inputs['labels'].squeeze()
+        ground_truth_caption = inputs['labels']
         ground_truth_tokens.extend(ground_truth_caption)
         
         decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
@@ -399,25 +401,25 @@ print("DEBUG predicted_captions:", predicted_captions)
 metrics_dict = {}       
 metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
 
-ground_truth_captions = [[x] for x in ground_truth_captions]
-predicted_captions = [[x] for x in predicted_captions]
-ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions))
-predicted_captions_dict = dict((zip(all_filenames, predicted_captions)))
+ground_truth_captions_flattened = [[x] for x in ground_truth_captions]
+predicted_captions_flattened = [[x] for x in predicted_captions]
+ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions_flattened))
+predicted_captions_dict = dict((zip(all_filenames, predicted_captions_flattened)))
 
 if subsample_size > 0.25:
     metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
     metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
     metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
     metrics_dict["blue4_score"] = bleu4_metric.update(predicted_captions, ground_truth_captions).compute().item()
-    # metrics_dict["perplexity_score"] = perplexity_metric.update(predicted_tokens, ground_truth_tokens).compute()
+    metrics_dict["perplexity_score"] = perplexity_metric.compute().item()
     metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(predicted_captions, ground_truth_captions).compute().item()
     metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(predicted_captions, ground_truth_captions).compute().item()
     metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(predicted_captions, ground_truth_captions).compute().item()
 
     metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-    # metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+    metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
     metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-    # metrics_dict["spice_score"], metrics_dict['spice_scores'] = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+    metrics_dict["spice_score"], metrics_dict['spice_scores'] = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
 
 print(f"Epoch {epoch+1} completed, average test loss: {metrics_dict['avg_test_loss']}")
 print(metrics_dict)
