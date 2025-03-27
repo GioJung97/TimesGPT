@@ -213,14 +213,15 @@ if args.local_rank == 0:
 
 
 class NPZDataset(Dataset):
-    def __init__(self, data_dir, num_captions):
+    def __init__(self, data_dir, num_captions, subsample_size):
         self.data_dir = data_dir
         self.file_names = os.listdir(data_dir)
         self.total_captions = len(self.file_names) * num_captions
         self.num_caption = num_captions
+        self.subsample_size = subsample_size
 
     def __len__(self):
-        return self.total_captions
+        return int(self.total_captions * self.subsample_size)
 
     def __getitem__(self, idx):
         filename_index = idx // self.num_caption
@@ -235,13 +236,13 @@ class NPZDataset(Dataset):
                   'labels': torch.from_numpy(data['arr_1'][labels_offset])}
         return sample
 
-train_dataset = NPZDataset(train_data_dir, num_captions)
+train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-val_dataset = NPZDataset(val_data_dir, num_captions)
+val_dataset = NPZDataset(val_data_dir, num_captions, subsample_size)
 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
 
-test_dataset = NPZDataset(test_data_dir, num_captions)
+test_dataset = NPZDataset(test_data_dir, num_captions, subsample_size)
 test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
 
 # load pretrained processor, tokenizer, and model
@@ -319,24 +320,24 @@ print("Number of trainable parameters: ", trainable_params)
 
 
 
-model.to(device)
+# model.to(device)
 
-if subsample_size != None:
-    train_subset_indices = range(0, int(len(train_dataloader) * subsample_size))
-    train_subset = Subset(train_dataset, train_subset_indices)
-    train_dataloader = DataLoader(train_subset, batch_size=batch_size)
+# if subsample_size != None:
+#     train_subset_indices = range(0, int(len(train_dataloader) * subsample_size))
+#     train_subset = Subset(train_dataset, train_subset_indices)
+#     train_dataloader = DataLoader(train_subset, batch_size=batch_size)
 
-    val_subset_indices = range(0, int(len(val_dataloader) * subsample_size))
-    val_subset = Subset(val_dataset, val_subset_indices)
-    val_dataloader = DataLoader(val_subset, batch_size=batch_size)
+#     val_subset_indices = range(0, int(len(val_dataloader) * subsample_size))
+#     val_subset = Subset(val_dataset, val_subset_indices)
+#     val_dataloader = DataLoader(val_subset, batch_size=batch_size)
 
-    test_subset_indices = range(0, int(len(test_dataloader) * subsample_size))
-    test_subset = Subset(test_dataset, test_subset_indices)
-    test_dataloader = DataLoader(test_subset, batch_size=batch_size)
+#     test_subset_indices = range(0, int(len(test_dataloader) * subsample_size))
+#     test_subset = Subset(test_dataset, test_subset_indices)
+#     test_dataloader = DataLoader(test_subset, batch_size=batch_size)
 
-    print("DEBUG len(train_dataloader): ", len(train_dataloader))
-    print("DEBUG len(val_dataloader): ", len(val_dataloader))
-    print("DEBUG len(test_dataloader): ", len(test_dataloader))
+print("DEBUG len(train_dataloader): ", len(train_dataloader))
+print("DEBUG len(val_dataloader): ", len(val_dataloader))
+print("DEBUG len(test_dataloader): ", len(test_dataloader))
 
 
 
@@ -359,7 +360,7 @@ for epoch in range(num_epochs):
     steps_total = len(train_dataloader)
     for batch in train_dataloader:
         # batch = [(x.to(device), y.to(device)) for (x,y) in batch.items()]
-        print(f"DEBUG type(batch) {type(batch)}, batch length: {len(batch)}, rank: {local_rank}")
+        # print(f"DEBUG type(batch) {type(batch)}, batch length: {len(batch)}, rank: {local_rank}")
         inputs = {}
         for idx, values in batch.items():
             if idx in ['pixel_values', 'labels']:
@@ -374,10 +375,10 @@ for epoch in range(num_epochs):
         # optimizer.zero_grad()
         model.backward(loss)
         model.step()
-        print(f"Step: {step_num}/{steps_total}, Training Loss: {loss.item()}")
-        if args.local_rank == 0:
-            wandb.log({"train_loss": loss.item(), 'train_learning_rate': learning_rate})
-        step_num += batch_size
+        print(f"Step: {step_num}/{steps_total}, Rank: {local_rank}, Training Loss: {loss.item()}")
+        # if args.local_rank == 0:
+        #     wandb.log({"train_loss": loss.item(), 'train_learning_rate': learning_rate})
+        step_num += 1
     learning_rate = learning_rate - (learning_rate * learning_rate_decay)
 
     # Validation

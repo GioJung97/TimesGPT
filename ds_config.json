@@ -5,10 +5,10 @@
     "trial_duration": 4,
     "trial_interval": 2,
   },
-  "gradient_accumulation_steps": 1,
+  "gradient_accumulation_steps": 32,
   "num_gpus": 4,
   "train_micro_batch_size_per_gpu": 1,
-  "train_batch_size": 4,
+  "train_batch_size": 128,
   "steps_per_print": 50,
   "optimizer": {
     "type": "Adam",
@@ -34,12 +34,12 @@
     "stage3_param_persistence_threshold": 1e5,
     "reduce_bucket_size": 1e7,
     "sub_group_size": 1e9,
-    "offload_optimizer": {
-      "device": "cpu"
-    },
-    "offload_param": {
-      "device": "cpu"
-    }
+    // "offload_optimizer": {
+    //   "device": "cpu"
+    // },
+    // "offload_param": {
+    //   "device": "cpu"
+    // }
   },
   "gradient_clipping": 1.0,
   "prescale_gradients": false,
