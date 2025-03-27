@@ -1,6 +1,7 @@
 import os
 import io
 import av
+import sys
 import pathlib
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ import wandb
 from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.data.dataloader import default_collate
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoderModel, VisionEncoderDecoderConfig
 # from transformers import AutoModelForSequenceClassification, AutoTokenizer, AdamW
 from datasets import load_dataset
@@ -128,6 +130,16 @@ parser.add_argument('--no_local_rank', action='store_true',
 parser.add_argument('--autotuning', type=str, default="run",
                     help="Have Deepspeed optimize for hardware. {tune,run} (default: run)")
 
+parser.add_argument('--do_train', action="store_true",
+                    help="Whether to do the training phase or not.")
+
+parser.add_argument('--do_val', action="store_true",
+                    help="Whether to do the validation phase or not.")
+
+parser.add_argument('--do_test', action="store_true",
+                    help="Whether to do the evaluation (test) phase or not.")
+
+
 args = parser.parse_args()
 
 # Config docs for GPT2 and Timesformer
@@ -180,11 +192,10 @@ torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 deepspeed.runtime.utils.set_random_seed(seed)
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-experiment_name = f'deepspeed_rank_{local_rank}_bs_'+str(batch_size)+"_lr_"+str(learning_rate)+"_dec_"+str(learning_rate_decay)+"_size_"+str(subsample_size)+"_beams_"+str(num_beams)+"_seed_"+str(seed)
+# experiment_name = f'deepspeed_bs_'+str(batch_size)+"_lr_"+str(learning_rate)+"_dec_"+str(learning_rate_decay)+"_size_"+str(subsample_size)+"_beams_"+str(num_beams)+"_seed_"+str(seed)
+experiment_name = f'deepspeed_testing'
 
 num_qualitative = 100
-
-
 ds_config_file = "./ds_config.json"
 
 # start a new wandb run to track this script
@@ -240,10 +251,12 @@ train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
 val_dataset = NPZDataset(val_data_dir, num_captions, subsample_size)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True)
+val_sampler = DistributedSampler(val_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
+val_dataloader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler)
 
 test_dataset = NPZDataset(test_data_dir, num_captions, subsample_size)
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True)
+test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
+test_dataloader = DataLoader(test_dataset, batch_size=batch_size, sampler=test_sampler)
 
 # load pretrained processor, tokenizer, and model
 image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
@@ -339,52 +352,115 @@ print("DEBUG len(train_dataloader): ", len(train_dataloader))
 print("DEBUG len(val_dataloader): ", len(val_dataloader))
 print("DEBUG len(test_dataloader): ", len(test_dataloader))
 
-
-
-
-
+# deepspeed.init_distributed()
 model, _, train_dataloader, _ = deepspeed.initialize(
     args=args,
     model=model,
     model_parameters=[p for p in model.parameters() if p.requires_grad],
     training_data=train_dataset,
-    config='./ds_config.json')
-
-
-
+    config=ds_config_file)
 
 # Train and Val
-for epoch in range(num_epochs):
-    model.train()
-    step_num = 0
-    steps_total = len(train_dataloader)
-    for batch in train_dataloader:
-        # batch = [(x.to(device), y.to(device)) for (x,y) in batch.items()]
-        # print(f"DEBUG type(batch) {type(batch)}, batch length: {len(batch)}, rank: {local_rank}")
-        inputs = {}
-        for idx, values in batch.items():
-            if idx in ['pixel_values', 'labels']:
-                inputs[idx] = values.to(device)
+if args.do_train:
+    for epoch in range(num_epochs):
+        model.train()
+        step_num = 0
+        steps_total = len(train_dataloader)
+        for batch in train_dataloader:
+            # batch = [(x.to(device), y.to(device)) for (x,y) in batch.items()]
+            # print(f"DEBUG type(batch) {type(batch)}, batch length: {len(batch)}, rank: {local_rank}")
+            inputs = {}
+            for idx, values in batch.items():
+                if idx in ['pixel_values', 'labels']:
+                    inputs[idx] = values.to(device)
 
-        # print("DEBUG inputs.shape:", inputs['labels'].shape)
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
-            outputs = model(**inputs)
-            loss = outputs.loss
-            # loss.backward()
-        # optimizer.step()
-        # optimizer.zero_grad()
-        model.backward(loss)
-        model.step()
-        print(f"Step: {step_num}/{steps_total}, Rank: {local_rank}, Training Loss: {loss.item()}")
-        # if args.local_rank == 0:
-        #     wandb.log({"train_loss": loss.item(), 'train_learning_rate': learning_rate})
-        step_num += 1
-    learning_rate = learning_rate - (learning_rate * learning_rate_decay)
+            # print("DEBUG inputs.shape:", inputs['labels'].shape)
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(**inputs)
+                loss = outputs.loss
+                # loss.backward()
+            # optimizer.step()
+            # optimizer.zero_grad()
+            model.backward(loss)
+            model.step()
+            print(f"Step: {step_num}/{steps_total}, Rank: {local_rank}, Training Loss: {loss.item()}")
+            # if args.local_rank == 0:
+            #     wandb.log({"train_loss": loss.item(), 'train_learning_rate': learning_rate})
+            step_num += 1
+        learning_rate = learning_rate - (learning_rate * learning_rate_decay)
 
-    # Validation
+        # Save checkpoint every epoch
+        checkpoint_path = os.path.join(training_artifacts, experiment_name)
+        print(f"INFO Saving checkpoint: {checkpoint_path}")
+        model.save_checkpoint(checkpoint_path, f"epoch_{epoch}")
+
+        # instantiate a inference object from deepseed
+        # loop over our val_dataloader, running inference on each one
+        # Validation every epoch
+        if args.do_val:
+            model.eval()
+            total_val_loss = 0
+            for batch in val_dataloader:
+                # batch = {k: v.to(device) for k, v in batch.items()}
+                inputs = {}
+                for idx, values in batch.items():
+                    if idx in ['pixel_values', 'labels']:
+                        inputs[idx] = values.to(device)
+
+                with torch.autocast(device_type='cuda', dtype=torch.float16):        
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                    loss = outputs.loss
+                total_val_loss += loss.item()
+
+            avg_val_loss = total_val_loss / len(val_dataloader)
+            print(f"Epoch {epoch+1} completed, average val loss: {avg_val_loss}")
+            if args.local_rank == 0:
+                wandb.log({"ave_val_loss": avg_val_loss})
+
+# free up memory - remove model from gpus
+
+if args.do_test and local_rank == 0:
+    # deepseed.init_inference(...)
+    # Run the test set and print statistics if we're doing a test
+    # model = deepseed.init_inference()
+    model = deepspeed.init_inference(model)
+    # model, client_sd = model.load_checkpoint(os.path.join(training_artifacts, experiment_name))
+    # step = client_sd['step']
+
+    #advance data loader to ckpt step
+    # dataloader_to_step(data_loader, step + 1)
+    
+
     model.eval()
-    total_val_loss = 0
-    for batch in val_dataloader:
+    total_test_loss = 0
+    predicted_captions = []
+    predicted_tokens = []
+    ground_truth_captions = []
+    ground_truth_tokens = []
+    all_filenames = []
+
+    bleu1_metric = BLEUScore(n_gram=1)
+    bleu2_metric = BLEUScore(n_gram=2)
+    bleu3_metric = BLEUScore(n_gram=3)
+    bleu4_metric = BLEUScore(n_gram=4)
+    perplexity_metric = Perplexity().to(device)
+    word_error_rate_metric = WordErrorRate()
+    word_info_lost_metric = WordInformationLost()
+    word_info_preserved_metric = WordInformationPreserved()
+    cider_metric = Cider()
+    meteor_metric = Meteor()
+    rouge_metric = Rouge()
+    spice_metric = Spice()
+
+    gen_kwargs = {
+        "min_length": min_caption_length,
+        "max_length": max_caption_length,
+        "num_beams": num_beams,
+        "no_repeat_ngram_size": no_repeat_ngram_size,
+    }
+
+    for batch in test_dataloader:
         # batch = {k: v.to(device) for k, v in batch.items()}
         inputs = {}
         for idx, values in batch.items():
@@ -395,88 +471,35 @@ for epoch in range(num_epochs):
             with torch.no_grad():
                 outputs = model(**inputs)
             loss = outputs.loss
-        total_val_loss += loss.item()
+            total_test_loss += loss.item()
 
-    avg_val_loss = total_val_loss / len(val_dataloader)
-    print(f"Epoch {epoch+1} completed, average val loss: {avg_val_loss}")
-    if args.local_rank == 0:
-        wandb.log({"ave_val_loss": avg_val_loss})
+            perplexity_metric.update(outputs.logits, inputs['labels'])
 
-    # Save checkpoint every epoch
-    model.save_checkpoint(os.path.join(training_artifacts, experiment_name + f"_checkpoint_{epoch}"))
+            tokens = model.generate(**inputs, **gen_kwargs)
+            predicted_tokens.extend(tokens)
+            
+            decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
+            predicted_captions.extend(decoded_predicted_caption)
+            
+            ground_truth_caption = inputs['labels']
+            ground_truth_tokens.extend(ground_truth_caption)
+            
+            decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
+            ground_truth_captions.extend(decoded_ground_truth_caption)
 
+            all_filenames.extend(batch['filenames'])
 
-sys.exit()
+    print("DEBUG ground_truth_captions:", ground_truth_captions)
+    print("DEBUG predicted_captions:", predicted_captions)
+    metrics_dict = {}       
+    metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
 
-# Run the test set and print statistics if we're doing a test
-model.eval()
-total_test_loss = 0
-predicted_captions = []
-predicted_tokens = []
-ground_truth_captions = []
-ground_truth_tokens = []
-all_filenames = []
+    ground_truth_captions_flattened = [[x] for x in ground_truth_captions]
+    predicted_captions_flattened = [[x] for x in predicted_captions]
+    ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions_flattened))
+    predicted_captions_dict = dict((zip(all_filenames, predicted_captions_flattened)))
 
-bleu1_metric = BLEUScore(n_gram=1)
-bleu2_metric = BLEUScore(n_gram=2)
-bleu3_metric = BLEUScore(n_gram=3)
-bleu4_metric = BLEUScore(n_gram=4)
-perplexity_metric = Perplexity().to(device)
-word_error_rate_metric = WordErrorRate()
-word_info_lost_metric = WordInformationLost()
-word_info_preserved_metric = WordInformationPreserved()
-cider_metric = Cider()
-meteor_metric = Meteor()
-rouge_metric = Rouge()
-spice_metric = Spice()
-
-gen_kwargs = {
-    "min_length": min_caption_length,
-    "max_length": max_caption_length,
-    "num_beams": num_beams,
-    "no_repeat_ngram_size": no_repeat_ngram_size,
-}
-
-for batch in test_dataloader:
-    # batch = {k: v.to(device) for k, v in batch.items()}
-    inputs = {}
-    for idx, values in batch.items():
-        if idx in ['pixel_values', 'labels']:
-            inputs[idx] = values.to(device)
-
-    with torch.autocast(device_type='cuda', dtype=torch.float16):        
-        with torch.no_grad():
-            outputs = model(**inputs)
-        loss = outputs.loss
-        total_test_loss += loss.item()
-
-        perplexity_metric.update(outputs.logits, inputs['labels'])
-
-        tokens = model.generate(**inputs, **gen_kwargs)
-        predicted_tokens.extend(tokens)
-        
-        decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
-        predicted_captions.extend(decoded_predicted_caption)
-        
-        ground_truth_caption = inputs['labels']
-        ground_truth_tokens.extend(ground_truth_caption)
-        
-        decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
-        ground_truth_captions.extend(decoded_ground_truth_caption)
-
-        all_filenames.extend(batch['filenames'])
-
-print("DEBUG ground_truth_captions:", ground_truth_captions)
-print("DEBUG predicted_captions:", predicted_captions)
-metrics_dict = {}       
-metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
-
-ground_truth_captions_flattened = [[x] for x in ground_truth_captions]
-predicted_captions_flattened = [[x] for x in predicted_captions]
-ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions_flattened))
-predicted_captions_dict = dict((zip(all_filenames, predicted_captions_flattened)))
-
-if subsample_size > 0.25:
+    # if subsample_size > 0.25:
     metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
     metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
     metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
@@ -491,77 +514,73 @@ if subsample_size > 0.25:
     metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
     metrics_dict["spice_score"], metrics_dict['spice_scores'] = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
 
-print(f"Epoch {epoch+1} completed, average test loss: {metrics_dict['avg_test_loss']}")
-print(metrics_dict)
+    print(f"Epoch {epoch+1} completed, average test loss: {metrics_dict['avg_test_loss']}")
+    print(metrics_dict)
 
-if args.local_rank == 0:
-    wandb.log(metrics_dict)
-    wandb.finish()
+    if args.local_rank == 0:
+        wandb.log(metrics_dict)
+        wandb.finish()
 
-# Run the qualitative if we are doing that
-os.makedirs(output_dir, exist_ok=True)
-with open(os.path.join(output_dir, experiment_name +".csv"), 'w') as f:
-    for i,filename in enumerate(ground_truth_captions_dict):
-        f.writelines(filename + "," + predicted_captions[i][0] + "," + ground_truth_captions[i][0] + "\n")
+    # Run the qualitative if we are doing that
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, experiment_name +".csv"), 'w') as f:
+        for i,filename in enumerate(ground_truth_captions_dict):
+            f.writelines(filename + "," + predicted_captions[i][0] + "," + ground_truth_captions[i][0] + "\n")
 
-mean = torch.tensor(image_processor.image_mean).view(1, 3, 1, 1)
-std = torch.tensor(image_processor.image_std).view(1, 3, 1, 1)
+    mean = torch.tensor(image_processor.image_mean).view(1, 3, 1, 1)
+    std = torch.tensor(image_processor.image_std).view(1, 3, 1, 1)
 
-path_to_8_frames = '/data1/juve/datasets/youdescribe/videos/8-framed_images/'
-# /data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/G_QWtUFFAFQ_100000_110000_58e7cf3e46e13dfd851a2932.npz
-# /data1/juve/datasets/youdescribe/videos/8-framed_images/00-u98sOE4s_000049_000059.png
+    path_to_8_frames = '/data1/juve/datasets/youdescribe/videos/8-framed_images/'
+    # /data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/G_QWtUFFAFQ_100000_110000_58e7cf3e46e13dfd851a2932.npz
+    # /data1/juve/datasets/youdescribe/videos/8-framed_images/00-u98sOE4s_000049_000059.png
 
-# in progress
-# # make a qualitative report, don't print all test set (could be too big)
-# with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
-#     f.write(f"""<!DOCTYPE html>
-#                 <html><head></head>
-#                 <body>
-#             """)
-#     for i,filename in enumerate(ground_truth_captions_dict):
-#         clip_id = filename.split("_")[-1]
-#         end_time = int(float(filename.split("_")[-2]) / 1000)
-#         start_time = int(float(filename.split("_")[-3]) / 1000)
-#         video_id = filename[:11]
-#         new_filename = f"{video_id}_{start_time:06}_{end_time:06}.png"
+    # in progress
+    # # make a qualitative report, don't print all test set (could be too big)
+    # with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
+    #     f.write(f"""<!DOCTYPE html>
+    #                 <html><head></head>
+    #                 <body>
+    #             """)
+    #     for i,filename in enumerate(ground_truth_captions_dict):
+    #         clip_id = filename.split("_")[-1]
+    #         end_time = int(float(filename.split("_")[-2]) / 1000)
+    #         start_time = int(float(filename.split("_")[-3]) / 1000)
+    #         video_id = filename[:11]
+    #         new_filename = f"{video_id}_{start_time:06}_{end_time:06}.png"
 
-#         f.write(f"<p>{i}, {filename} {new_filename} <br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
-#         f.write(f'<img loading="lazy" src="8-framed_images/{new_filename}">')
-#         f.write("<br>\n")
-#         if i > num_qualitative:
-#             break
-#     f.write(f"</body></html>")
-
-
-# good working code, but does not scale 
-
-with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
-    f.write(f"""<!DOCTYPE html>
-                <html><head></head>
-                <body>
-            """)
-    for i,filename in enumerate(ground_truth_captions_dict):
-        npz_data = np.load(os.path.join(data_dir, "test", filename))
-        processed_images = torch.tensor(npz_data['arr_0'])
-        unprocessed_images = processed_images * std + mean
-
-        f.write(f"<p>{i}, {filename}<br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
-        # for j in range(npz_data['arr_0'].shape[0]):
-        for j in range(unprocessed_images.shape[0]):
-            an_image = unprocessed_images[j]
-            transform = transforms.ToPILImage()
-            pil_image = transform(an_image)
-            buffer = io.BytesIO()
-            pil_image.save(buffer, format="PNG")
-            buffer.seek(0) # Rewind the buffer to the beginning
-            base64_string = base64.b64encode(buffer.read()).decode()
-            img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
-            f.write(f"{img_tag}\n")
-        f.write("<br>\n")
-        if i > num_qualitative:
-            break
-    f.write(f"</body></html>")
+    #         f.write(f"<p>{i}, {filename} {new_filename} <br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
+    #         f.write(f'<img loading="lazy" src="8-framed_images/{new_filename}">')
+    #         f.write("<br>\n")
+    #         if i > num_qualitative:
+    #             break
+    #     f.write(f"</body></html>")
 
 
+    # good working code, but does not scale 
 
-model.save_pretrained(os.path.join(output_dir, experiment_name))
+    with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
+        f.write(f"""<!DOCTYPE html>
+                    <html><head></head>
+                    <body>
+                """)
+        for i,filename in enumerate(ground_truth_captions_dict):
+            npz_data = np.load(os.path.join(data_dir, "test", filename))
+            processed_images = torch.tensor(npz_data['arr_0'])
+            unprocessed_images = processed_images * std + mean
+
+            f.write(f"<p>{i}, {filename}<br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
+            # for j in range(npz_data['arr_0'].shape[0]):
+            for j in range(unprocessed_images.shape[0]):
+                an_image = unprocessed_images[j]
+                transform = transforms.ToPILImage()
+                pil_image = transform(an_image)
+                buffer = io.BytesIO()
+                pil_image.save(buffer, format="PNG")
+                buffer.seek(0) # Rewind the buffer to the beginning
+                base64_string = base64.b64encode(buffer.read()).decode()
+                img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
+                f.write(f"{img_tag}\n")
+            f.write("<br>\n")
+            if i > num_qualitative:
+                break
+        f.write(f"</body></html>")

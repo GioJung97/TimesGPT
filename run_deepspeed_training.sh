@@ -76,4 +76,5 @@
 
 # time deepspeed main_deepspeed.py --num_gpus=4 -ep 1 -bs 1 -nahe 12 -nhle 12 -nld 12 -nhd 12 -ss 1.0
 export CUDA_VISIBLE_DEVICES="0,1,3,4"
-time deepspeed main_deepspeed.py --num_gpus=4 -ep 2 -ss .001 --train_batch_size=128 -nahe 12 -nhle 12 -nld 12 -nhd 12
+# time deepspeed main_deepspeed.py --num_gpus=4 -ep 2 -ss .001 --train_batch_size=128 -nahe 12 -nhle 12 -nld 12 -nhd 12 --do_train --do_val --do_test
+time deepspeed main_deepspeed.py --num_gpus=4 -ep 2 -ss .001 --train_batch_size=128 -nahe 12 -nhle 12 -nld 12 -nhd 12 --do_test
