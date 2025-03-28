@@ -481,18 +481,18 @@ if args.do_test:
     ground_truth_tokens = []
     all_filenames = []
 
-    # bleu1_metric = BLEUScore(n_gram=1)
-    # bleu2_metric = BLEUScore(n_gram=2)
-    # bleu3_metric = BLEUScore(n_gram=3)
-    # bleu4_metric = BLEUScore(n_gram=4)
-    # perplexity_metric = Perplexity().to(device)
-    # word_error_rate_metric = WordErrorRate()
-    # word_info_lost_metric = WordInformationLost()
-    # word_info_preserved_metric = WordInformationPreserved()
-    # cider_metric = Cider()
-    # meteor_metric = Meteor()
-    # rouge_metric = Rouge()
-    # spice_metric = Spice()
+    bleu1_metric = BLEUScore(n_gram=1)
+    bleu2_metric = BLEUScore(n_gram=2)
+    bleu3_metric = BLEUScore(n_gram=3)
+    bleu4_metric = BLEUScore(n_gram=4)
+    perplexity_metric = Perplexity().to(device)
+    word_error_rate_metric = WordErrorRate()
+    word_info_lost_metric = WordInformationLost()
+    word_info_preserved_metric = WordInformationPreserved()
+    cider_metric = Cider()
+    meteor_metric = Meteor()
+    rouge_metric = Rouge()
+    spice_metric = Spice()
 
     gen_kwargs = {
         "min_length": min_caption_length,
@@ -660,7 +660,7 @@ if args.do_test:
                 processed_images = torch.tensor(npz_data['arr_0'])
                 unprocessed_images = processed_images * std + mean
 
-                f.write(f"<div class='sample'><p>{i}, {filename}<br>Predicted Caption: {predicted_captions[i]}<br>Ground-Truth Caption: {ground_truth_captions[i]}</p>\n<div class='grid-container'>\n")
+                f.write(f"<div class='sample'><p>{i}, {filename}<br>Predicted Caption: {predicted_captions_dict[filename]}<br>Ground-Truth Caption: {ground_truth_captions_dict[filename]}</p>\n<div class='grid-container'>\n")
                 # for j in range(npz_data['arr_0'].shape[0]):
                 for j in range(unprocessed_images.shape[0]):
                     an_image = unprocessed_images[j]
