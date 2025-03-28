@@ -419,13 +419,29 @@ if args.do_train:
                 wandb.log({"ave_val_loss": avg_val_loss})
 
 # free up memory - remove model from gpus
+# del model
 
-if args.do_test and local_rank == 0:
+
+# deepspeed.init_distributed()
+# model, _, train_dataloader, _ = deepspeed.initialize(
+#     args=args,
+#     model=model,
+#     model_parameters=[p for p in model.parameters() if p.requires_grad],
+#     training_data=train_dataset,
+#     config=ds_config_file)
+
+
+# model = deepspeed.init_inference(model)
+_, _ = model.load_checkpoint(os.path.join(training_artifacts, experiment_name))
+
+# model = deepspeed.init_inference(model)
+
+
+if args.do_test:
     # deepseed.init_inference(...)
     # Run the test set and print statistics if we're doing a test
     # model = deepseed.init_inference()
-    model = deepspeed.init_inference(model)
-    # model, client_sd = model.load_checkpoint(os.path.join(training_artifacts, experiment_name))
+    # model = deepspeed.init_inference(model)
     # step = client_sd['step']
 
     #advance data loader to ckpt step
@@ -459,37 +475,49 @@ if args.do_test and local_rank == 0:
         "num_beams": num_beams,
         "no_repeat_ngram_size": no_repeat_ngram_size,
     }
-
+    print("DEBUG before test_dataloader loop")
     for batch in test_dataloader:
         # batch = {k: v.to(device) for k, v in batch.items()}
+        print("DEBUG inside test_dataloader loop")
         inputs = {}
         for idx, values in batch.items():
             if idx in ['pixel_values', 'labels']:
                 inputs[idx] = values.to(device)
+        print("DEBUG inside test_dataloader loop - 2")
 
-        with torch.autocast(device_type='cuda', dtype=torch.float16):        
+        with torch.autocast(device_type='cuda', dtype=torch.float16):       
+            print("DEBUG inside test_dataloader loop - 2.1")
+ 
             with torch.no_grad():
+                print("DEBUG inside test_dataloader loop - 2.2")
                 outputs = model(**inputs)
+            print("DEBUG inside test_dataloader loop - 2.3")
             loss = outputs.loss
+            print("DEBUG inside test_dataloader loop - 2.4")
             total_test_loss += loss.item()
 
-            perplexity_metric.update(outputs.logits, inputs['labels'])
+            # perplexity_metric.update(outputs.logits, inputs['labels'])
+            print("DEBUG inside test_dataloader loop - 3")
 
             tokens = model.generate(**inputs, **gen_kwargs)
             predicted_tokens.extend(tokens)
-            
+            print("DEBUG inside test_dataloader loop - 4")
+
             decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
             predicted_captions.extend(decoded_predicted_caption)
-            
+            print("DEBUG inside test_dataloader loop - 5")
+
             ground_truth_caption = inputs['labels']
             ground_truth_tokens.extend(ground_truth_caption)
-            
+            print("DEBUG inside test_dataloader loop - 6")
+
             decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
             ground_truth_captions.extend(decoded_ground_truth_caption)
+            print("DEBUG inside test_dataloader loop - 7")
 
             all_filenames.extend(batch['filenames'])
 
-    print("DEBUG ground_truth_captions:", ground_truth_captions)
+    print("DEBUG  :", ground_truth_captions)
     print("DEBUG predicted_captions:", predicted_captions)
     metrics_dict = {}       
     metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
