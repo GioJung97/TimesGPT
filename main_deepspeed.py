@@ -25,13 +25,13 @@ import torch.nn.functional as F
 from PIL import Image
 import base64
 
-
 from transformers.integrations import HfDeepSpeedConfig
 from transformers import AutoModel
 import deepspeed
 from deepspeed.pipe import PipelineModule
 from deepspeed.utils import RepeatingLoader
 
+import torch.distributed as dist
 
 # parse command line args here
 parser = argparse.ArgumentParser()
@@ -160,8 +160,23 @@ args = parser.parse_args()
 # ls /data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/train | wc
 # 46079
 # 11 * 46079 = 506869
+# /4 = 126717
 
-# 126717
+# Check for environmnet variable with machine LOCAL_RANK?
+if 'LOCAL_RANK' in os.environ:
+    args.local_rank = int(os.environ['LOCAL_RANK'])
+
+# Then set the device accordingly:
+torch.cuda.set_device(args.local_rank)
+device = torch.device("cuda", args.local_rank)
+
+# If we haven't initialized a distributed environment...
+if not dist.is_initialized():
+    deepspeed.init_distributed()
+
+world_size = dist.get_world_size() if dist.is_initialized() else 1
+rank = dist.get_rank() if dist.is_initialized() else 0
+print(f"DEBUG world_size: {world_size}, rank: {rank}, args.local_rank: {args.local_rank}")
 
 seed = args.random_seed
 num_epochs = args.epochs
@@ -418,37 +433,47 @@ if args.do_train:
             if args.local_rank == 0:
                 wandb.log({"ave_val_loss": avg_val_loss})
 
-# free up memory - remove model from gpus
-# del model
-
-
-# deepspeed.init_distributed()
-# model, _, train_dataloader, _ = deepspeed.initialize(
-#     args=args,
-#     model=model,
-#     model_parameters=[p for p in model.parameters() if p.requires_grad],
-#     training_data=train_dataset,
-#     config=ds_config_file)
-
-
-# model = deepspeed.init_inference(model)
-_, _ = model.load_checkpoint(os.path.join(training_artifacts, experiment_name))
-
-# model = deepspeed.init_inference(model)
-
 
 if args.do_test:
-    # deepseed.init_inference(...)
-    # Run the test set and print statistics if we're doing a test
-    # model = deepseed.init_inference()
-    # model = deepspeed.init_inference(model)
-    # step = client_sd['step']
 
-    #advance data loader to ckpt step
-    # dataloader_to_step(data_loader, step + 1)
-    
+    del model, config, tokenizer, image_processor
 
+    # load pretrained processor, tokenizer, and model
+    image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    # model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
+    # /data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3
+
+    config = VisionEncoderDecoderConfig.from_pretrained(pretrained_model)
+    config.encoder.num_hidden_layers = args.num_hidden_layers_encoder
+    config.encoder.num_attention_heads = args.num_attention_heads_encoder
+    config.decoder.n_layer = args.num_layers_decoder
+    config.decoder.n_heads = args.num_heads_decoder
+
+    config.encoder.attention_type = args.attention_type_encoder
+    config.encoder.hidden_size = args.hidden_size_encoder
+    config.encoder.intermediate_size = args.intermediate_size_encoder
+    config.encoder.image_size = args.image_size_encoder
+    config.encoder.num_frames = args.num_frames_encoder
+    config.encoder.path_size = args.patch_size_encoder
+
+    model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.model_max_length = max_caption_length
+    tokenizer.max_length = max_caption_length
+
+    model.config.decoder_start_token_id = tokenizer.bos_token_id
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.max_length = max_caption_length
+    model.config.num_beams = num_beams
+    model.config.no_repeat_ngram_size = no_repeat_ngram_size
+
+    model = deepspeed.init_inference(model)
     model.eval()
+
+
     total_test_loss = 0
     predicted_captions = []
     predicted_tokens = []
@@ -456,159 +481,198 @@ if args.do_test:
     ground_truth_tokens = []
     all_filenames = []
 
-    bleu1_metric = BLEUScore(n_gram=1)
-    bleu2_metric = BLEUScore(n_gram=2)
-    bleu3_metric = BLEUScore(n_gram=3)
-    bleu4_metric = BLEUScore(n_gram=4)
-    perplexity_metric = Perplexity().to(device)
-    word_error_rate_metric = WordErrorRate()
-    word_info_lost_metric = WordInformationLost()
-    word_info_preserved_metric = WordInformationPreserved()
-    cider_metric = Cider()
-    meteor_metric = Meteor()
-    rouge_metric = Rouge()
-    spice_metric = Spice()
+    # bleu1_metric = BLEUScore(n_gram=1)
+    # bleu2_metric = BLEUScore(n_gram=2)
+    # bleu3_metric = BLEUScore(n_gram=3)
+    # bleu4_metric = BLEUScore(n_gram=4)
+    # perplexity_metric = Perplexity().to(device)
+    # word_error_rate_metric = WordErrorRate()
+    # word_info_lost_metric = WordInformationLost()
+    # word_info_preserved_metric = WordInformationPreserved()
+    # cider_metric = Cider()
+    # meteor_metric = Meteor()
+    # rouge_metric = Rouge()
+    # spice_metric = Spice()
 
     gen_kwargs = {
         "min_length": min_caption_length,
         "max_length": max_caption_length,
-        "num_beams": num_beams,
+        "num_beams": 1,
         "no_repeat_ngram_size": no_repeat_ngram_size,
     }
-    print("DEBUG before test_dataloader loop")
     for batch in test_dataloader:
         # batch = {k: v.to(device) for k, v in batch.items()}
-        print("DEBUG inside test_dataloader loop")
         inputs = {}
         for idx, values in batch.items():
             if idx in ['pixel_values', 'labels']:
                 inputs[idx] = values.to(device)
-        print("DEBUG inside test_dataloader loop - 2")
 
         with torch.autocast(device_type='cuda', dtype=torch.float16):       
-            print("DEBUG inside test_dataloader loop - 2.1")
  
             with torch.no_grad():
-                print("DEBUG inside test_dataloader loop - 2.2")
                 outputs = model(**inputs)
-            print("DEBUG inside test_dataloader loop - 2.3")
             loss = outputs.loss
-            print("DEBUG inside test_dataloader loop - 2.4")
             total_test_loss += loss.item()
 
-            # perplexity_metric.update(outputs.logits, inputs['labels'])
-            print("DEBUG inside test_dataloader loop - 3")
+            perplexity_metric.update(outputs.logits, inputs['labels'])
 
             tokens = model.generate(**inputs, **gen_kwargs)
             predicted_tokens.extend(tokens)
-            print("DEBUG inside test_dataloader loop - 4")
 
             decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
             predicted_captions.extend(decoded_predicted_caption)
-            print("DEBUG inside test_dataloader loop - 5")
 
             ground_truth_caption = inputs['labels']
             ground_truth_tokens.extend(ground_truth_caption)
-            print("DEBUG inside test_dataloader loop - 6")
 
             decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
             ground_truth_captions.extend(decoded_ground_truth_caption)
-            print("DEBUG inside test_dataloader loop - 7")
 
             all_filenames.extend(batch['filenames'])
 
-    print("DEBUG  :", ground_truth_captions)
+    print("DEBUG ground_truth_captions:", ground_truth_captions)
     print("DEBUG predicted_captions:", predicted_captions)
-    metrics_dict = {}       
-    metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
 
-    ground_truth_captions_flattened = [[x] for x in ground_truth_captions]
-    predicted_captions_flattened = [[x] for x in predicted_captions]
-    ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions_flattened))
-    predicted_captions_dict = dict((zip(all_filenames, predicted_captions_flattened)))
+    # Aggregate loss across GPUs
+    loss_tensor = torch.tensor(total_test_loss, device=device)
+    if dist.is_initialized():
+        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+    total_test_loss = loss_tensor.item()
 
-    # if subsample_size > 0.25:
-    metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
-    metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
-    metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
-    metrics_dict["blue4_score"] = bleu4_metric.update(predicted_captions, ground_truth_captions).compute().item()
-    metrics_dict["perplexity_score"] = perplexity_metric.compute().item()
-    metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(predicted_captions, ground_truth_captions).compute().item()
-    metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(predicted_captions, ground_truth_captions).compute().item()
-    metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(predicted_captions, ground_truth_captions).compute().item()
-
-    metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-    metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-    metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-    metrics_dict["spice_score"], metrics_dict['spice_scores'] = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-
-    print(f"Epoch {epoch+1} completed, average test loss: {metrics_dict['avg_test_loss']}")
-    print(metrics_dict)
-
+    # Gather lists from all GPUs (requires PyTorch 1.8+)
+    gathered_predicted = [None for _ in range(world_size)]
+    gathered_gt = [None for _ in range(world_size)]
+    gathered_filenames = [None for _ in range(world_size)]
+    if dist.is_initialized():
+        dist.all_gather_object(gathered_predicted, predicted_captions)
+        dist.all_gather_object(gathered_gt, ground_truth_captions)
+        dist.all_gather_object(gathered_filenames, all_filenames)
+        
+        predicted_captions = [item for sublist in gathered_predicted for item in sublist]
+        ground_truth_captions = [item for sublist in gathered_gt for item in sublist]
+        all_filenames = [item for sublist in gathered_filenames for item in sublist]
+    
     if args.local_rank == 0:
+        avg_loss = total_test_loss / (len(test_dataloader) * world_size)
+        print(f"Average Test Loss: {avg_loss}")
+
+        bleu1_metric = BLEUScore(n_gram=1)
+        bleu2_metric = BLEUScore(n_gram=2)
+        bleu3_metric = BLEUScore(n_gram=3)
+        bleu4_metric = BLEUScore(n_gram=4)
+        
+        word_error_rate_metric = WordErrorRate()
+        word_info_lost_metric = WordInformationLost()
+        word_info_preserved_metric = WordInformationPreserved()
+        cider_metric = Cider()
+        meteor_metric = Meteor()
+        rouge_metric = Rouge()
+        spice_metric = Spice()    
+        metrics_dict = {}       
+        metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
+
+        ground_truth_captions_flattened = [[x] for x in ground_truth_captions]
+        predicted_captions_flattened = [[x] for x in predicted_captions]
+        ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions_flattened))
+        predicted_captions_dict = dict((zip(all_filenames, predicted_captions_flattened)))
+
+        # if subsample_size > 0.25:
+        metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
+        metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
+        metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
+        metrics_dict["blue4_score"] = bleu4_metric.update(predicted_captions, ground_truth_captions).compute().item()
+        metrics_dict["perplexity_score"] = perplexity_metric.compute().item()
+        metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(predicted_captions, ground_truth_captions).compute().item()
+        metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(predicted_captions, ground_truth_captions).compute().item()
+        metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(predicted_captions, ground_truth_captions).compute().item()
+
+        metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+        metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+        metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+        metrics_dict["spice_score"], spice_scores = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+
+        print(f"Average test loss: {metrics_dict['avg_test_loss']}")
+        print(metrics_dict)
+
         wandb.log(metrics_dict)
         wandb.finish()
 
-    # Run the qualitative if we are doing that
-    os.makedirs(output_dir, exist_ok=True)
-    with open(os.path.join(output_dir, experiment_name +".csv"), 'w') as f:
-        for i,filename in enumerate(ground_truth_captions_dict):
-            f.writelines(filename + "," + predicted_captions[i][0] + "," + ground_truth_captions[i][0] + "\n")
+        # Run the qualitative if we are doing that
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, experiment_name +".csv"), 'w') as f:
+            for i,filename in enumerate(ground_truth_captions_dict):
+                f.writelines(filename + "," + predicted_captions[i][0] + "," + ground_truth_captions[i][0] + "\n")
 
-    mean = torch.tensor(image_processor.image_mean).view(1, 3, 1, 1)
-    std = torch.tensor(image_processor.image_std).view(1, 3, 1, 1)
+        mean = torch.tensor(image_processor.image_mean).view(1, 3, 1, 1)
+        std = torch.tensor(image_processor.image_std).view(1, 3, 1, 1)
 
-    path_to_8_frames = '/data1/juve/datasets/youdescribe/videos/8-framed_images/'
-    # /data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/G_QWtUFFAFQ_100000_110000_58e7cf3e46e13dfd851a2932.npz
-    # /data1/juve/datasets/youdescribe/videos/8-framed_images/00-u98sOE4s_000049_000059.png
+        path_to_8_frames = '/data1/juve/datasets/youdescribe/videos/8-framed_images/'
+        # /data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/G_QWtUFFAFQ_100000_110000_58e7cf3e46e13dfd851a2932.npz
+        # /data1/juve/datasets/youdescribe/videos/8-framed_images/00-u98sOE4s_000049_000059.png
 
-    # in progress
-    # # make a qualitative report, don't print all test set (could be too big)
-    # with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
-    #     f.write(f"""<!DOCTYPE html>
-    #                 <html><head></head>
-    #                 <body>
-    #             """)
-    #     for i,filename in enumerate(ground_truth_captions_dict):
-    #         clip_id = filename.split("_")[-1]
-    #         end_time = int(float(filename.split("_")[-2]) / 1000)
-    #         start_time = int(float(filename.split("_")[-3]) / 1000)
-    #         video_id = filename[:11]
-    #         new_filename = f"{video_id}_{start_time:06}_{end_time:06}.png"
+        # in progress
+        # # make a qualitative report, don't print all test set (could be too big)
+        # with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
+        #     f.write(f"""<!DOCTYPE html>
+        #                 <html><head></head>
+        #                 <body>
+        #             """)
+        #     for i,filename in enumerate(ground_truth_captions_dict):
+        #         clip_id = filename.split("_")[-1]
+        #         end_time = int(float(filename.split("_")[-2]) / 1000)
+        #         start_time = int(float(filename.split("_")[-3]) / 1000)
+        #         video_id = filename[:11]
+        #         new_filename = f"{video_id}_{start_time:06}_{end_time:06}.png"
 
-    #         f.write(f"<p>{i}, {filename} {new_filename} <br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
-    #         f.write(f'<img loading="lazy" src="8-framed_images/{new_filename}">')
-    #         f.write("<br>\n")
-    #         if i > num_qualitative:
-    #             break
-    #     f.write(f"</body></html>")
+        #         f.write(f"<p>{i}, {filename} {new_filename} <br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
+        #         f.write(f'<img loading="lazy" src="8-framed_images/{new_filename}">')
+        #         f.write("<br>\n")
+        #         if i > num_qualitative:
+        #             break
+        #     f.write(f"</body></html>")
 
 
-    # good working code, but does not scale 
+        # good working code, but does not scale 
 
-    with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
-        f.write(f"""<!DOCTYPE html>
-                    <html><head></head>
-                    <body>
-                """)
-        for i,filename in enumerate(ground_truth_captions_dict):
-            npz_data = np.load(os.path.join(data_dir, "test", filename))
-            processed_images = torch.tensor(npz_data['arr_0'])
-            unprocessed_images = processed_images * std + mean
+        with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
+            f.write(f"""<!DOCTYPE html>
+                        <html><head><style>
+                        .sample {{  width: 1024px; border: 1px solid black; padding: 10px; margin: 10px; }}
 
-            f.write(f"<p>{i}, {filename}<br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
-            # for j in range(npz_data['arr_0'].shape[0]):
-            for j in range(unprocessed_images.shape[0]):
-                an_image = unprocessed_images[j]
-                transform = transforms.ToPILImage()
-                pil_image = transform(an_image)
-                buffer = io.BytesIO()
-                pil_image.save(buffer, format="PNG")
-                buffer.seek(0) # Rewind the buffer to the beginning
-                base64_string = base64.b64encode(buffer.read()).decode()
-                img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
-                f.write(f"{img_tag}\n")
-            f.write("<br>\n")
-            if i > num_qualitative:
-                break
-        f.write(f"</body></html>")
+                        .grid-container {{
+                            display: grid;
+                            grid-template-columns: repeat(4, 1fr); /* Creates 4 equal columns */
+                            grid-template-rows: repeat(2, 1fr); /* Creates 2 equal rows */
+                            place-items: center;                                    
+                            gap: 10px; /* Optional: Add spacing between grid items */
+                        }}
+
+                        .grid-container img {{
+                            width: 224px; /* Make images fill the grid cells */                                 
+                            height: 224px;                                                                      
+                            object-fit: cover; /* Maintain aspect ratio and cover the cell */
+                        }}
+                        </style></head>
+                        <body>
+                    """)
+            for i,filename in enumerate(ground_truth_captions_dict):
+                npz_data = np.load(os.path.join(data_dir, "test", filename))
+                processed_images = torch.tensor(npz_data['arr_0'])
+                unprocessed_images = processed_images * std + mean
+
+                f.write(f"<div class='sample'><p>{i}, {filename}<br>Predicted Caption: {predicted_captions[i]}<br>Ground-Truth Caption: {ground_truth_captions[i]}</p>\n<div class='grid-container'>\n")
+                # for j in range(npz_data['arr_0'].shape[0]):
+                for j in range(unprocessed_images.shape[0]):
+                    an_image = unprocessed_images[j]
+                    transform = transforms.ToPILImage()
+                    pil_image = transform(an_image)
+                    buffer = io.BytesIO()
+                    pil_image.save(buffer, format="PNG")
+                    buffer.seek(0) # Rewind the buffer to the beginning
+                    base64_string = base64.b64encode(buffer.read()).decode()
+                    img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
+                    f.write(f"{img_tag}\n")
+                f.write("</div></div>\n")
+                if i > num_qualitative:
+                    break
+            f.write(f"</body></html>")
