@@ -27,11 +27,11 @@ import base64
 
 from transformers.integrations import HfDeepSpeedConfig
 from transformers import AutoModel
-import deepspeed
-from deepspeed.pipe import PipelineModule
-from deepspeed.utils import RepeatingLoader
-
 import torch.distributed as dist
+# from deepspeed.pipe import PipelineModule
+# from deepspeed.utils import RepeatingLoader
+# from deepspeed.runtime.engine import DeepSpeedEngine
+import deepspeed
 
 # parse command line args here
 parser = argparse.ArgumentParser()
@@ -212,6 +212,7 @@ experiment_name = f'deepspeed_testing'
 
 num_qualitative = 100
 ds_config_file = "./ds_config.json"
+inf_config_file = "./inference_config.json"
 
 # start a new wandb run to track this script
 if args.local_rank == 0:
@@ -265,13 +266,13 @@ class NPZDataset(Dataset):
 train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-val_dataset = NPZDataset(val_data_dir, num_captions, subsample_size)
+val_dataset = NPZDataset(val_data_dir, 1, subsample_size)
 val_sampler = DistributedSampler(val_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler)
 
-test_dataset = NPZDataset(test_data_dir, num_captions, subsample_size)
-test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size, sampler=test_sampler)
+test_dataset = NPZDataset(test_data_dir, 1, subsample_size)
+# test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
+test_dataloader = DataLoader(test_dataset, batch_size=1)
 
 # load pretrained processor, tokenizer, and model
 image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
@@ -292,9 +293,6 @@ config.encoder.image_size = args.image_size_encoder
 config.encoder.num_frames = args.num_frames_encoder
 config.encoder.path_size = args.patch_size_encoder
 
-
-
-
 model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
@@ -303,7 +301,7 @@ tokenizer.model_max_length = max_caption_length
 tokenizer.max_length = max_caption_length
 
 model.config.decoder_start_token_id = tokenizer.bos_token_id
-model.config.pad_token_id = tokenizer.pad_token_id
+model.config.pad_token_id = tokenizer.eos_token_id
 model.config.max_length = max_caption_length
 model.config.num_beams = num_beams
 model.config.no_repeat_ngram_size = no_repeat_ngram_size
@@ -367,16 +365,18 @@ print("DEBUG len(train_dataloader): ", len(train_dataloader))
 print("DEBUG len(val_dataloader): ", len(val_dataloader))
 print("DEBUG len(test_dataloader): ", len(test_dataloader))
 
-# deepspeed.init_distributed()
-model, _, train_dataloader, _ = deepspeed.initialize(
-    args=args,
-    model=model,
-    model_parameters=[p for p in model.parameters() if p.requires_grad],
-    training_data=train_dataset,
-    config=ds_config_file)
 
 # Train and Val
 if args.do_train:
+
+    # deepspeed.init_distributed()
+    model, _, train_dataloader, _ = deepspeed.initialize(
+        args=args,
+        model=model,
+        model_parameters=[p for p in model.parameters() if p.requires_grad],
+        training_data=train_dataset,
+        config=ds_config_file)
+
     for epoch in range(num_epochs):
         model.train()
         step_num = 0
@@ -438,40 +438,72 @@ if args.do_test:
 
     del model, config, tokenizer, image_processor
 
-    # load pretrained processor, tokenizer, and model
-    image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    # model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
-    # /data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3
+    # # load pretrained processor, tokenizer, and model
+    # image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
+    # tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    # # model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
+    # # /data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3
 
-    config = VisionEncoderDecoderConfig.from_pretrained(pretrained_model)
-    config.encoder.num_hidden_layers = args.num_hidden_layers_encoder
-    config.encoder.num_attention_heads = args.num_attention_heads_encoder
-    config.decoder.n_layer = args.num_layers_decoder
-    config.decoder.n_heads = args.num_heads_decoder
+    # config = VisionEncoderDecoderConfig.from_pretrained(pretrained_model)
+    # config.encoder.num_hidden_layers = args.num_hidden_layers_encoder
+    # config.encoder.num_attention_heads = args.num_attention_heads_encoder
+    # config.decoder.n_layer = args.num_layers_decoder
+    # config.decoder.n_heads = args.num_heads_decoder
 
-    config.encoder.attention_type = args.attention_type_encoder
-    config.encoder.hidden_size = args.hidden_size_encoder
-    config.encoder.intermediate_size = args.intermediate_size_encoder
-    config.encoder.image_size = args.image_size_encoder
-    config.encoder.num_frames = args.num_frames_encoder
-    config.encoder.path_size = args.patch_size_encoder
+    # config.encoder.attention_type = args.attention_type_encoder
+    # config.encoder.hidden_size = args.hidden_size_encoder
+    # config.encoder.intermediate_size = args.intermediate_size_encoder
+    # config.encoder.image_size = args.image_size_encoder
+    # config.encoder.num_frames = args.num_frames_encoder
+    # config.encoder.path_size = args.patch_size_encoder
 
-    model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    # model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.model_max_length = max_caption_length
-    tokenizer.max_length = max_caption_length
+    # tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.model_max_length = max_caption_length
+    # tokenizer.max_length = max_caption_length
 
-    model.config.decoder_start_token_id = tokenizer.bos_token_id
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.config.max_length = max_caption_length
-    model.config.num_beams = num_beams
-    model.config.no_repeat_ngram_size = no_repeat_ngram_size
+    # model.config.decoder_start_token_id = tokenizer.bos_token_id
+    # model.config.pad_token_id = tokenizer.pad_token_id
+    # model.config.max_length = max_caption_length
+    # model.config.num_beams = num_beams
+    # model.config.no_repeat_ngram_size = no_repeat_ngram_size
 
-    model = deepspeed.init_inference(model)
-    model.eval()
+
+    model = deepspeed.init_inference(
+        model=model,
+        # config=inf_config_file,
+        checkpoint="./checkpoint.json",  
+        replace_with_kernel_inject=False
+        )
+    
+
+    # model = ds_engine.module
+    
+    # deepspeed.init_distributed()
+    # model, _, test_dataloader, _ = deepspeed.initialize(
+    #     # args=args,
+    #     model=model,
+    #     # model_parameters=[p for p in model.parameters() if p.requires_grad],
+    #     training_data=test_dataset,
+    #     config=inf_config_file,
+    #     checkpoint
+    #     )
+
+    # # model, _, train_dataloader, _ = deepspeed.initialize(
+    # #     args=args,
+    # #     model=model,
+    # #     model_parameters=[p for p in model.parameters() if p.requires_grad],
+    # #     training_data=train_dataset,
+    # #     config=ds_config_file)
+
+    # checkpoint_path = os.path.join(training_artifacts, experiment_name)
+    # checkpoint_json = {"type": "ds_model", "version": 0.0, "checkpoints": checkpoint_path,}
+    # # model = deepspeed.init_inference(model)
+    # _, client_sd = model.load_checkpoint(checkpoint_path)
+    # model.eval()
+    print("DEBUG -- MADE IT HERE")
 
 
     total_test_loss = 0
@@ -499,6 +531,7 @@ if args.do_test:
         "max_length": max_caption_length,
         "num_beams": 1,
         "no_repeat_ngram_size": no_repeat_ngram_size,
+        "early_stopping": False,
     }
     for batch in test_dataloader:
         # batch = {k: v.to(device) for k, v in batch.items()}
@@ -516,7 +549,7 @@ if args.do_test:
 
             perplexity_metric.update(outputs.logits, inputs['labels'])
 
-            tokens = model.generate(**inputs, **gen_kwargs)
+            tokens = model.generate(**inputs, **gen_kwargs, pad_token_id=tokenizer.eos_token_id)
             predicted_tokens.extend(tokens)
 
             decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
