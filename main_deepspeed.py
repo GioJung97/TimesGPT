@@ -238,7 +238,6 @@ if args.local_rank == 0:
         },
     )
 
-
 class NPZDataset(Dataset):
     def __init__(self, data_dir, num_captions, subsample_size):
         self.data_dir = data_dir
@@ -315,10 +314,6 @@ def join_layers(vision_model):
     ]
     return layers
 
-
-
-
-
 if args.freeze_encoder_decoder:
     for parameter in model.parameters():
         parameter.requires_grad = False
@@ -335,31 +330,6 @@ if args.freeze_encoder_decoder:
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 print("Number of trainable parameters: ", trainable_params)
 
-# if args.freeze_encoder_decoder:
-#     for parameter in model.parameters():
-#         parameter.requires_grad = False
-
-#     for block in model.decoder.transformer.h:
-#         for name, param in block.named_parameters():
-#             if "crossatt" in name or 'ln_cross_attn' in name:
-#                 param.requires_grad = True
-
-
-
-# model.to(device)
-
-# if subsample_size != None:
-#     train_subset_indices = range(0, int(len(train_dataloader) * subsample_size))
-#     train_subset = Subset(train_dataset, train_subset_indices)
-#     train_dataloader = DataLoader(train_subset, batch_size=batch_size)
-
-#     val_subset_indices = range(0, int(len(val_dataloader) * subsample_size))
-#     val_subset = Subset(val_dataset, val_subset_indices)
-#     val_dataloader = DataLoader(val_subset, batch_size=batch_size)
-
-#     test_subset_indices = range(0, int(len(test_dataloader) * subsample_size))
-#     test_subset = Subset(test_dataset, test_subset_indices)
-#     test_dataloader = DataLoader(test_subset, batch_size=batch_size)
 
 print("DEBUG len(train_dataloader): ", len(train_dataloader))
 print("DEBUG len(val_dataloader): ", len(val_dataloader))
@@ -438,73 +408,12 @@ if args.do_test:
 
     del model, config, tokenizer, image_processor
 
-    # # load pretrained processor, tokenizer, and model
-    # image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
-    # tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    # # model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
-    # # /data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3
-
-    # config = VisionEncoderDecoderConfig.from_pretrained(pretrained_model)
-    # config.encoder.num_hidden_layers = args.num_hidden_layers_encoder
-    # config.encoder.num_attention_heads = args.num_attention_heads_encoder
-    # config.decoder.n_layer = args.num_layers_decoder
-    # config.decoder.n_heads = args.num_heads_decoder
-
-    # config.encoder.attention_type = args.attention_type_encoder
-    # config.encoder.hidden_size = args.hidden_size_encoder
-    # config.encoder.intermediate_size = args.intermediate_size_encoder
-    # config.encoder.image_size = args.image_size_encoder
-    # config.encoder.num_frames = args.num_frames_encoder
-    # config.encoder.path_size = args.patch_size_encoder
-
-    # model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-
-    # tokenizer.pad_token = tokenizer.eos_token
-    # tokenizer.model_max_length = max_caption_length
-    # tokenizer.max_length = max_caption_length
-
-    # model.config.decoder_start_token_id = tokenizer.bos_token_id
-    # model.config.pad_token_id = tokenizer.pad_token_id
-    # model.config.max_length = max_caption_length
-    # model.config.num_beams = num_beams
-    # model.config.no_repeat_ngram_size = no_repeat_ngram_size
-
-
     model = deepspeed.init_inference(
         model=model,
         # config=inf_config_file,
         checkpoint="./checkpoint.json",  
         replace_with_kernel_inject=False
         )
-    
-
-    # model = ds_engine.module
-    
-    # deepspeed.init_distributed()
-    # model, _, test_dataloader, _ = deepspeed.initialize(
-    #     # args=args,
-    #     model=model,
-    #     # model_parameters=[p for p in model.parameters() if p.requires_grad],
-    #     training_data=test_dataset,
-    #     config=inf_config_file,
-    #     checkpoint
-    #     )
-
-    # # model, _, train_dataloader, _ = deepspeed.initialize(
-    # #     args=args,
-    # #     model=model,
-    # #     model_parameters=[p for p in model.parameters() if p.requires_grad],
-    # #     training_data=train_dataset,
-    # #     config=ds_config_file)
-
-    # checkpoint_path = os.path.join(training_artifacts, experiment_name)
-    # checkpoint_json = {"type": "ds_model", "version": 0.0, "checkpoints": checkpoint_path,}
-    # # model = deepspeed.init_inference(model)
-    # _, client_sd = model.load_checkpoint(checkpoint_path)
-    # model.eval()
-    print("DEBUG -- MADE IT HERE")
-
 
     total_test_loss = 0
     predicted_captions = []
