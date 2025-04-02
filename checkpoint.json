@@ -1,5 +1,5 @@
 {
     "type": "ds_model",
     "version": 0.0,
-    "checkpoints": "/data2/juve/training_artifacts/deepspeed_testing/epoch_1/"
+    "checkpoints": "/data2/juve/training_artifacts/deepspeed_testing/epoch_2/"
 }

@@ -192,7 +192,7 @@ max_caption_length = 500
 min_caption_length = 10
 num_beams = 4
 no_repeat_ngram_size = 3 # don't repeat same word more than this many times
-num_captions = 11
+num_captions = 5
 
 # pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
 pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
@@ -267,7 +267,7 @@ train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True
 
 val_dataset = NPZDataset(val_data_dir, 1, subsample_size)
 val_sampler = DistributedSampler(val_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size, sampler=val_sampler)
+val_dataloader = DataLoader(val_dataset, batch_size=1, sampler=val_sampler)
 
 test_dataset = NPZDataset(test_data_dir, 1, subsample_size)
 # test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
@@ -328,8 +328,7 @@ if args.freeze_encoder_decoder:
 
 
 trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print("Number of trainable parameters: ", trainable_params)
-
+print("DEBUG Number of trainable parameters: ", trainable_params)
 
 print("DEBUG len(train_dataloader): ", len(train_dataloader))
 print("DEBUG len(val_dataloader): ", len(val_dataloader))
@@ -406,7 +405,7 @@ if args.do_train:
 
 if args.do_test:
 
-    del model, config, tokenizer, image_processor
+    # del model, config, tokenizer, image_processor
 
     model = deepspeed.init_inference(
         model=model,
