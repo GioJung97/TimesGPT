@@ -270,8 +270,8 @@ val_sampler = DistributedSampler(val_dataset, shuffle=True, num_replicas=num_gpu
 val_dataloader = DataLoader(val_dataset, batch_size=1, sampler=val_sampler)
 
 test_dataset = NPZDataset(test_data_dir, 1, subsample_size)
-# test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
-test_dataloader = DataLoader(test_dataset, batch_size=1)
+test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
+test_dataloader = DataLoader(test_dataset, batch_size=1, sampler=test_sampler)
 
 # load pretrained processor, tokenizer, and model
 image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
@@ -345,6 +345,11 @@ if args.do_train:
         model_parameters=[p for p in model.parameters() if p.requires_grad],
         training_data=train_dataset,
         config=ds_config_file)
+    
+    # For this to work, the model above using deepspeed_initialize has to be
+    # identical architechture as the resume_from_checkpoint's architecture.
+    if args.resume_from_checkpoint is not None:
+        model.load_checkpoint(str(args.resume_from_checkpoint))
 
     for epoch in range(num_epochs):
         model.train()
@@ -383,6 +388,7 @@ if args.do_train:
         # Validation every epoch
         if args.do_val:
             model.eval()
+            val_sampler.set_epoch(epoch)  # refresh sampler
             total_val_loss = 0
             for batch in val_dataloader:
                 # batch = {k: v.to(device) for k, v in batch.items()}
@@ -391,9 +397,8 @@ if args.do_train:
                     if idx in ['pixel_values', 'labels']:
                         inputs[idx] = values.to(device)
 
-                with torch.autocast(device_type='cuda', dtype=torch.float16):        
-                    with torch.no_grad():
-                        outputs = model(**inputs)
+                with torch.autocast(device_type='cuda', dtype=torch.float16), torch.no_grad():        
+                    outputs = model(**inputs)
                     loss = outputs.loss
                 total_val_loss += loss.item()
 
@@ -437,9 +442,10 @@ if args.do_test:
     gen_kwargs = {
         "min_length": min_caption_length,
         "max_length": max_caption_length,
-        "num_beams": 1,
+        "num_beams": 4,
         "no_repeat_ngram_size": no_repeat_ngram_size,
         "early_stopping": False,
+        "pad_token_id": tokenizer.eos_token_id
     }
     for batch in test_dataloader:
         # batch = {k: v.to(device) for k, v in batch.items()}
@@ -448,10 +454,8 @@ if args.do_test:
             if idx in ['pixel_values', 'labels']:
                 inputs[idx] = values.to(device)
 
-        with torch.autocast(device_type='cuda', dtype=torch.float16):       
- 
-            with torch.no_grad():
-                outputs = model(**inputs)
+        with torch.autocast(device_type='cuda', dtype=torch.float16), torch.no_grad():       
+            outputs = model(**inputs)
             loss = outputs.loss
             total_test_loss += loss.item()
 
@@ -461,15 +465,15 @@ if args.do_test:
             predicted_tokens.extend(tokens)
 
             decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
-            predicted_captions.extend(decoded_predicted_caption)
+        predicted_captions.extend(decoded_predicted_caption)
 
-            ground_truth_caption = inputs['labels']
-            ground_truth_tokens.extend(ground_truth_caption)
+        ground_truth_caption = inputs['labels']
+        ground_truth_tokens.extend(ground_truth_caption)
 
-            decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
-            ground_truth_captions.extend(decoded_ground_truth_caption)
+        decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
+        ground_truth_captions.extend(decoded_ground_truth_caption)
 
-            all_filenames.extend(batch['filenames'])
+        all_filenames.extend(batch['filenames'])
 
     print("DEBUG ground_truth_captions:", ground_truth_captions)
     print("DEBUG predicted_captions:", predicted_captions)
@@ -617,3 +621,5 @@ if args.do_test:
                 if i > num_qualitative:
                     break
             f.write(f"</body></html>")
+            
+dist.barrier()
