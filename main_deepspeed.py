@@ -12,7 +12,16 @@ from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.distributed import DistributedSampler
-from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoderModel, VisionEncoderDecoderConfig
+from transformers import (
+    AutoImageProcessor,
+    AutoTokenizer,
+    VisionEncoderDecoderModel,
+    VisionEncoderDecoderConfig,
+    TimesformerConfig,
+    GPT2Config,
+    GPT2LMHeadModel,
+    TimesformerModel
+)
 # from transformers import AutoModelForSequenceClassification, AutoTokenizer, AdamW
 from datasets import load_dataset
 from torcheval.metrics.text import BLEUScore, Perplexity, WordErrorRate, WordInformationLost, WordInformationPreserved
@@ -26,7 +35,6 @@ from PIL import Image
 import base64
 
 from transformers.integrations import HfDeepSpeedConfig
-from transformers import AutoModel
 import torch.distributed as dist
 # from deepspeed.pipe import PipelineModule
 # from deepspeed.utils import RepeatingLoader
@@ -162,6 +170,9 @@ args = parser.parse_args()
 # 11 * 46079 = 506869
 # /4 = 126717
 
+#########################
+## VARIABLES
+#########################
 # Check for environmnet variable with machine LOCAL_RANK?
 if 'LOCAL_RANK' in os.environ:
     args.local_rank = int(os.environ['LOCAL_RANK'])
@@ -188,7 +199,7 @@ learning_rate_decay = args.decay
 local_rank = args.local_rank
 
 subsample_size = args.subsample_size
-max_caption_length = 500
+max_caption_length = 50
 min_caption_length = 10
 num_beams = 4
 no_repeat_ngram_size = 3 # don't repeat same word more than this many times
@@ -208,7 +219,7 @@ torch.cuda.manual_seed_all(seed)
 deepspeed.runtime.utils.set_random_seed(seed)
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 # experiment_name = f'deepspeed_bs_'+str(batch_size)+"_lr_"+str(learning_rate)+"_dec_"+str(learning_rate_decay)+"_size_"+str(subsample_size)+"_beams_"+str(num_beams)+"_seed_"+str(seed)
-experiment_name = f'deepspeed_testing'
+experiment_name = f'juve_deepspeed_testing'
 
 num_qualitative = 100
 ds_config_file = "./ds_config.json"
@@ -238,6 +249,9 @@ if args.local_rank == 0:
         },
     )
 
+#########################
+## DATASET CLASS
+#########################
 class NPZDataset(Dataset):
     def __init__(self, data_dir, num_captions, subsample_size):
         self.data_dir = data_dir
@@ -263,47 +277,73 @@ class NPZDataset(Dataset):
         return sample
 
 train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+# train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
-val_dataset = NPZDataset(val_data_dir, 1, subsample_size)
-val_sampler = DistributedSampler(val_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
+val_dataset = NPZDataset(val_data_dir, num_captions, subsample_size)
+val_sampler = DistributedSampler(val_dataset, shuffle=True, num_replicas=world_size, rank=args.local_rank)
 val_dataloader = DataLoader(val_dataset, batch_size=1, sampler=val_sampler)
 
-test_dataset = NPZDataset(test_data_dir, 1, subsample_size)
-test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=num_gpus, rank=local_rank)
+test_dataset = NPZDataset(test_data_dir, num_captions, subsample_size)
+test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=world_size, rank=args.local_rank)
 test_dataloader = DataLoader(test_dataset, batch_size=1, sampler=test_sampler)
 
 # load pretrained processor, tokenizer, and model
+pre_trained_video_encoder = "facebook/timesformer-base-finetuned-k600"
+pre_trained_text_decoder = "openai-community/gpt2"
 image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
 tokenizer = AutoTokenizer.from_pretrained("gpt2")
 # model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
 # /data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3
 
-config = VisionEncoderDecoderConfig.from_pretrained(pretrained_model)
-config.encoder.num_hidden_layers = args.num_hidden_layers_encoder
-config.encoder.num_attention_heads = args.num_attention_heads_encoder
-config.decoder.n_layer = args.num_layers_decoder
-config.decoder.n_heads = args.num_heads_decoder
+#####################################
+## MODEL INIT *Fresh untrained model*
+#####################################
+# 1) Load base configs
+config_encoder = TimesformerConfig.from_pretrained(pre_trained_video_encoder)
+config_decoder = GPT2Config.from_pretrained(pre_trained_text_decoder)
 
-config.encoder.attention_type = args.attention_type_encoder
-config.encoder.hidden_size = args.hidden_size_encoder
-config.encoder.intermediate_size = args.intermediate_size_encoder
-config.encoder.image_size = args.image_size_encoder
-config.encoder.num_frames = args.num_frames_encoder
-config.encoder.path_size = args.patch_size_encoder
+config_decoder.is_decoder = True
+config_decoder.add_cross_attention = True
 
-model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+# 2) update configs
+config_encoder.num_hidden_layers = args.num_hidden_layers_encoder
+config_encoder.num_attention_heads = args.num_attention_heads_encoder
+config_encoder.attention_type = args.attention_type_encoder
+config_encoder.hidden_size = args.hidden_size_encoder
+config_encoder.intermediate_size = args.intermediate_size_encoder
+config_encoder.image_size = args.image_size_encoder
+config_encoder.num_frames = args.num_frames_encoder
+config_encoder.patch_size = args.patch_size_encoder
+
+config_decoder.n_layer = args.num_layers_decoder
+config_decoder.n_head = args.num_heads_decoder
+
+
+# 3) combine encoder & decoder
+combined_config = VisionEncoderDecoderConfig.from_encoder_decoder_configs(
+    encoder_config=config_encoder,
+    decoder_config=config_decoder
+)
+
+# 4) create a fresh model from that config
+hf_model = VisionEncoderDecoderModel(combined_config)
+
+# 5) Load pre-trained weights from timesformer & gpt2 into the hf_model
+hf_model.encoder = TimesformerModel.from_pretrained(pre_trained_video_encoder, config=config_encoder)
+hf_model.decoder = GPT2LMHeadModel.from_pretrained(pre_trained_text_decoder, config=config_decoder)
+
+# model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
+optimizer = torch.optim.AdamW(hf_model.parameters(), lr=learning_rate)
 
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.model_max_length = max_caption_length
 tokenizer.max_length = max_caption_length
 
-model.config.decoder_start_token_id = tokenizer.bos_token_id
-model.config.pad_token_id = tokenizer.eos_token_id
-model.config.max_length = max_caption_length
-model.config.num_beams = num_beams
-model.config.no_repeat_ngram_size = no_repeat_ngram_size
+hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
+hf_model.config.pad_token_id = tokenizer.eos_token_id
+hf_model.config.max_length = max_caption_length
+hf_model.config.num_beams = num_beams
+hf_model.config.no_repeat_ngram_size = no_repeat_ngram_size
 
 def join_layers(vision_model):
     layers = [
@@ -315,10 +355,10 @@ def join_layers(vision_model):
     return layers
 
 if args.freeze_encoder_decoder:
-    for parameter in model.parameters():
+    for parameter in hf_model.parameters():
         parameter.requires_grad = False
 
-    for block in model.decoder.transformer.h:
+    for block in hf_model.decoder.transformer.h:
         for name, param in block.named_parameters():
             if "crossatt" in name or 'ln_cross_attn' in name or 'mlp' in name:
                 param.requires_grad = True
@@ -327,10 +367,8 @@ if args.freeze_encoder_decoder:
     # model.decoder.lm_head.requires_grad = True
 
 
-trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+trainable_params = sum(p.numel() for p in hf_model.parameters() if p.requires_grad)
 print("DEBUG Number of trainable parameters: ", trainable_params)
-
-print("DEBUG len(train_dataloader): ", len(train_dataloader))
 print("DEBUG len(val_dataloader): ", len(val_dataloader))
 print("DEBUG len(test_dataloader): ", len(test_dataloader))
 
@@ -339,23 +377,26 @@ print("DEBUG len(test_dataloader): ", len(test_dataloader))
 if args.do_train:
 
     # deepspeed.init_distributed()
-    model, _, train_dataloader, _ = deepspeed.initialize(
+    deep_speed_model_engine, _, deepspeed_train_dataloader, _ = deepspeed.initialize(
         args=args,
-        model=model,
-        model_parameters=[p for p in model.parameters() if p.requires_grad],
+        model=hf_model,
+        model_parameters=[p for p in hf_model.parameters() if p.requires_grad],
         training_data=train_dataset,
         config=ds_config_file)
-    
-    # For this to work, the model above using deepspeed_initialize has to be
+    print("DEBUG len(deepspeed_train_dataloader): ", len(deepspeed_train_dataloader))
+    # For this to work, the deep_speed_model_engine above has to be
     # identical architechture as the resume_from_checkpoint's architecture.
+    # load_checkpoint will also assume that we are using the same number of gpus,
+    # because we are saving model states under zero optimization.
+    # TODO
     if args.resume_from_checkpoint is not None:
-        model.load_checkpoint(str(args.resume_from_checkpoint))
+        deep_speed_model_engine.load_checkpoint(str(args.resume_from_checkpoint))
 
     for epoch in range(num_epochs):
-        model.train()
+        deep_speed_model_engine.train()
         step_num = 0
-        steps_total = len(train_dataloader)
-        for batch in train_dataloader:
+        steps_total = len(deepspeed_train_dataloader)
+        for batch in deepspeed_train_dataloader:
             # batch = [(x.to(device), y.to(device)) for (x,y) in batch.items()]
             # print(f"DEBUG type(batch) {type(batch)}, batch length: {len(batch)}, rank: {local_rank}")
             inputs = {}
@@ -365,32 +406,39 @@ if args.do_train:
 
             # print("DEBUG inputs.shape:", inputs['labels'].shape)
             with torch.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(**inputs)
+                outputs = deep_speed_model_engine(**inputs)
                 loss = outputs.loss
                 # loss.backward()
             # optimizer.step()
             # optimizer.zero_grad()
-            model.backward(loss)
-            model.step()
+            deep_speed_model_engine.backward(loss)
+            deep_speed_model_engine.step()
             print(f"Step: {step_num}/{steps_total}, Rank: {local_rank}, Training Loss: {loss.item()}")
             # if args.local_rank == 0:
             #     wandb.log({"train_loss": loss.item(), 'train_learning_rate': learning_rate})
             step_num += 1
         learning_rate = learning_rate - (learning_rate * learning_rate_decay)
+        for param_group in deep_speed_model_engine.optimizer.param_groups:
+            param_group['lr'] = learning_rate
 
         # Save checkpoint every epoch
         checkpoint_path = os.path.join(training_artifacts, experiment_name)
+        if rank == 0:
+            os.makedirs(checkpoint_path, exist_ok=True)
+
         print(f"INFO Saving checkpoint: {checkpoint_path}")
-        model.save_checkpoint(checkpoint_path, f"epoch_{epoch}")
+        deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
+        
 
         # instantiate a inference object from deepseed
         # loop over our val_dataloader, running inference on each one
         # Validation every epoch
         if args.do_val:
-            model.eval()
-            val_sampler.set_epoch(epoch)  # refresh sampler
+            deep_speed_model_engine.eval()
+            # val_sampler.set_epoch(epoch)  # refresh sampler
             total_val_loss = 0
-            for batch in val_dataloader:
+            for i, batch in enumerate(val_dataloader):
+                print(f"batch {i}")
                 # batch = {k: v.to(device) for k, v in batch.items()}
                 inputs = {}
                 for idx, values in batch.items():
@@ -398,7 +446,7 @@ if args.do_train:
                         inputs[idx] = values.to(device)
 
                 with torch.autocast(device_type='cuda', dtype=torch.float16), torch.no_grad():        
-                    outputs = model(**inputs)
+                    outputs = deep_speed_model_engine(**inputs)
                     loss = outputs.loss
                 total_val_loss += loss.item()
 
@@ -406,18 +454,51 @@ if args.do_train:
             print(f"Epoch {epoch+1} completed, average val loss: {avg_val_loss}")
             if args.local_rank == 0:
                 wandb.log({"ave_val_loss": avg_val_loss})
-
+    del deep_speed_model_engine
 
 if args.do_test:
+    checkpoint_dict = None
 
-    # del model, config, tokenizer, image_processor
+    # For this to work, the hf_model has to be identical architechture
+    # as the resume_from_checkpoint's architecture.
+    if not args.do_train:
+        # load the checkpoint stored in args.resume_from_checkpoint, if training
+        # and testing were run separately
+        if args.resume_from_checkpoint is not None:
+            print(f"[DEBUG] Resuming from {str(args.resume_from_checkpoint)}")
+            checkpoint_dict = {
+                "type": "ds_model",
+                "version": 0.0,
+                "checkpoints": tuple(f"{str(args.resume_from_checkpoint)}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
+            }
 
-    model = deepspeed.init_inference(
-        model=model,
-        # config=inf_config_file,
-        checkpoint="./checkpoint.json",  
-        replace_with_kernel_inject=False
-        )
+        else:
+            # Did not provide a checkpoint to run inference on.
+            print(f"[DANGER] You did not proved a checkpoint to run inference on.")
+            sys.exit(1)
+    else:
+        # If training was just run in the same script, load the checkpoint
+        # from the last epoch.
+        checkpoint_path = os.path.join(checkpoint_path, f"epoch_{num_epochs-1}")
+        print(f"[DEBUG] Resuming from {checkpoint_path}")
+
+        checkpoint_dict = {
+            "type": "ds_model",
+            "version": 0.0,
+            "checkpoints": tuple(f"{checkpoint_path}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
+        }
+
+    print(f"[DEBUG] checkpoint_dict: {checkpoint_dict}")
+    ds_inference_engine = deepspeed.init_inference(
+        model=hf_model,
+        config={
+            "tensor_parallel": { "tp_size": world_size },  # or 1 if just data parallel (aka 1 means to not spread model across gpus)
+            "dtype": "fp16"
+        },
+        checkpoint=checkpoint_dict
+    )
+
+    ds_inference_engine.eval()
 
     total_test_loss = 0
     predicted_captions = []
@@ -442,12 +523,12 @@ if args.do_test:
     gen_kwargs = {
         "min_length": min_caption_length,
         "max_length": max_caption_length,
-        "num_beams": 4,
+        "num_beams": 1,
         "no_repeat_ngram_size": no_repeat_ngram_size,
-        "early_stopping": False,
-        "pad_token_id": tokenizer.eos_token_id
+        "early_stopping": True # if false, then it skips eos token until we reach max_length
     }
-    for batch in test_dataloader:
+    for i, batch in enumerate(test_dataloader):
+        # print(f"batch {i}")
         # batch = {k: v.to(device) for k, v in batch.items()}
         inputs = {}
         for idx, values in batch.items():
@@ -455,13 +536,18 @@ if args.do_test:
                 inputs[idx] = values.to(device)
 
         with torch.autocast(device_type='cuda', dtype=torch.float16), torch.no_grad():       
-            outputs = model(**inputs)
+            outputs = ds_inference_engine(**inputs)
             loss = outputs.loss
             total_test_loss += loss.item()
 
             perplexity_metric.update(outputs.logits, inputs['labels'])
 
-            tokens = model.generate(**inputs, **gen_kwargs, pad_token_id=tokenizer.eos_token_id)
+            # tokens = ds_inference_engine.generate(**inputs, **gen_kwargs)
+            import time
+            start = time.time()
+            tokens = ds_inference_engine.module.generate(**inputs, **gen_kwargs, pad_token_id=tokenizer.eos_token_id, use_cache=True)
+            end = time.time()
+            print(f"Rank {args.local_rank}'s generation took {end - start} seconds..")
             predicted_tokens.extend(tokens)
 
             decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
@@ -475,8 +561,8 @@ if args.do_test:
 
         all_filenames.extend(batch['filenames'])
 
-    print("DEBUG ground_truth_captions:", ground_truth_captions)
-    print("DEBUG predicted_captions:", predicted_captions)
+    print("[DEBUG] ground_truth_captions:", ground_truth_captions)
+    print("[DEBUG] predicted_captions:", predicted_captions)
 
     # Aggregate loss across GPUs
     loss_tensor = torch.tensor(total_test_loss, device=device)
@@ -496,7 +582,7 @@ if args.do_test:
         predicted_captions = [item for sublist in gathered_predicted for item in sublist]
         ground_truth_captions = [item for sublist in gathered_gt for item in sublist]
         all_filenames = [item for sublist in gathered_filenames for item in sublist]
-    
+
     if args.local_rank == 0:
         avg_loss = total_test_loss / (len(test_dataloader) * world_size)
         print(f"Average Test Loss: {avg_loss}")
