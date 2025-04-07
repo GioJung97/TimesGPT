@@ -377,7 +377,7 @@ print("DEBUG len(test_dataloader): ", len(test_dataloader))
 if args.do_train:
 
     # deepspeed.init_distributed()
-    deep_speed_model_engine, _, deepspeed_train_dataloader, _ = deepspeed.initialize(
+    deep_speed_model_engine, optimizer, deepspeed_train_dataloader, lr_scheduler = deepspeed.initialize(
         args=args,
         model=hf_model,
         model_parameters=[p for p in hf_model.parameters() if p.requires_grad],
@@ -388,9 +388,9 @@ if args.do_train:
     # identical architechture as the resume_from_checkpoint's architecture.
     # load_checkpoint will also assume that we are using the same number of gpus,
     # because we are saving model states under zero optimization.
-    # TODO
     if args.resume_from_checkpoint is not None:
-        deep_speed_model_engine.load_checkpoint(str(args.resume_from_checkpoint))
+        print(f"[DEBUG] Using weights from {str(args.resume_from_checkpoint)}")
+        deep_speed_model_engine.load_checkpoint(str(args.resume_from_checkpoint), tag="")
 
     for epoch in range(num_epochs):
         deep_speed_model_engine.train()
@@ -418,7 +418,8 @@ if args.do_train:
             #     wandb.log({"train_loss": loss.item(), 'train_learning_rate': learning_rate})
             step_num += 1
         learning_rate = learning_rate - (learning_rate * learning_rate_decay)
-        for param_group in deep_speed_model_engine.optimizer.param_groups:
+        for i, param_group in enumerate(deep_speed_model_engine.optimizer.param_groups):
+            print(f"{i}\tparam_group: {param_group}")
             param_group['lr'] = learning_rate
 
         # Save checkpoint every epoch
@@ -454,7 +455,10 @@ if args.do_train:
             print(f"Epoch {epoch+1} completed, average val loss: {avg_val_loss}")
             if args.local_rank == 0:
                 wandb.log({"ave_val_loss": avg_val_loss})
-    del deep_speed_model_engine
+    
+    # free memory
+    deep_speed_model_engine.destroy()
+    torch.cuda.empty_cache()
 
 if args.do_test:
     checkpoint_dict = None
