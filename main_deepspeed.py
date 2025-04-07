@@ -319,6 +319,7 @@ config_encoder.patch_size = args.patch_size_encoder
 config_decoder.n_layer = args.num_layers_decoder
 config_decoder.n_head = args.num_heads_decoder
 
+# https://github.com/Dao-AILab/flash-attention/tree/main/training
 # FlashAttention for GPT-2
 config_decoder.use_flash_attn = True
 config_decoder.fused_mlp = True
