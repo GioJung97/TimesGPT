@@ -19,7 +19,7 @@ from transformers import (
     VisionEncoderDecoderConfig,
     TimesformerConfig,
     GPT2Config,
-    GPT2LMHeadModel,
+    #GPT2LMHeadModel,
     TimesformerModel
 )
 # from transformers import AutoModelForSequenceClassification, AutoTokenizer, AdamW
@@ -40,6 +40,7 @@ import torch.distributed as dist
 # from deepspeed.utils import RepeatingLoader
 # from deepspeed.runtime.engine import DeepSpeedEngine
 import deepspeed
+from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 
 # parse command line args here
 parser = argparse.ArgumentParser()
@@ -318,6 +319,11 @@ config_encoder.patch_size = args.patch_size_encoder
 config_decoder.n_layer = args.num_layers_decoder
 config_decoder.n_head = args.num_heads_decoder
 
+# FlashAttention for GPT-2
+config_decoder.use_flash_attn = True
+config_decoder.fused_mlp = True
+config_decoder.fused_bias_fc = True
+config_decoder.fused_dropout_add_ln = True
 
 # 3) combine encoder & decoder
 combined_config = VisionEncoderDecoderConfig.from_encoder_decoder_configs(
@@ -330,9 +336,10 @@ hf_model = VisionEncoderDecoderModel(combined_config)
 
 # 5) Load pre-trained weights from timesformer & gpt2 into the hf_model
 hf_model.encoder = TimesformerModel.from_pretrained(pre_trained_video_encoder, config=config_encoder)
-hf_model.decoder = GPT2LMHeadModel.from_pretrained(pre_trained_text_decoder, config=config_decoder)
-
+hf_model.decoder = GPT2LMHeadModel.from_pretrained(pre_trained_text_decoder, config=config_decoder)#,attn_implementation="flash_attention_2")
+print(hf_model)
 # model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
+
 optimizer = torch.optim.AdamW(hf_model.parameters(), lr=learning_rate)
 
 tokenizer.pad_token = tokenizer.eos_token
@@ -457,6 +464,7 @@ if args.do_train:
                 wandb.log({"ave_val_loss": avg_val_loss})
     
     # free memory
+    # https://github.com/deepspeedai/DeepSpeed/blob/master/deepspeed/runtime/zero/stage3.py
     deep_speed_model_engine.destroy()
     torch.cuda.empty_cache()
 
