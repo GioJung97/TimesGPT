@@ -65,9 +65,9 @@ parser.add_argument('-ph', '--phases', choices=['train','val', 'eval'], default=
 parser.add_argument('-pf', '--pretrained_file', default=None, 
                     type=lambda p: pathlib.Path(p).resolve(strict=True), 
                     help="Pretrained model file to initialize")
-parser.add_argument('-re', '--resume_from_checkpoint', default=None,
-                    type=lambda p: pathlib.Path(p).resolve(strict=True), 
-                    help="The checkpoint file from which to resume training")
+parser.add_argument('-re', '--resume_from_checkpoint', default=0,
+                    type=int, 
+                    help="The checkpoint (or epoch) number from which to resume training")
 parser.add_argument('-fr', '--freeze', type=list, default=None,
                     help="List of layers to freeze while training/fine-tuning")
 parser.add_argument('-tr', '--train_dataset', default=None,
@@ -220,7 +220,7 @@ torch.cuda.manual_seed_all(seed)
 deepspeed.runtime.utils.set_random_seed(seed)
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 # experiment_name = f'deepspeed_bs_'+str(batch_size)+"_lr_"+str(learning_rate)+"_dec_"+str(learning_rate_decay)+"_size_"+str(subsample_size)+"_beams_"+str(num_beams)+"_seed_"+str(seed)
-experiment_name = f'juve_deepspeed_testing'
+experiment_name = f'deepspeed_test_v2'
 
 num_qualitative = 100
 ds_config_file = "./ds_config.json"
@@ -398,7 +398,8 @@ if args.do_train:
     # because we are saving model states under zero optimization.
     if args.resume_from_checkpoint is not None:
         print(f"[DEBUG] Using weights from {str(args.resume_from_checkpoint)}")
-        deep_speed_model_engine.load_checkpoint(str(args.resume_from_checkpoint), tag="")
+        # deep_speed_model_engine.load_checkpoint(str(args.resume_from_checkpoint), tag="")
+        deep_speed_model_engine.load_checkpoint(os.path.join(training_artifacts, experiment_name), tag=f"epoch_{str(args.resume_from_checkpoint)}")
 
     for epoch in range(num_epochs):
         deep_speed_model_engine.train()
@@ -477,12 +478,14 @@ if args.do_test:
     if not args.do_train:
         # load the checkpoint stored in args.resume_from_checkpoint, if training
         # and testing were run separately
+        epoch_and_num = f"epoch_{str(args.resume_from_checkpoint)}"
+        epoch_path = os.path.join(training_artifacts, experiment_name, epoch_and_num) 
         if args.resume_from_checkpoint is not None:
             print(f"[DEBUG] Resuming from {str(args.resume_from_checkpoint)}")
             checkpoint_dict = {
                 "type": "ds_model",
                 "version": 0.0,
-                "checkpoints": tuple(f"{str(args.resume_from_checkpoint)}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
+                "checkpoints": tuple(f"{epoch_path}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
             }
 
         else:
