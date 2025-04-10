@@ -495,7 +495,8 @@ if args.do_test:
     else:
         # If training was just run in the same script, load the checkpoint
         # from the last epoch.
-        checkpoint_path = os.path.join(checkpoint_path, f"epoch_{num_epochs-1}")
+        # checkpoint_path = os.path.join(checkpoint_path, f"epoch_{num_epochs-1}")
+        checkpoint_path = os.path.join(training_artifacts, experiment_name, f"epoch_{num_epochs-1}") 
         print(f"[DEBUG] Resuming from {checkpoint_path}")
 
         checkpoint_dict = {
