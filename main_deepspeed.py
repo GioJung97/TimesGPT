@@ -618,12 +618,11 @@ if args.do_test:
         metrics_dict = {}       
         metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
 
-        ground_truth_captions_flattened = [[x] for x in ground_truth_captions]
-        predicted_captions_flattened = [[x] for x in predicted_captions]
+        ground_truth_captions_flattened = [[x.replace('\n', ' ').strip()] for x in ground_truth_captions]
+        predicted_captions_flattened = [[x.replace('\n', ' ').strip()] for x in predicted_captions]
         ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions_flattened))
         predicted_captions_dict = dict((zip(all_filenames, predicted_captions_flattened)))
-
-        # if subsample_size > 0.25:
+        
         metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
         metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
         metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
@@ -633,6 +632,8 @@ if args.do_test:
         metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(predicted_captions, ground_truth_captions).compute().item()
         metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(predicted_captions, ground_truth_captions).compute().item()
 
+        print(f"\n\nDEBUG ground_truth_captions_dict: {ground_truth_captions_dict}\n\n")
+        print(f"\n\nDEBUG predicted_captions_dict: {predicted_captions_dict}\n\n")
         metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
         metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
         metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
