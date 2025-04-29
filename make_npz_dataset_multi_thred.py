@@ -49,17 +49,29 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # ## Save output list as json
 
 # Open YD CSV file
-SOURCE_VIDEO_PATH = "/data1/juve/datasets/youdescribe/videos/source"
+# SOURCE_VIDEO_PATH = "/data1/juve/datasets/youdescribe/videos/source"
+SOURCE_VIDEO_PATH="/data1/juve/datasets/Vatex/clips/"
+
 # OUTPUT_CLIP_PATH = "/data1/juve/datasets/youdescribe/videos/clips/duration_leq_10"
 # PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/youdescribe/hf_datasets/arrow"
 # PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/juve-optimization-2-multi-thread"
-PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/youdescribe/npz_datasets"
+# PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/youdescribe/npz_datasets"
+PROCESSED_DATA_OUTPUT_PATH = "/data2/juve/dataset/vatex/npz_datasets/"
 NUM_FRAMES = 8
 TIME_ENCODING = False
-DATASET_NAME = "YD3_" + str(NUM_FRAMES) + "_frames"
+# DATASET_NAME = "YD3_" + str(NUM_FRAMES) + "_frames"
+DATASET_NAME = "VATEX_" + str(NUM_FRAMES) + "_frames"
 # csv_file = "/home/922053012/youdescribe-dataset/dataset/youdescribe_classic_dataset_cleaned_processed_videos_2024-10-26.csv" # 80505 datapoints
-csv_file = "/home/922053012/vd_aug/data_aug_datasets/youdescribe_classic_dataset_with_data_aug_lte10s_2024-10-26.csv"
-output_csv_file = PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/index.csv"
+# csv_file = "/home/922053012/vd_aug/data_aug_datasets/youdescribe_classic_dataset_with_data_aug_lte10s_2024-10-26.csv"
+csv_file = "/data2/juve/dataset/vatex/csv/vatex_test.csv"
+output_csv_file = PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/test_index.csv"
+
+# csv_file = "/data2/juve/dataset/vatex/csv/vatex_val.csv"
+# output_csv_file = PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/val_index.csv"
+
+# csv_file = "/data2/juve/dataset/vatex/csv/vatex_train.csv"
+# output_csv_file = PROCESSED_DATA_OUTPUT_PATH + "/" + DATASET_NAME + "/train_index.csv"
+
 OPEN_VIDEOS = {}
 NUM_WORKERS = 20
 CLIP_LENGTH = 10
@@ -124,6 +136,9 @@ def calculate_boundaries(start, end, clip_window_duration, video_len):
     Extracts clip segment
     returns the start & end time corresponding to our mechanism
     """
+    if video_len == "NaN":
+        return start, end
+    
     middle = ((end - start) / 2.0) + start
 
     # case 0: video < 10 secs

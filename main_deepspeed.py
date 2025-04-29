@@ -62,10 +62,12 @@ parser.add_argument('-ac', '--activation_type',
                     help='Activation function. (default: None)')
 parser.add_argument('-ph', '--phases', choices=['train','val', 'eval'], default=['train'], 
                     help="List of phases to run. ex: ['train', 'val', 'eval'] deafult")
-parser.add_argument('-pf', '--pretrained_file', default=None, 
-                    type=lambda p: pathlib.Path(p).resolve(strict=True), 
+parser.add_argument('-pf', '--pretrained_model', default=None, 
+                    type=str, 
                     help="Pretrained model file to initialize")
-parser.add_argument('-re', '--resume_from_checkpoint', default=0,
+parser.add_argument('-fw', '--fresh_weights', action="store_true", 
+                    help="Whether to start from HF base models without a base training.")
+parser.add_argument('-re', '--resume_from_checkpoint', default=None,
                     type=int, 
                     help="The checkpoint (or epoch) number from which to resume training")
 parser.add_argument('-fr', '--freeze', type=list, default=None,
@@ -128,8 +130,11 @@ parser.add_argument('-frz', '--freeze_encoder_decoder', action='store_true',
 parser.add_argument('-ss', '--subsample_size', default=1.0, type=float,
                     help="The percentage of data to use from train, val, and test. 1.0 is all (default: 1.0)")
 
+parser.add_argument('--num_captions', type=int, default=2,
+                    help="Number of Captions to use.")
+
 parser.add_argument('--num_gpus', type=int, default=2,
-                    help="Number of GPUs to use!")
+                    help="Number of GPUs to use.")
 parser.add_argument('--local_rank', type=int, default=0,
                     help="The rank of this machine. (default=0)")
 
@@ -200,15 +205,17 @@ learning_rate_decay = args.decay
 local_rank = args.local_rank
 
 subsample_size = args.subsample_size
-max_caption_length = 50
+max_caption_length = 500
 min_caption_length = 10
 num_beams = 4
 no_repeat_ngram_size = 3 # don't repeat same word more than this many times
-num_captions = 5
+num_captions = args.num_captions
 
 # pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
-pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
-data_dir = '/data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/'
+# pretrained_model = '/home/922201615/caelen/training/vatex/checkpoint_20/'
+pretrained_model = args.pretrained_model
+# data_dir = '/data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/'
+data_dir = '/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames'
 output_dir = "./output"
 training_artifacts = '/data2/juve/training_artifacts/'
 train_data_dir = os.path.join(data_dir, 'train') 
@@ -220,7 +227,8 @@ torch.cuda.manual_seed_all(seed)
 deepspeed.runtime.utils.set_random_seed(seed)
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 # experiment_name = f'deepspeed_bs_'+str(batch_size)+"_lr_"+str(learning_rate)+"_dec_"+str(learning_rate_decay)+"_size_"+str(subsample_size)+"_beams_"+str(num_beams)+"_seed_"+str(seed)
-experiment_name = f'deepspeed_test_v2'
+# experiment_name = f'deepspeed_test_v2'
+experiment_name = f"{args.experiment_name}_ws_{num_gpus}_nc_{num_captions}_ep_{num_epochs}_ss_{subsample_size}"
 
 num_qualitative = 100
 ds_config_file = "./ds_config.json"
@@ -235,18 +243,20 @@ if args.local_rank == 0:
         # track hyperparameters and run metadata
         config={
         "ds_config": ds_config_file,
-        "learning_rate": learning_rate,
         "architecture": "SpaceTimeGPT",
-        "dataset": "YD3",
+        "dataset": data_dir,
         "epochs": num_epochs,
         "seed": seed,
         "beams": num_beams,
+        "learning_rate": learning_rate,
         "decay": learning_rate_decay,
+        "num_captions": num_captions,
         "subsample_size": subsample_size,
-        "batch_size": batch_size,
+        "batch_size": args.train_batch_size,
         "min_caption_length": min_caption_length,
         "max_caption_length": max_caption_length,
         "pretrained_model": pretrained_model,
+        "num_gpus": num_gpus,
         },
     )
 
@@ -281,12 +291,12 @@ train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
 # train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
 val_dataset = NPZDataset(val_data_dir, num_captions, subsample_size)
-val_sampler = DistributedSampler(val_dataset, shuffle=True, num_replicas=world_size, rank=args.local_rank)
-val_dataloader = DataLoader(val_dataset, batch_size=1, sampler=val_sampler)
+# val_sampler = DistributedSampler(val_dataset, shuffle=True, num_replicas=world_size, rank=args.local_rank)
+val_dataloader = DataLoader(val_dataset, batch_size=1)
 
 test_dataset = NPZDataset(test_data_dir, num_captions, subsample_size)
-test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=world_size, rank=args.local_rank)
-test_dataloader = DataLoader(test_dataset, batch_size=1, sampler=test_sampler)
+# test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=world_size, rank=args.local_rank)
+test_dataloader = DataLoader(test_dataset, batch_size=1)
 
 # load pretrained processor, tokenizer, and model
 pre_trained_video_encoder = "facebook/timesformer-base-finetuned-k600"
@@ -299,6 +309,14 @@ tokenizer = AutoTokenizer.from_pretrained("gpt2")
 #####################################
 ## MODEL INIT *Fresh untrained model*
 #####################################
+
+# optimizer = torch.optim.AdamW(hf_model.parameters(), lr=learning_rate)
+
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.model_max_length = max_caption_length
+tokenizer.max_length = max_caption_length
+
+
 # 1) Load base configs
 config_encoder = TimesformerConfig.from_pretrained(pre_trained_video_encoder)
 config_decoder = GPT2Config.from_pretrained(pre_trained_text_decoder)
@@ -333,34 +351,71 @@ combined_config = VisionEncoderDecoderConfig.from_encoder_decoder_configs(
 )
 
 # 4) create a fresh model from that config
-hf_model = VisionEncoderDecoderModel(combined_config)
+if args.fresh_weights:
+    hf_model = VisionEncoderDecoderModel(combined_config)
+    # 5) Load pre-trained weights from timesformer & gpt2 into the hf_model
+    hf_model.encoder = TimesformerModel.from_pretrained(pre_trained_video_encoder, config=config_encoder)
+    hf_model.decoder = GPT2LMHeadModel.from_pretrained(pre_trained_text_decoder, config=config_decoder)#,attn_implementation="flash_attention_2")
+    hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
+    hf_model.config.pad_token_id = tokenizer.eos_token_id
+    hf_model.config.max_length = max_caption_length
+    hf_model.config.num_beams = num_beams
+    hf_model.config.no_repeat_ngram_size = no_repeat_ngram_size
 
-# 5) Load pre-trained weights from timesformer & gpt2 into the hf_model
-hf_model.encoder = TimesformerModel.from_pretrained(pre_trained_video_encoder, config=config_encoder)
-hf_model.decoder = GPT2LMHeadModel.from_pretrained(pre_trained_text_decoder, config=config_decoder)#,attn_implementation="flash_attention_2")
+elif args.pretrained_model is not None:
+    # assumes single-gpu model like juve's or caelen's
+    # (Basically converts a single gpu model to a multi-gpu model in this code)
+    # 5) Load pre-trained weights from previous best best
+    # hf_model.encoder = TimesformerModel.from_pretrained(pre_trained_video_encoder, config=config_encoder)
+    # hf_model.decoder = GPT2LMHeadModel.from_pretrained(pre_trained_text_decoder, config=config_decoder)#,attn_implementation="flash_attention_2")
+    # hf_model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
+    # hf_model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
+    # hf_model = VisionEncoderDecoderModel.from_pretrained(pretrained_model).to(device)
+    hf_model = VisionEncoderDecoderModel.from_pretrained(args.pretrained_model).to(device)
+else:
+    print("ERROR: Undefined condition.")
+    sys.exit()
+
+deep_speed_model_engine, optimizer, deepspeed_train_dataloader, lr_scheduler = deepspeed.initialize(
+    args=args,
+    model=hf_model,
+    model_parameters=[p for p in hf_model.parameters() if p.requires_grad],
+    training_data=train_dataset,
+    config=ds_config_file)
+
+if args.resume_from_checkpoint is not None:
+    deep_speed_model_engine.load_checkpoint(os.path.join(training_artifacts, experiment_name), tag=f"epoch_{str(num_epochs - 1)}")
+
+# if args.pretrained_model is not None and args.resume_from_checkpoint is None:
+#     # model = VisionEncoderDecoderModel.from_pretrained(args.pretrained_model).to(device)
+
+# # INFORMATIONAL
+# # TODO: fix counting model parameters now that we are using deep_speed_model_engine - hint: .model does not work
+# # trainable_params = sum(p.numel() for p in deep_speed_model_engine.parameters() if p.requires_grad)
+# # print("DEBUG Number of trainable parameters: ", trainable_params)
+# print("DEBUG len(val_dataloader): ", len(val_dataloader))
+# print("DEBUG len(test_dataloader): ", len(test_dataloader))
+# print("DEBUG len(deepspeed_train_dataloader): ", len(deepspeed_train_dataloader))
+# # For this to work, the deep_speed_model_engine above has to be
+# # identical architechture as the resume_from_checkpoint's architecture.
+# # load_checkpoint will also assume that we are using the same number of gpus,
+# # because we are saving model states under zero optimization.
+
+# if args.resume_from_checkpoint is not None and args.pretrained_model is None:
+#     print(f"[DEBUG] Using weights from {str(args.resume_from_checkpoint)}")
+#     # deep_speed_model_engine.load_checkpoint(str(args.resume_from_checkpoint), tag="")
+
 print(hf_model)
-# model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
 
-optimizer = torch.optim.AdamW(hf_model.parameters(), lr=learning_rate)
 
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.model_max_length = max_caption_length
-tokenizer.max_length = max_caption_length
-
-hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
-hf_model.config.pad_token_id = tokenizer.eos_token_id
-hf_model.config.max_length = max_caption_length
-hf_model.config.num_beams = num_beams
-hf_model.config.no_repeat_ngram_size = no_repeat_ngram_size
-
-def join_layers(vision_model):
-    layers = [
-        *vision_model.features,
-        vision_model.avgpool,
-        lambda x: torch.flatten(x, 1),
-        *vision_model.classifier,
-    ]
-    return layers
+# def join_layers(vision_model):
+#     layers = [
+#         *vision_model.features,
+#         vision_model.avgpool,
+#         lambda x: torch.flatten(x, 1),
+#         *vision_model.classifier,
+#     ]
+#     return layers
 
 if args.freeze_encoder_decoder:
     for parameter in hf_model.parameters():
@@ -375,31 +430,13 @@ if args.freeze_encoder_decoder:
     # model.decoder.lm_head.requires_grad = True
 
 
-trainable_params = sum(p.numel() for p in hf_model.parameters() if p.requires_grad)
-print("DEBUG Number of trainable parameters: ", trainable_params)
-print("DEBUG len(val_dataloader): ", len(val_dataloader))
-print("DEBUG len(test_dataloader): ", len(test_dataloader))
+
+
+
 
 
 # Train and Val
 if args.do_train:
-
-    # deepspeed.init_distributed()
-    deep_speed_model_engine, optimizer, deepspeed_train_dataloader, lr_scheduler = deepspeed.initialize(
-        args=args,
-        model=hf_model,
-        model_parameters=[p for p in hf_model.parameters() if p.requires_grad],
-        training_data=train_dataset,
-        config=ds_config_file)
-    print("DEBUG len(deepspeed_train_dataloader): ", len(deepspeed_train_dataloader))
-    # For this to work, the deep_speed_model_engine above has to be
-    # identical architechture as the resume_from_checkpoint's architecture.
-    # load_checkpoint will also assume that we are using the same number of gpus,
-    # because we are saving model states under zero optimization.
-    if args.resume_from_checkpoint is not None:
-        print(f"[DEBUG] Using weights from {str(args.resume_from_checkpoint)}")
-        # deep_speed_model_engine.load_checkpoint(str(args.resume_from_checkpoint), tag="")
-        deep_speed_model_engine.load_checkpoint(os.path.join(training_artifacts, experiment_name), tag=f"epoch_{str(args.resume_from_checkpoint)}")
 
     for epoch in range(num_epochs):
         deep_speed_model_engine.train()
@@ -410,8 +447,10 @@ if args.do_train:
             # print(f"DEBUG type(batch) {type(batch)}, batch length: {len(batch)}, rank: {local_rank}")
             inputs = {}
             for idx, values in batch.items():
-                if idx in ['pixel_values', 'labels']:
-                    inputs[idx] = values.to(device)
+                if idx == 'pixel_values':
+                    inputs[idx] = values.to(device, dtype=torch.float16)  # important!
+                elif idx == 'labels':
+                    inputs[idx] = values.to(device)  # leave labels as is
 
             # print("DEBUG inputs.shape:", inputs['labels'].shape)
             with torch.autocast(device_type='cuda', dtype=torch.float16):
@@ -448,12 +487,14 @@ if args.do_train:
             # val_sampler.set_epoch(epoch)  # refresh sampler
             total_val_loss = 0
             for i, batch in enumerate(val_dataloader):
-                print(f"batch {i}")
+                # print(f"batch {i}")
                 # batch = {k: v.to(device) for k, v in batch.items()}
                 inputs = {}
                 for idx, values in batch.items():
-                    if idx in ['pixel_values', 'labels']:
-                        inputs[idx] = values.to(device)
+                    if idx == 'pixel_values':
+                        inputs[idx] = values.to(device, dtype=torch.float16)  # important!
+                    elif idx == 'labels':
+                        inputs[idx] = values.to(device)  # leave labels as is
 
                 with torch.autocast(device_type='cuda', dtype=torch.float16), torch.no_grad():        
                     outputs = deep_speed_model_engine(**inputs)
@@ -471,41 +512,49 @@ if args.do_train:
     torch.cuda.empty_cache()
 
 if args.do_test:
-    checkpoint_dict = None
+    
+    checkpoint_path = os.path.join(training_artifacts, experiment_name, f"epoch_{num_epochs-1}") 
+    checkpoint_dict = {
+        "type": "ds_model",
+        "version": 0.0,
+        "checkpoints": tuple(f"{checkpoint_path}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
+    }
+
 
     # For this to work, the hf_model has to be identical architechture
     # as the resume_from_checkpoint's architecture.
-    if not args.do_train:
-        # load the checkpoint stored in args.resume_from_checkpoint, if training
-        # and testing were run separately
-        epoch_and_num = f"epoch_{str(args.resume_from_checkpoint)}"
-        epoch_path = os.path.join(training_artifacts, experiment_name, epoch_and_num) 
-        if args.resume_from_checkpoint is not None:
-            print(f"[DEBUG] Resuming from {str(args.resume_from_checkpoint)}")
-            checkpoint_dict = {
-                "type": "ds_model",
-                "version": 0.0,
-                "checkpoints": tuple(f"{epoch_path}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
-            }
 
-        else:
-            # Did not provide a checkpoint to run inference on.
-            print(f"[DANGER] You did not proved a checkpoint to run inference on.")
-            sys.exit(1)
-    else:
-        # If training was just run in the same script, load the checkpoint
-        # from the last epoch.
-        # checkpoint_path = os.path.join(checkpoint_path, f"epoch_{num_epochs-1}")
-        checkpoint_path = os.path.join(training_artifacts, experiment_name, f"epoch_{num_epochs-1}") 
-        print(f"[DEBUG] Resuming from {checkpoint_path}")
+    # if not args.do_train:
+    #     # load the checkpoint stored in args.resume_from_checkpoint, if training
+    #     # and testing were run separately
+    #     epoch_and_num = f"epoch_{str(args.resume_from_checkpoint)}"
+    #     epoch_path = os.path.join(training_artifacts, experiment_name, epoch_and_num) 
+    #     if args.resume_from_checkpoint is not None:
+    #         print(f"[DEBUG] Resuming from {str(args.resume_from_checkpoint)}")
+    #         checkpoint_dict = {
+    #             "type": "ds_model",
+    #             "version": 0.0,
+    #             "checkpoints": tuple(f"{epoch_path}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
+    #         }
 
-        checkpoint_dict = {
-            "type": "ds_model",
-            "version": 0.0,
-            "checkpoints": tuple(f"{checkpoint_path}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
-        }
+    #     else:
+    #         # Did not provide a checkpoint to run inference on.
+    #         print(f"[DANGER] You did not proved a checkpoint to run inference on.")
+    #         sys.exit(1)
+    # else:
+    #     # If training was just run in the same script, load the checkpoint
+    #     # from the last epoch.
+    #     # checkpoint_path = os.path.join(checkpoint_path, f"epoch_{num_epochs-1}")
+    #     checkpoint_path = os.path.join(training_artifacts, experiment_name, f"epoch_{num_epochs-1}") 
+    #     print(f"[DEBUG] Resuming from {checkpoint_path}")
 
-    print(f"[DEBUG] checkpoint_dict: {checkpoint_dict}")
+    #     checkpoint_dict = {
+    #         "type": "ds_model",
+    #         "version": 0.0,
+    #         "checkpoints": tuple(f"{checkpoint_path}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
+    #     }
+
+    # print(f"[DEBUG] checkpoint_dict: {checkpoint_dict}")
     ds_inference_engine = deepspeed.init_inference(
         model=hf_model,
         config={
@@ -514,9 +563,11 @@ if args.do_test:
         },
         checkpoint=checkpoint_dict
     )
-
     ds_inference_engine.eval()
 
+    # deep_speed_model_engine.eval()
+
+    # get the metrics ready
     total_test_loss = 0
     predicted_captions = []
     predicted_tokens = []
@@ -540,17 +591,20 @@ if args.do_test:
     gen_kwargs = {
         "min_length": min_caption_length,
         "max_length": max_caption_length,
-        "num_beams": 1,
+        "num_beams": num_beams,
         "no_repeat_ngram_size": no_repeat_ngram_size,
         "early_stopping": True # if false, then it skips eos token until we reach max_length
     }
+
     for i, batch in enumerate(test_dataloader):
         # print(f"batch {i}")
         # batch = {k: v.to(device) for k, v in batch.items()}
         inputs = {}
         for idx, values in batch.items():
-            if idx in ['pixel_values', 'labels']:
-                inputs[idx] = values.to(device)
+            if idx == 'pixel_values':
+                inputs[idx] = values.to(device, dtype=torch.float16)  # important!
+            elif idx == 'labels':
+                inputs[idx] = values.to(device)  # leave labels as is
 
         with torch.autocast(device_type='cuda', dtype=torch.float16), torch.no_grad():       
             outputs = ds_inference_engine(**inputs)
@@ -583,39 +637,40 @@ if args.do_test:
 
     # Aggregate loss across GPUs
     loss_tensor = torch.tensor(total_test_loss, device=device)
-    if dist.is_initialized():
-        dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+    # if dist.is_initialized():
+    #     dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
     total_test_loss = loss_tensor.item()
 
     # Gather lists from all GPUs (requires PyTorch 1.8+)
-    gathered_predicted = [None for _ in range(world_size)]
-    gathered_gt = [None for _ in range(world_size)]
-    gathered_filenames = [None for _ in range(world_size)]
-    if dist.is_initialized():
-        dist.all_gather_object(gathered_predicted, predicted_captions)
-        dist.all_gather_object(gathered_gt, ground_truth_captions)
-        dist.all_gather_object(gathered_filenames, all_filenames)
+    # gathered_predicted = [None for _ in range(world_size)]
+    # gathered_gt = [None for _ in range(world_size)]
+    # gathered_filenames = [None for _ in range(world_size)]
+    # if dist.is_initialized():
+    #     dist.all_gather_object(gathered_predicted, predicted_captions)
+    #     dist.all_gather_object(gathered_gt, ground_truth_captions)
+    #     dist.all_gather_object(gathered_filenames, all_filenames)
         
-        predicted_captions = [item for sublist in gathered_predicted for item in sublist]
-        ground_truth_captions = [item for sublist in gathered_gt for item in sublist]
-        all_filenames = [item for sublist in gathered_filenames for item in sublist]
+    #     predicted_captions = [item for sublist in gathered_predicted for item in sublist]
+    #     ground_truth_captions = [item for sublist in gathered_gt for item in sublist]
+    #     all_filenames = [item for sublist in gathered_filenames for item in sublist]
 
     if args.local_rank == 0:
         avg_loss = total_test_loss / (len(test_dataloader) * world_size)
         print(f"Average Test Loss: {avg_loss}")
 
-        bleu1_metric = BLEUScore(n_gram=1)
-        bleu2_metric = BLEUScore(n_gram=2)
-        bleu3_metric = BLEUScore(n_gram=3)
-        bleu4_metric = BLEUScore(n_gram=4)
+        # bleu1_metric = BLEUScore(n_gram=1)
+        # bleu2_metric = BLEUScore(n_gram=2)
+        # bleu3_metric = BLEUScore(n_gram=3)
+        # bleu4_metric = BLEUScore(n_gram=4)
         
-        word_error_rate_metric = WordErrorRate()
-        word_info_lost_metric = WordInformationLost()
-        word_info_preserved_metric = WordInformationPreserved()
-        cider_metric = Cider()
-        meteor_metric = Meteor()
-        rouge_metric = Rouge()
-        spice_metric = Spice()    
+        # word_error_rate_metric = WordErrorRate()
+        # word_info_lost_metric = WordInformationLost()
+        # word_info_preserved_metric = WordInformationPreserved()
+        # cider_metric = Cider()
+        # meteor_metric = Meteor()
+        # rouge_metric = Rouge()
+        # spice_metric = Spice()
+
         metrics_dict = {}       
         metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
 
@@ -655,7 +710,7 @@ if args.do_test:
         mean = torch.tensor(image_processor.image_mean).view(1, 3, 1, 1)
         std = torch.tensor(image_processor.image_std).view(1, 3, 1, 1)
 
-        path_to_8_frames = '/data1/juve/datasets/youdescribe/videos/8-framed_images/'
+        # path_to_8_frames = '/data1/juve/datasets/youdescribe/videos/8-framed_images/'
         # /data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/G_QWtUFFAFQ_100000_110000_58e7cf3e46e13dfd851a2932.npz
         # /data1/juve/datasets/youdescribe/videos/8-framed_images/00-u98sOE4s_000049_000059.png
 
@@ -722,7 +777,7 @@ if args.do_test:
                     img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
                     f.write(f"{img_tag}\n")
                 f.write("</div></div>\n")
-                if i > num_qualitative:
+                if i >= num_qualitative:
                     break
             f.write(f"</body></html>")
             

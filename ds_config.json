@@ -5,10 +5,10 @@
     "trial_duration": 4,
     "trial_interval": 2,
   },
-  "gradient_accumulation_steps": 32,
+  "gradient_accumulation_steps": 64,
   "num_gpus": 3,
-  "train_micro_batch_size_per_gpu": 1,
-  "train_batch_size": 96,
+  "train_micro_batch_size_per_gpu": 2,
+  "train_batch_size": 384,
   "steps_per_print": 50,
   "optimizer": {
     "type": "Adam",
