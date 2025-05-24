@@ -1,0 +1,37 @@
+{
+  "train_batch_size": 1,
+  "train_micro_batch_size_per_gpu": 1,
+  "gradient_accumulation_steps": 1,
+  "optimizer": {
+    "type": "AdamW",
+    "params": {
+      "lr": 1e-5,
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "eps": 1e-8,
+      "weight_decay": 0.01
+    }
+  },
+  "fp16": {
+    "enabled": false
+  },
+  "pipeline": {
+    "stages": "auto",
+    "partition": "uniform",
+    "seed_layers": true,
+    "activation_checkpoint_interval": 0
+  },
+  "zero_optimization": {
+    "stage": 0
+  },
+  "comms_logger": {
+    "enabled": true,
+    "verbose": true,
+    "prof_all": true,
+    "debug": true
+  },
+  "wall_clock_breakdown": false,
+  "dump_state": false
+}
