@@ -5,14 +5,23 @@
     "trial_duration": 4,
     "trial_interval": 2
   },
-  "gradient_accumulation_steps": 64,
-  "num_gpus": 3,
+  "gradient_accumulation_steps": 4,
+  "num_gpus": 2,
   "train_micro_batch_size_per_gpu": 2,
-  "train_batch_size": 128,
+  "train_batch_size": 8,
   "steps_per_print": 50,
+  "train_world_size": 2,
+  "world_size": 2,
   "pipeline": {
-        "micro_batch_size": 2,
-        "pipeline_parallel_size": 3
+    "enabled": true,
+    "world_size": 2,
+    "stages": 2,
+    "partition": "parameters",
+    "seed_layers": true,
+    "activation_checkpoint_interval": 1,
+    "activation_checkpoint_func": "deepspeed.checkpointing.checkpoint",
+        "micro_batch_size": 1,
+        "pipeline_parallel_size": 2
   },
   "optimizer": {
     "type": "Adam",
@@ -30,15 +39,7 @@
     "enabled": true
   },
   "zero_optimization": {
-    "stage": 1,
-    "contiguous_gradients": true,
-    "stage3_max_live_parameters": 1e9,
-    "stage3_max_reuse_distance": 1e9,
-    "stage3_prefetch_bucket_size": 1e7,
-    "stage3_param_persistence_threshold": 1e5,
-    "reduce_bucket_size": 1e7,
-    "sub_group_size": 1e9,
-    "gather_16bit_weights_on_model_save": false
+    "stage": 1
   },
   "gradient_clipping": 1.0,
   "prescale_gradients": false,

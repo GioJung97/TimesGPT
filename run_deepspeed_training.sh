@@ -76,8 +76,12 @@
 # /data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3
 
 # time deepspeed main_deepspeed.py --num_gpus=4 -ep 1 -bs 1 -nahe 12 -nhle 12 -nld 12 -nhd 12 -ss 1.0
-export CUDA_VISIBLE_DEVICES="0,3,4"
+# export CUDA_VISIBLE_DEVICES="0,3,4"
+export CUDA_VISIBLE_DEVICES="3,4"
+# export DEEPSPEED_TIMEOUT=3600
 # time deepspeed main_deepspeed.py --resume_from_checkpoint 3 --pretrained_model "/data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3" --num_gpus 3 -ep 1 -ss 0.001 --experiment_name vatex_ds --train_batch_size=384 -nahe 12 -nhle 12 -nld 12 -nhd 12  --do_test 
 # time deepspeed main_deepspeed.py --pretrained_model "/data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3"  --num_gpus 3 -ep 2 -ss 0.001 --num_captions 10 --experiment_name vatex_ds_nogather --train_batch_size=384 -nahe 12 -nhle 12 -nld 12 -nhd 12 --do_train --do_val --do_test 
-time deepspeed main_deepspeed.py --fresh_weights  --num_gpus 3 -ep 5 -ss 1.00 --num_captions 10 --experiment_name vatex_ds_ng_fw --train_batch_size=384 -nahe 12 -nhle 12 -nld 12 -nhd 12 --do_train --do_val --do_test 
+# time deepspeed main_deepspeed.py --fresh_weights  --num_gpus 3 -ep 5 -ss 1.00 --num_captions 10 --experiment_name vatex_ds_ng_fw --train_batch_size=384 -nahe 12 -nhle 12 -nld 12 -nhd 12 --do_train --do_val --do_test 
 # time deepspeed main_deepspeed.py --num_gpus=4 -ep 2 -ss .1 --train_batch_size=4 -nahe 12 -nhle 12 -nld 12 -nhd 12 --do_test
+# time deepspeed main_deepspeed.py --fresh_weights  --num_gpus 3 -ep 2 -ss 0.001 --num_captions 10 --experiment_name vatex_ds_ng_fw --train_batch_size=384 -nahe 12 -nhle 12 -nld 12 -nhd 12 --do_train --do_val --do_test 
+time deepspeed main_deepspeed.py --pipeline_parallel --fresh_weights   --num_gpus 2 --world_size 2 -ep 5 -ss 0.001 --num_captions 10 --experiment_name vatex_ds_ng_fw --train_batch_size 8 -nahe 12 -nhle 12 -nld 12 -nhd 12 --do_train --do_val --do_test 
