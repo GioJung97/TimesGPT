@@ -41,7 +41,7 @@ from PIL import Image
 import base64
 
 from transformers.integrations import HfDeepSpeedConfig
-import torch.distributed as torchdist
+import torch.distributed as dist
 # from deepspeed.pipe import PipelineModule
 # from deepspeed.utils import RepeatingLoader
 # from deepspeed.runtime.engine import DeepSpeedEngine
@@ -62,7 +62,7 @@ torch.cuda.set_device(local_rank)
 device = torch.device("cuda", local_rank)
 
 # If we haven't initialized a distributed environment...
-if not torchdist.is_initialized():
+if not dist.is_initialized():
     deepspeed.init_distributed()
     # deepspeed.init_distributed(dist_backend='nccl', rank=args.local_rank, world_size=args.world_size)
 
@@ -81,9 +81,9 @@ print(f"DEBUG MASTER_PORT: {os.environ.get('MASTER_PORT')}")
 print(f"DEBUG WORLD_SIZE: {os.environ.get('WORLD_SIZE')}")
 print(f"DEBUG RANK: {os.environ.get('RANK')}")
 
-print(f"DEBUG torchdist.is_initialized(): {torchdist.is_initialized()}")
-print(f"DEBUG torchdist.get_world_size(): {torchdist.get_world_size()}")
-print(f"DEBUG torchdist.get_rank(): {torchdist.get_rank()}")
+print(f"DEBUG dist.is_initialized(): {dist.is_initialized()}")
+print(f"DEBUG dist.get_world_size(): {dist.get_world_size()}")
+print(f"DEBUG dist.get_rank(): {dist.get_rank()}")
 
 
 # sys.exit()
@@ -300,6 +300,78 @@ if local_rank == 0:
         },
     )
 
+# load pretrained processor, tokenizer, and model
+pre_trained_video_encoder = "facebook/timesformer-base-finetuned-k600"
+pre_trained_text_decoder = "openai-community/gpt2"
+image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+# model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
+# /data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3
+
+#####################################
+## MODEL INIT *Fresh untrained model*
+#####################################
+# optimizer = torch.optim.AdamW(hf_model.parameters(), lr=learning_rate)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.model_max_length = max_caption_length
+tokenizer.max_length = max_caption_length
+
+# Load base configs
+config_encoder = TimesformerConfig.from_pretrained(pre_trained_video_encoder)
+config_decoder = GPT2Config.from_pretrained(pre_trained_text_decoder)
+config_decoder.is_decoder = True
+config_decoder.add_cross_attention = True
+config_decoder.use_cache = False # Enable caching for faster inference/Disable for training
+
+# update configs
+config_encoder.num_hidden_layers = args.num_hidden_layers_encoder
+config_encoder.num_attention_heads = args.num_attention_heads_encoder
+config_encoder.attention_type = args.attention_type_encoder
+config_encoder.hidden_size = args.hidden_size_encoder
+config_encoder.intermediate_size = args.intermediate_size_encoder
+config_encoder.image_size = args.image_size_encoder
+config_encoder.num_frames = args.num_frames_encoder
+config_encoder.patch_size = args.patch_size_encoder
+config_decoder.n_layer = args.num_layers_decoder
+config_decoder.n_head = args.num_heads_decoder
+
+# Claude 4 thinks that flash attention may be causing complications for splitting GPT2 across layers
+# https://github.com/Dao-AILab/flash-attention/tree/main/training
+# FlashAttention for GPT-2
+config_decoder.use_flash_attn = False
+config_decoder.fused_mlp = False
+config_decoder.fused_bias_fc = False
+config_decoder.fused_dropout_add_ln = False
+
+# Ensure hidden sizes match between encoder and decoder for cross-attention
+config_decoder.n_embd = config_encoder.hidden_size  # This is crucial
+
+# combine encoder & decoder
+combined_config = VisionEncoderDecoderConfig.from_encoder_decoder_configs(
+    encoder_config=config_encoder,
+    decoder_config=config_decoder
+)
+
+# create a fresh model from that config
+if args.fresh_weights:
+    hf_model = VisionEncoderDecoderModel(combined_config)
+    # Load pre-trained weights from timesformer & gpt2 into the hf_model
+    hf_model.encoder = TimesformerModel.from_pretrained(pre_trained_video_encoder, config=config_encoder)
+    hf_model.decoder = GPT2LMHeadModel.from_pretrained(pre_trained_text_decoder, config=config_decoder)#,attn_implementation="flash_attention_2")
+    hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
+    hf_model.config.pad_token_id = tokenizer.eos_token_id
+    hf_model.config.max_length = max_caption_length
+    hf_model.config.num_beams = num_beams
+    hf_model.config.no_repeat_ngram_size = no_repeat_ngram_size
+    hf_model = hf_model.to(device)
+
+elif args.pretrained_model is not None:
+    # assumes single-gpu model like juve's or caelen's
+    hf_model = VisionEncoderDecoderModel.from_pretrained(args.pretrained_model).to(device)
+else:
+    print("ERROR: Undefined condition.")
+    sys.exit()
+
 #########################
 ## DATASET CLASS
 #########################
@@ -326,41 +398,23 @@ class NPZDataset(Dataset):
         label_tensor = torch.from_numpy(data['arr_1'][labels_offset]).to(dtype=torch.long).unsqueeze(0)
 
         # Enforce expected shapes:
-        # Expected pixel_values shape: (8, 3, 224, 224) [or more frames but at least 8]
-        # Expected label_tensor shape: (1, 1024)
+        #   pixel_values shape: (8, 3, 224, 224) [or more frames but at least 8]
+        #   label_tensor shape: (1, 1024)
         assert pixel_values.ndim == 4, f"Expected pixel_values to have 4 dims, got {pixel_values.shape}"
         assert pixel_values.shape[0] >= 8, f"Expected at least 8 frames, got {pixel_values.shape[0]}"
         assert label_tensor.ndim == 2, f"Expected label_tensor to have 2 dims, got {label_tensor.shape}"
         assert label_tensor.shape[0] == 1, f"Expected first label dimension to be 1, got {label_tensor.shape[0]}"
         assert label_tensor.shape[1] == 1024, f"Expected label_tensor second dim to be 1024, got {label_tensor.shape[1]}"
 
-        # Each .npz file contains 'arr_o' and 'arr_1', images and captions
-        #  sample = {# 'filenames': self.file_names[filename_index], 
-        #           'pixel_values': torch.from_numpy(data['arr_0']), 
-        #           'labels': torch.from_numpy(data['arr_1'][labels_offset])}
         return pixel_values, label_tensor
-
-    # def __getitem__(self, idx):
-    #     filename_index = idx // self.num_caption
-    #     labels_offset  = idx % self.num_caption
-    #     file_path      = os.path.join(self.data_dir, self.file_names[filename_index])
-    #     data           = np.load(file_path)
-
-    #     # pixel_tensor = torch.from_numpy(data['arr_0'])                # (num_frames, C, H, W)
-    #     # cast frames to float16 so they match your model’s weights
-    #     pixel_tensor = torch.from_numpy(data['arr_0']).to(dtype=torch.float16)
-    #     label_tensor = torch.from_numpy(data['arr_1'][labels_offset]).to(dtype=torch.long) # (seq_len,)
-
-    #     return pixel_tensor, label_tensor
 
 train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
 train_sampler = DistributedSampler(train_dataset, shuffle=True, num_replicas=world_size, rank=local_rank)
 train_dataloader = DataLoader(
     train_dataset, 
-    batch_size=ds_config['pipeline'].get('micro_batch_size', 
-    args.train_batch_size), 
+    batch_size=ds_config['pipeline'].get('micro_batch_size', args.train_batch_size), 
     sampler=train_sampler,
-    collate_fn=lambda batch: batch
+    collate_fn=default_collate
     )
 
 # val_dataset = NPZDataset(val_data_dir, num_captions, subsample_size)
@@ -371,471 +425,275 @@ train_dataloader = DataLoader(
 # test_sampler = DistributedSampler(test_dataset, shuffle=True, num_replicas=world_size, rank=local_rank)
 # test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.train_batch_size)  
 
-# load pretrained processor, tokenizer, and model
-pre_trained_video_encoder = "facebook/timesformer-base-finetuned-k600"
-pre_trained_text_decoder = "openai-community/gpt2"
-image_processor = AutoImageProcessor.from_pretrained("MCG-NJU/videomae-base")
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
-# model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
-# /data1/juve/training_artifacts/vatex_100/polynomial/vatex_1.0prcnt_s24_10caps_lr1e-05_30_epochs_power_1.4_end_1e_8/model_saved_files/epoch_3
+# Fix DataLoaderAsDataset to pack both tensors into a single structure DeepSpeed can handle
+class DataLoaderAsDataset(Dataset):
+    def __init__(self, dataset, batch_size, sampler, collate_fn=None):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.sampler = sampler
+        self.collate_fn = collate_fn or default_collate
+        self.current_epoch = -1
+        self._batches = []
+        self._flattened_items = []
 
-#####################################
-## MODEL INIT *Fresh untrained model*
-#####################################
-
-# optimizer = torch.optim.AdamW(hf_model.parameters(), lr=learning_rate)
-
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.model_max_length = max_caption_length
-tokenizer.max_length = max_caption_length
-
-
-# 1) Load base configs
-config_encoder = TimesformerConfig.from_pretrained(pre_trained_video_encoder)
-config_decoder = GPT2Config.from_pretrained(pre_trained_text_decoder)
-
-config_decoder.is_decoder = True
-config_decoder.add_cross_attention = True
-
-# 2) update configs
-config_encoder.num_hidden_layers = args.num_hidden_layers_encoder
-config_encoder.num_attention_heads = args.num_attention_heads_encoder
-config_encoder.attention_type = args.attention_type_encoder
-config_encoder.hidden_size = args.hidden_size_encoder
-config_encoder.intermediate_size = args.intermediate_size_encoder
-config_encoder.image_size = args.image_size_encoder
-config_encoder.num_frames = args.num_frames_encoder
-config_encoder.patch_size = args.patch_size_encoder
-
-config_decoder.n_layer = args.num_layers_decoder
-config_decoder.n_head = args.num_heads_decoder
-
-# https://github.com/Dao-AILab/flash-attention/tree/main/training
-# FlashAttention for GPT-2
-config_decoder.use_flash_attn = True
-config_decoder.fused_mlp = True
-config_decoder.fused_bias_fc = True
-config_decoder.fused_dropout_add_ln = True
-
-# 3) combine encoder & decoder
-combined_config = VisionEncoderDecoderConfig.from_encoder_decoder_configs(
-    encoder_config=config_encoder,
-    decoder_config=config_decoder
-)
-
-# 4) create a fresh model from that config
-if args.fresh_weights:
-    hf_model = VisionEncoderDecoderModel(combined_config)
-    # 5) Load pre-trained weights from timesformer & gpt2 into the hf_model
-    hf_model.encoder = TimesformerModel.from_pretrained(pre_trained_video_encoder, config=config_encoder)
-    hf_model.decoder = GPT2LMHeadModel.from_pretrained(pre_trained_text_decoder, config=config_decoder)#,attn_implementation="flash_attention_2")
-    hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
-    hf_model.config.pad_token_id = tokenizer.eos_token_id
-    hf_model.config.max_length = max_caption_length
-    hf_model.config.num_beams = num_beams
-    hf_model.config.no_repeat_ngram_size = no_repeat_ngram_size
-    hf_model = hf_model.to(device)
-
-elif args.pretrained_model is not None:
-    # assumes single-gpu model like juve's or caelen's
-    # (Basically converts a single gpu model to a multi-gpu model in this code)
-    # 5) Load pre-trained weights from previous best best
-    # hf_model.encoder = TimesformerModel.from_pretrained(pre_trained_video_encoder, config=config_encoder)
-    # hf_model.decoder = GPT2LMHeadModel.from_pretrained(pre_trained_text_decoder, config=config_decoder)#,attn_implementation="flash_attention_2")
-    # hf_model = VisionEncoderDecoderModel.from_pretrained("Neleac/timesformer-gpt2-video-captioning").to(device)
-    # hf_model = VisionEncoderDecoderModel.from_pretrained(pretrained_model, config=config).to(device)
-    # hf_model = VisionEncoderDecoderModel.from_pretrained(pretrained_model).to(device)
-    hf_model = VisionEncoderDecoderModel.from_pretrained(args.pretrained_model).to(device)
-else:
-    print("ERROR: Undefined condition.")
-    sys.exit()
-
-
-def to_layers(model):
-    """
-    Returns a list of layers in the model, automatically accounts for tied layers.
-    Generated by ChatGPT 4.5 - 5/27/2025 - AScott
-    """
-    layers = []
-
-    def are_weights_tied(layer_a, layer_b):
-        return layer_a.weight is layer_b.weight
-
-    tied_embeddings = are_weights_tied(model.decoder.lm_head, model.decoder.transformer.wte)
-
-    layers.append(model.encoder.embeddings)
-    layers.extend(model.encoder.encoder.layer)
-    layers.append(model.encoder.layernorm)
-
-        # Add a simple adapter layer to clarify the interface between encoder and decoder
-    class EncoderDecoderAdapter(torch.nn.Module):
-        def forward(self, hidden_states):
-            # This adapter receives encoder outputs and returns them,
-            # making the interface between encoder and decoder explicit
-            return hidden_states
+    def _create_batches(self):
+        """Recreate batches for the current epoch"""
+        self._batches = []
+        self._flattened_items = []
+        sampler_iter = iter(self.sampler)
+        
+        while True:
+            batch_indices = []
+            try:
+                for _ in range(self.batch_size):
+                    batch_indices.append(next(sampler_iter))
+            except StopIteration:
+                if batch_indices:
+                    for idx in batch_indices:
+                        pixel_vals, labels = self.dataset[idx]
+                        pixel_vals = pixel_vals.unsqueeze(0)  # [8,3,224,224] -> [1,8,3,224,224]
+                        # Store as a list that DeepSpeed will pass to the first stage
+                        self._flattened_items.append([pixel_vals, labels])
+                break
             
-    layers.append(EncoderDecoderAdapter())
+            for idx in batch_indices:
+                pixel_vals, labels = self.dataset[idx]
+                pixel_vals = pixel_vals.unsqueeze(0)  # [8,3,224,224] -> [1,8,3,224,224]
+                # Store as a list that DeepSpeed will pass to the first stage
+                self._flattened_items.append([pixel_vals, labels])
+        
+        print(f"DEBUG _create_batches: Created {len(self._flattened_items)} items for epoch {self.current_epoch}")
+        if self._flattened_items:
+            sample_item = self._flattened_items[0]
+            print(f"DEBUG _create_batches: Sample item type: {type(sample_item)}")
+            print(f"DEBUG _create_batches: pixel_values shape: {sample_item[0].shape}, labels shape: {sample_item[1].shape}")
 
-    if tied_embeddings:
-        # Keep embeddings and lm_head contiguous
-        layers.extend([
-            model.decoder.transformer.wte,
-            model.decoder.transformer.wpe,
-            model.decoder.transformer.drop,
-            *model.decoder.transformer.h,
-            model.decoder.transformer.ln_f,
-            model.decoder.lm_head
-        ])
-    else:
-        # Flexible placement since embeddings and lm_head aren't tied
-        layers.extend([
-            model.decoder.transformer.wte,
-            model.decoder.transformer.wpe,
-            model.decoder.transformer.drop,
-        ])
-        layers.extend(model.decoder.transformer.h)
-        layers.append(model.decoder.transformer.ln_f)
-        layers.append(model.decoder.lm_head)
+    def set_epoch(self, epoch):
+        """Call this method at the beginning of each epoch"""
+        print(f"DEBUG set_epoch: Setting epoch {epoch}, current_epoch: {self.current_epoch}")
+        if epoch != self.current_epoch:
+            self.current_epoch = epoch
+            self.sampler.set_epoch(epoch)
+            self._create_batches()
 
-    return layers
-
-class DataLoaderAsDataset(DataLoader, Dataset):
-    # This class acts as both a DataLoader and a Dataset.
-    # It simply delegates __getitem__ and __len__ to its own iterator.
-    def __getitem__(self, index):
-        # We rebuild the list from the underlying dataset if needed.
-        # Alternatively, you can simply use list(self)[index]
-        return list(self)[index]
     def __len__(self):
-        return super().__len__()
+        if not self._flattened_items:
+            self._create_batches()
+        return len(self._flattened_items)
 
+    def __getitem__(self, idx):
+        if not self._flattened_items:
+            self._create_batches()
+        return self._flattened_items[idx]
+    
 my_train_loader = DataLoaderAsDataset(
     train_dataset, 
     batch_size=ds_config['pipeline'].get('micro_batch_size', args.train_batch_size), 
     sampler=train_sampler,
-    collate_fn=lambda batch: batch  # keep list-of-samples
+    collate_fn=default_collate  
 )
 
-class InputWrapper(nn.Module):
-    """
-    Wraps the very first stage block. Expects input as a tuple:
-      (pixel_values, labels)
-    Applies the block to pixel_values and returns a tuple (hidden, labels)
-    """
-    def __init__(self, block):
-        super().__init__()
-        self.block = block
-
-    def forward(self, inputs):
-        # If inputs is a list (from DeepSpeed), extract the first element.
-        if isinstance(inputs, list):
-            inputs = inputs[0]
-        # Expect input to be a tuple (pixel_values, labels)
-        pixel_values, labels = inputs
-        # Process pixel_values with the block.
-        out = self.block(pixel_values)
-        if hasattr(out, "last_hidden_state"):
-            hidden = out.last_hidden_state
-        else:
-            hidden = out
-        return (hidden, labels)
-
-class BlockWrapper(nn.Module):
-    """
-    Wraps any nn.Module M that expects hidden_states (Tensor) (and
-    optionally cross‐attention key/value) so that it becomes a
-    nn.Module that always accepts and returns (hidden_states, labels).
-    """
-    def __init__(self, block):
-        super().__init__()
-        self.block = block
-
-    # def forward(self, inputs):
-    #     # inputs is always a 2-tuple
-    #     hidden_states, labels = inputs
-
-    # def forward(self, inputs):
-    #     # DeepSpeed may call us as forward((hidden,labels)) or forward(hidden, labels)
-    #     if len(inputs) == 1 and isinstance(inputs[0], (tuple, list)):
-    #         hidden_states, labels = inputs[0]
-    #     elif len(inputs) == 2:
-    #         hidden_states, labels = inputs
-    #     else:
-    #         raise ValueError(f"BlockWrapper got wrong hidden_states: {hidden_states}, len(inputs): {len(inputs)}")
-
-    #     labels = labels.to(torch.int64)
-
-    #     # print("DEBUG hidden_states: ", hidden_states)
-
-    #     # DeepSpeed pipeline hands each micro-batch as a single sample,
-    #     # so if there is no batch-dim, add one
-    #     print("DEBUG type(hidden_states) before: ", type(hidden_states))
-    #     print("DEBUG len(hidden_states) before: ", len(hidden_states))
-    #     # print("DEBUG hidden_states: ", hidden_states)
-    #     # print("DEBUG hidden_states.shape before unsqueezing: ", hidden_states.shape)
-    #     if len(hidden_states.shape) == 4:            # (T, C, H, W)
-    #         hidden_states = hidden_states.unsqueeze(0)  # (1, T, C, H, W)
-    #         labels = labels.unsqueeze(0)                # (1, S)
-    #     print("DEBUG hidden_states.shape after unsqueezing: ", hidden_states.shape)
-    #     print("DEBUG type(hidden_states) after: ", type(hidden_states))
-    #     # call the wrapped block *only* on the hidden_states
-    #     out = self.block(hidden_states)  # for encoder blocks
-    #     # out may be a Tensor or a ModelOutput—
-    #     # assume it returns hidden_states as the first output
-    #     if isinstance(out, BaseModelOutput) or hasattr(out, "last_hidden_state"):
-    #         hidden = out.last_hidden_state
-    #     else:
-    #         hidden = out
-    #     return hidden, labels
-    def forward(self, inputs):
-        # if inputs is a list (i.e. a batch), collate it:
-        # if isinstance(inputs, list):
-        #     inputs = default_collate(inputs)
-
-        # Expect inputs to be a dictionary from the collate function
-        # pixel_values = inputs['pixel_values']
-        # labels = inputs['labels'].to(torch.int64)
-
-        if isinstance(inputs, list):
-            inputs = inputs[0]
-        pixel_values, labels = inputs
-
-        # DeepSpeed pipeline may give a single sample without the batch-dim.
-        print("DEBUG type(pixel_values) before: ", type(pixel_values))
-        # print("DEBUG pixel_values shape before unsqueezing: ", pixel_values.shape)
-        # if pixel_values.ndim == 4:  # Expected shape: (T, C, H, W)
-        #     pixel_values = pixel_values.unsqueeze(0)  # add batch-dim → (1, T, C, H, W)
-        #     labels = labels.unsqueeze(0)               # (1, ...)
-        # print("DEBUG pixel_values.shape after unsqueezing: ", pixel_values.shape)
-        print("DEBUG type(pixel_values) after: ", type(pixel_values))
-
-                # Unwrap hidden_states if it's already a tuple.
-        if isinstance(pixel_values, tuple):
-            pixel_values = pixel_values[0]
-        
-        out = self.block(pixel_values)
-        if hasattr(out, "last_hidden_state"):
-            hidden = out.last_hidden_state
-        else:
-            hidden = out
-        # Pack back the results as a dictionary
-        # return [{'pixel_values': hidden, 'labels': labels}]
-        return (hidden, labels)
-    
 def to_pipeline_blocks(hf_model):
     blocks = []
+    
+    class InputWrapper(nn.Module):
+        def __init__(self, block):
+            super().__init__()
+            self.block = block
 
-    # 1) encoder embedding: support both VisionEncoderDecoderModel and TimesformerModel
-    if hasattr(hf_model.encoder, "embeddings"):
-        # HF VisionEncoderDecoderModel style
-        embed_positions = getattr(getattr(hf_model.encoder, "encoder", None),
-                                  "embed_positions",
-                                  nn.Identity())
-        layernorm       = getattr(hf_model.encoder, "layernorm", nn.Identity())
-        enc_embed = nn.Sequential(
-            hf_model.encoder.embeddings,
-            embed_positions,
-            layernorm
-        )
-    else:
-        # TimesformerModel style
-        temporal_pos = getattr(hf_model.encoder, "temporal_position_embeddings", nn.Identity())
-        dropout      = getattr(hf_model.encoder, "dropout", nn.Identity())
-        enc_embed = nn.Sequential(
-            hf_model.encoder.patch_embeddings,  # includes projection + cls_token handling
-            temporal_pos,
-            dropout
-        )
-    blocks.append( InputWrapper(enc_embed) )
+        def forward(self, inputs):
+            print(f"DEBUG InputWrapper - inputs type: {type(inputs)}")
+            print(f"DEBUG InputWrapper - inputs shape: {inputs.shape if hasattr(inputs, 'shape') else 'no shape'}")
+            
+            # DeepSpeed batches our items, so we need to reshape
+            # inputs shape: [batch_size, 1, num_frames, channels, height, width]
+            # Expected:     [batch_size, num_frames, channels, height, width]
+            pixel_values = inputs
+            
+            if pixel_values.dim() == 6:  # [batch, 1, frames, channels, height, width]
+                pixel_values = pixel_values.squeeze(1)  # Remove the extra dimension -> [batch, frames, channels, height, width]
+            
+            print(f"DEBUG InputWrapper - reshaped pixel_values.shape: {pixel_values.shape}")
+            
+            # Process through the encoder embedding block
+            activation = self.block(pixel_values)
+            if isinstance(activation, tuple):
+                activation = activation[0]
+            elif hasattr(activation, "last_hidden_state"):
+                activation = activation.last_hidden_state
+            
+            print(f"DEBUG InputWrapper - activation.shape: {activation.shape}")
+            
+            # Create dummy labels tensor
+            batch_size = activation.size(0)
+            dummy_labels = torch.randint(0, 50256, (batch_size, 1024), 
+                                    device=activation.device, dtype=torch.long)
+            
+            return activation, dummy_labels
 
-    # 2) each encoder Transformer block
+    input_wrapper = InputWrapper(hf_model.encoder.embeddings)
+    blocks.append(input_wrapper)
+    
+    # 2) Encoder transformer blocks - no dimension manipulation
     for enc_block in hf_model.encoder.encoder.layer:
-        blocks.append(BlockWrapper(enc_block))
+        class BlockWrapper(nn.Module):
+            def __init__(self, block):
+                super().__init__()
+                self.block = block
 
-    # 3) adapter to unify interface (no-op)
+            def forward(self, inputs):
+                activation, labels = inputs
+                out = self.block(activation)
+                if isinstance(out, tuple):
+                    out = out[0]
+                elif hasattr(out, "last_hidden_state"):
+                    out = out.last_hidden_state
+                return out, labels
+        
+        blocks.append(BlockWrapper(enc_block))
+    
+    # 3) Adapter
     class Adapter(nn.Module):
         def forward(self, inputs):
-            return inputs  # pass (hidden,labels) straight through
+            activation, labels = inputs
+            return activation, labels
     blocks.append(Adapter())
 
-    # # 4) decoder embeddings
-    # dec_embed = nn.Sequential(
-    #     hf_model.decoder.transformer.wte,
-    #     hf_model.decoder.transformer.wpe,
-    #     hf_model.decoder.transformer.drop
-    # )
-    # blocks.append(BlockWrapper(dec_embed))
-
-    # 4) decoder token‐embedding: apply wte/wpe/drop to the *labels*, not hidden_states
-    # class TokenEmbedWrapper(nn.Module):
-    #     def __init__(self, wte, wpe, drop):
-    #         super().__init__()
-    #         self.wte  = wte
-    #         self.wpe  = wpe
-    #         self.drop = drop
-    #     def forward(self, inputs):
-
-    #         encoder_hidden, labels = inputs
-
-    #         # make sure labels are int64 for Embedding
-    #         labels = labels.to(torch.long)
-
-    #         # add batch‐dim if needed
-    #         if labels.dim() == 1:
-    #             labels = labels.unsqueeze(0)
-
-    #         # token & position embedding + dropout
-    #         tok_emb = self.wte(labels)                            # (B, S, D)
-    #         pos_ids = torch.arange(tok_emb.size(1), device=labels.device)
-    #         pos_emb = self.wpe(pos_ids).unsqueeze(0)              # (1, S, D)
-    #         hidden   = self.drop(tok_emb + pos_emb)               # (B, S, D)
-    #         return hidden, labels
-
+    # Fix the token embedding issue by adding bounds checking
     class TokenEmbedWrapper(nn.Module):
         def __init__(self, wte, wpe, drop):
             super().__init__()
             self.wte = wte
             self.wpe = wpe
             self.drop = drop
+            self.vocab_size = wte.num_embeddings  # Get vocabulary size
 
         def forward(self, inputs):
-            # inputs == (encoder_output, labels)
             encoder_out, labels = inputs
-
-            # ensure the labels are int64 before passing into the Embedding
-            labels = labels.long()
-
-            # standard HF positional indices
-            seq_len = labels.size(1)
-            pos_ids = torch.arange(seq_len,  device=labels.device).unsqueeze(0)
-
-            # do your wte + wpe + drop  
-            # hidden = self.wte(labels) + self.wpe(pos_ids)
-            # hidden = self.drop(hidden)
-
-            # disable FP16 autocast for embedding indices
-            # with torch.cuda.amp.autocast(enabled=False):
-            #     token_embeddings = self.wte(labels)    # now LongTensor indices
-            # pos_embeddings = self.wpe(pos_ids)        # float32/16 positional
-            # hidden = self.drop(token_embeddings + pos_embeddings)
-
-            # standard token+pos embedding + dropout
-            token_embeddings = self.wte(labels)
-            pos_embeddings   = self.wpe(pos_ids)
-            hidden = self.drop(token_embeddings + pos_embeddings)
-
-            # return in whatever tuple‐form your pipeline expects
-            return (encoder_out, hidden)
+            labels = labels.to(torch.long)
+            
+            # Get the actual batch size from encoder_out
+            batch_size = encoder_out.size(0)
+            
+            # Handle labels properly - remove any extra dimensions first
+            if labels.dim() == 3:  # [batch, 1, seq_len]
+                labels = labels.squeeze(1)  # [batch, seq_len]
+            elif labels.dim() == 2 and labels.shape[0] == 1:  # [1, seq_len]
+                labels = labels.squeeze(0)  # [seq_len]
+                
+            seq_len = labels.size(-1)
+            
+            # Ensure labels have the correct batch dimension
+            if labels.dim() == 1:  # [seq_len]
+                labels = labels.unsqueeze(0).expand(batch_size, -1)  # [batch, seq_len]
+            elif labels.dim() == 2 and labels.size(0) != batch_size:  # Wrong batch size
+                # Take the first sample and expand it
+                labels = labels[0:1].expand(batch_size, -1)  # [batch, seq_len]
+            
+            # CRITICAL: Clamp labels to valid token range to prevent CUDA assertion
+            labels = torch.clamp(labels, 0, self.vocab_size - 1)
+            
+            # Create position IDs
+            pos_ids = torch.arange(seq_len, device=labels.device).unsqueeze(0).expand(batch_size, -1)
+            
+            # Generate embeddings
+            token_embeddings = self.wte(labels)  # [batch, seq_len, hidden_size]
+            pos_embeddings = self.wpe(pos_ids)   # [batch, seq_len, hidden_size]
+            emb = self.drop(token_embeddings + pos_embeddings)  # [batch, seq_len, hidden_size]
+            
+            print(f"DEBUG TokenEmbedWrapper - labels.shape: {labels.shape}")
+            print(f"DEBUG TokenEmbedWrapper - labels.min(): {labels.min()}, labels.max(): {labels.max()}")
+            print(f"DEBUG TokenEmbedWrapper - vocab_size: {self.vocab_size}")
+            print(f"DEBUG TokenEmbedWrapper - emb.shape: {emb.shape}")
+            
+            return encoder_out, emb, labels    
 
     blocks.append(TokenEmbedWrapper(
         hf_model.decoder.transformer.wte,
         hf_model.decoder.transformer.wpe,
         hf_model.decoder.transformer.drop
     ))
-
-    # 5) each decoder Transformer block
+    
+    # 5) Decoder transformer blocks
     for dec_block in hf_model.decoder.transformer.h:
-        # wrap a block that *knows* how to call it in cross‐attention mode
         class DecBlockWrapper(nn.Module):
             def __init__(self, block):
                 super().__init__()
                 self.block = block
+                
             def forward(self, inputs):
-                hidden_states, labels = inputs
-                # add batch-dim if missing
-                if hidden_states.dim() == 2:        # (S, D)
-                    hidden_states = hidden_states.unsqueeze(0)  # (1, S, D)
-                    labels = labels.unsqueeze(0)                # (1, S)
-                    # pass both hidden_states & labels as input_ids into the block
-                    out = self.block(
-                        input_ids=labels,
-                        encoder_hidden_states=hidden_states,
-                        return_dict=True
-                    )
-                # out.last_hidden_state has shape [B, S, D]
-                return out.last_hidden_state, labels
+                encoder_out, token_emb, labels = inputs
+
+                # Debug shapes
+                print(f"DEBUG DecBlockWrapper - encoder_out.shape: {encoder_out.shape}")
+                print(f"DEBUG DecBlockWrapper - token_emb.shape: {token_emb.shape}")
+            
+                # Call GPT2Block with positional argument for hidden_states
+                out = self.block(
+                    token_emb,  # hidden_states as first positional argument
+                    encoder_hidden_states=encoder_out,
+                    use_cache=False,  # Disable caching for training
+                )
+                
+                if isinstance(out, tuple):
+                    hidden_states = out[0]
+                else:
+                    hidden_states = out
+                
+                return encoder_out, hidden_states, labels
+        
         blocks.append(DecBlockWrapper(dec_block))
 
-    # 6) final LN + lm_head → produce logits
+    # 6) Final stage
     class FinalWrapper(nn.Module):
-        def __init__(self, ln_f, lm_head, pad_token_id):
+        def __init__(self, ln_f, lm_head):
             super().__init__()
-            self.ln  = ln_f
+            self.ln = ln_f
             self.head = lm_head
-            self.pad_token_id = pad_token_id
-        def forward(self, inputs):
-            hidden_states, labels = inputs
-            hidden = self.ln(hidden_states)
-            logits = self.head(hidden)
-            # compute & return a single scalar loss
-            return F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-                ignore_index=self.pad_token_id
-            )
 
+        def forward(self, inputs):
+            encoder_out, hidden, labels = inputs
+            hidden = self.ln(hidden)
+            logits = self.head(hidden)
+            return logits, labels
+    
     blocks.append(FinalWrapper(
         hf_model.decoder.transformer.ln_f,
-        hf_model.decoder.lm_head,
-        hf_model.config.pad_token_id
+        hf_model.decoder.lm_head
     ))
 
     return blocks
 
 print(f"DEBUG ds_config: {ds_config}")
 
-print(f"DEBUG: torchdist.is_initialized(): {torchdist.is_initialized()}")
-print(f"DEBUG: torchdist.get_world_size(): {torchdist.get_world_size()}")
-print(f"DEBUG: torchdist.get_rank(): {torchdist.get_rank()}")
+print(f"DEBUG: dist.is_initialized(): {dist.is_initialized()}")
+print(f"DEBUG: dist.get_world_size(): {dist.get_world_size()}")
+print(f"DEBUG: dist.get_rank(): {dist.get_rank()}")
 
-torchdist.barrier()
+dist.barrier()
 print(f"DEBUG args.world_size: {args.world_size}, args.num_gpus: {args.num_gpus}, args.train_batch_size: {args.train_batch_size}")
 print(f"DEBUG os.environ['RANK']: {os.environ.get('RANK')}, os.environ['WORLD_SIZE']: {os.environ.get('WORLD_SIZE')}, os.environ['LOCAL_RANK']: {os.environ.get('LOCAL_RANK')}")
 
-def compute_loss(logits, labels):
+# Update the compute_loss function to handle the correct input format
+def compute_loss(outputs, labels=None):
+    # outputs is a tuple: (logits, labels) from FinalWrapper
+    if isinstance(outputs, tuple):
+        logits, labels = outputs
+    else:
+        # Fallback if something goes wrong
+        logits = outputs
+        labels = labels
+    
     return F.cross_entropy(
         logits.view(-1, logits.size(-1)),
         labels.view(-1),
-        ignore_index=hf_model.config.pad_token_id
+        ignore_index=tokenizer.eos_token_id  # Use tokenizer's eos_token_id instead
     )
 
 if args.pipeline_parallel:
-
-    # Then modify the call to PipelineModule to include a loss_fn:
-    # def compute_loss(model_output, labels):
-    #     return model_output.loss
-
-    # # model_layers = to_layers(hf_model)
-    # hf_model = PipelineModule(
-    #     # layers=model_layers,
-    #     layers=to_layers(hf_model),
-    #     num_stages=args.num_gpus,  # e.g., 2, 4, 8, etc.
-    #     loss_fn=compute_loss,
-    #     partition_method='uniform',  # or 'uniform', 'type:transformer', etc.
-    #     activation_checkpoint_interval=ds_config['pipeline']['activation_checkpoint_interval']
-    # )
-    # # hf_model = pipeline_model # replace hf_model with pipeline_model
-
-    # all_blocks = to_pipeline_blocks(hf_model)
-    # num_stages = args.num_gpus
-    # per = math.ceil(len(all_blocks) / num_stages)
-    # segments = [
-    #     torch.nn.Sequential(*all_blocks[i*per : (i+1)*per])
-    #     for i in range(num_stages)
-    # ]
-    # hf_model = PipelineModule(
-    #     layers=to_layers(hf_model),
-    #     # loss_fn=lambda logits_and_labels: F.cross_entropy(
-    #     #     logits_and_labels[0].view(-1, logits_and_labels[0].size(-1)),
-    #     #     logits_and_labels[1].view(-1),
-    #     #     ignore_index=hf_model.config.pad_token_id
-    #     # ),
-    #     loss_fn=compute_loss,
-    #     num_stages=args.num_gpus,
-    #     partition_method='uniform',
-    #     activation_checkpoint_interval=ds_config['pipeline']['activation_checkpoint_interval'],
-    # )
-
+    # Store the original config before wrapping with PipelineModule
+    original_pad_token_id = hf_model.config.pad_token_id
+    
     blocks = to_pipeline_blocks(hf_model)
 
     hf_model = PipelineModule(
@@ -853,9 +711,6 @@ optimizer = AdamW([p for p in hf_model.parameters() if p.requires_grad],
                   weight_decay=5e-9)
 
 
-# if args.pipeline_parallel:
-#     train_dataloader = itertools.cycle(train_dataloader)
-
 deep_speed_model_engine, optimizer, train_dataloader, lr_scheduler = deepspeed.initialize(
     args=args,
     model=hf_model,
@@ -865,41 +720,9 @@ deep_speed_model_engine, optimizer, train_dataloader, lr_scheduler = deepspeed.i
     config=ds_config_file,
     dist_init_required=None,  # Ensure distributed initialization is required
     )
-# deep_speed_model_engine.training_data = train_dataloader
-
 
 if args.resume_from_checkpoint is not None:
     deep_speed_model_engine.load_checkpoint(os.path.join(training_artifacts, experiment_name), tag=f"epoch_{str(num_epochs - 1)}")
-
-# if args.pretrained_model is not None and args.resume_from_checkpoint is None:
-#     # model = VisionEncoderDecoderModel.from_pretrained(args.pretrained_model).to(device)
-
-# # INFORMATIONAL
-# # TODO: fix counting model parameters now that we are using deep_speed_model_engine - hint: .model does not work
-# # trainable_params = sum(p.numel() for p in deep_speed_model_engine.parameters() if p.requires_grad)
-# # print("DEBUG Number of trainable parameters: ", trainable_params)
-# print("DEBUG len(val_dataloader): ", len(val_dataloader))
-# print("DEBUG len(test_dataloader): ", len(test_dataloader))
-# print("DEBUG len(deepspeed_train_dataloader): ", len(deepspeed_train_dataloader))
-# # For this to work, the deep_speed_model_engine above has to be
-# # identical architechture as the resume_from_checkpoint's architecture.
-# # load_checkpoint will also assume that we are using the same number of gpus,
-# # because we are saving model states under zero optimization.
-
-# if args.resume_from_checkpoint is not None and args.pretrained_model is None:
-#     print(f"[DEBUG] Using weights from {str(args.resume_from_checkpoint)}")
-#     # deep_speed_model_engine.load_checkpoint(str(args.resume_from_checkpoint), tag="")
-
-# print(hf_model)
-
-# def join_layers(vision_model):
-#     layers = [
-#         *vision_model.features,
-#         vision_model.avgpool,
-#         lambda x: torch.flatten(x, 1),
-#         *vision_model.classifier,
-#     ]
-#     return layers
 
 if args.freeze_encoder_decoder:
     for parameter in hf_model.parameters():
@@ -910,9 +733,6 @@ if args.freeze_encoder_decoder:
             if "crossatt" in name or 'ln_cross_attn' in name or 'mlp' in name:
                 param.requires_grad = True
     
-    # model.decoder.transformer.ln_f.requires_grad = True
-    # model.decoder.lm_head.requires_grad = True
-
 def print_device_maps(model, local_rank):
     output_buffer = []
 
@@ -921,40 +741,39 @@ def print_device_maps(model, local_rank):
         output_buffer.append(f"local_rank: {local_rank}, name: {name}, device: {param.device}")
 
     # Synchronize all processes
-    torchdist.barrier()
+    dist.barrier()
 
     # Sequential printing by rank
-    world_size = torchdist.get_world_size()
+    world_size = dist.get_world_size()
     for rank in range(world_size):
         if local_rank == rank:
             print("\n".join(output_buffer))
-        torchdist.barrier()  # Wait for this rank to finish printing
+        dist.barrier()  # Wait for this rank to finish printing
 
 print(f"DEBUG ds_config: {ds_config}")
 print_device_maps(deep_speed_model_engine, local_rank)
-torchdist.barrier()  # Ensure all processes see the same output
+dist.barrier()  # Ensure all processes see the same output
 
 if args.do_train:
-    
+    # Remove the duplicate for loop and combine them
     for epoch in range(num_epochs):
-        train_sampler.set_epoch(epoch)  # refresh sampler
+        # Set epoch for the DataLoaderAsDataset to regenerate batches
+        my_train_loader.set_epoch(epoch)  # refresh dataloader
 
         # manually compute how many train_batch() calls = 1 epoch
         steps_per_epoch = len(train_dataset) \
             // (args.train_batch_size * world_size * ds_config['gradient_accumulation_steps'])
 
-    for epoch in range(num_epochs):
         # Set to training mode
         deep_speed_model_engine.train()
         
         # Process fixed number of steps per epoch
         for step in range(steps_per_epoch):
             loss = deep_speed_model_engine.train_batch()
-            print(f"Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss.item() if loss is not None else 'N/A'}")
-            if deep_speed_model_engine.is_pipeline_last_stage():
+            if deep_speed_model_engine.is_last_stage():
                 print(f"Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss.item():.4f}")
         
-        torchdist.barrier()
+        dist.barrier()
         
         # Save checkpoint
         checkpoint_path = os.path.join(training_artifacts, experiment_name)
@@ -962,369 +781,6 @@ if args.do_train:
             os.makedirs(checkpoint_path, exist_ok=True)
         
         deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
-
-# Train and Val
-if args.do_train_old:
-
-    for epoch in range(num_epochs):
-        deep_speed_model_engine.train()
-
-        step_num = 0
-        # steps_total = len(deepspeed_train_dataloader)
-        # steps_total = len(train_dataset) // (args.train_batch_size // (num_gpus * args.gradient_accumulation_steps))
-        steps_total = len(train_dataset) // (args.train_batch_size // (num_gpus * ds_config['gradient_accumulation_steps']))
-
-        for batch in deepspeed_train_dataloader:
-            # batch = [(x.to(device), y.to(device)) for (x,y) in batch.items()]
-            # print(f"DEBUG type(batch) {type(batch)}, batch length: {len(batch)}, rank: {local_rank}")
-            inputs = {}
-            for idx, values in batch.items():
-                if idx == 'pixel_values':
-                    inputs[idx] = values.to(device, dtype=torch.float16)  # important!
-                elif idx == 'labels':
-                    inputs[idx] = values.to(device)  # leave labels as is
-
-            # print("DEBUG inputs.shape:", inputs['labels'].shape)
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = deep_speed_model_engine(**inputs)
-                loss = outputs.loss
-                # loss.backward()
-            # optimizer.step()
-            # optimizer.zero_grad()
-            deep_speed_model_engine.backward(loss)
-            deep_speed_model_engine.step()
-            print(f"Step: {step_num}/{steps_total}, Rank: {local_rank}, Training Loss: {loss.item()}")
-            # if args.local_rank == 0:
-            #     wandb.log({"train_loss": loss.item(), 'train_learning_rate': learning_rate})
-            step_num += 1
-        learning_rate = learning_rate - (learning_rate * learning_rate_decay)
-        for i, param_group in enumerate(deep_speed_model_engine.optimizer.param_groups):
-            print(f"{i}\tparam_group: {param_group}")
-            param_group['lr'] = learning_rate
-
-        # Save checkpoint every epoch
-        checkpoint_path = os.path.join(training_artifacts, experiment_name)
-        if local_rank == 0:
-            os.makedirs(checkpoint_path, exist_ok=True)
-
-        print(f"INFO Saving checkpoint: {checkpoint_path}")
-        deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
-        
-        # instantiate a inference object from deepseed
-        # loop over our val_dataloader, running inference on each one
-        # Validation every epoch
-        if args.do_val:
-            deep_speed_model_engine.eval()
-            # val_sampler.set_epoch(epoch)  # refresh sampler
-            total_val_loss = 0
-            for i, batch in enumerate(val_dataloader):
-                # print(f"batch {i}")
-                # batch = {k: v.to(device) for k, v in batch.items()}
-                inputs = {}
-                for idx, values in batch.items():
-                    if idx == 'pixel_values':
-                        inputs[idx] = values.to(device, dtype=torch.float16)  # important!
-                    elif idx == 'labels':
-                        inputs[idx] = values.to(device)  # leave labels as is
-
-                with torch.autocast(device_type='cuda', dtype=torch.float16), torch.no_grad():        
-                    outputs = deep_speed_model_engine(**inputs)
-                    loss = outputs.loss
-                total_val_loss += loss.item()
-
-            avg_val_loss = total_val_loss / len(val_dataloader)
-            print(f"Epoch {epoch+1} completed, average val loss: {avg_val_loss}")
-            if local_rank == 0:
-                wandb.log({"ave_val_loss": avg_val_loss})
-    
-    # free memory
-    # https://github.com/deepspeedai/DeepSpeed/blob/master/deepspeed/runtime/zero/stage3.py
-    deep_speed_model_engine.destroy()
-    torch.cuda.empty_cache()
-
-if args.do_test:
-    
-    checkpoint_path = os.path.join(training_artifacts, experiment_name, f"epoch_{num_epochs-1}") 
-    checkpoint_dict = {
-        "type": "ds_model",
-        "version": 0.0,
-        "checkpoints": tuple(f"{checkpoint_path}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
-    }
-
-
-    # For this to work, the hf_model has to be identical architechture
-    # as the resume_from_checkpoint's architecture.
-
-    # if not args.do_train:
-    #     # load the checkpoint stored in args.resume_from_checkpoint, if training
-    #     # and testing were run separately
-    #     epoch_and_num = f"epoch_{str(args.resume_from_checkpoint)}"
-    #     epoch_path = os.path.join(training_artifacts, experiment_name, epoch_and_num) 
-    #     if args.resume_from_checkpoint is not None:
-    #         print(f"[DEBUG] Resuming from {str(args.resume_from_checkpoint)}")
-    #         checkpoint_dict = {
-    #             "type": "ds_model",
-    #             "version": 0.0,
-    #             "checkpoints": tuple(f"{epoch_path}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
-    #         }
-
-    #     else:
-    #         # Did not provide a checkpoint to run inference on.
-    #         print(f"[DANGER] You did not proved a checkpoint to run inference on.")
-    #         sys.exit(1)
-    # else:
-    #     # If training was just run in the same script, load the checkpoint
-    #     # from the last epoch.
-    #     # checkpoint_path = os.path.join(checkpoint_path, f"epoch_{num_epochs-1}")
-    #     checkpoint_path = os.path.join(training_artifacts, experiment_name, f"epoch_{num_epochs-1}") 
-    #     print(f"[DEBUG] Resuming from {checkpoint_path}")
-
-    #     checkpoint_dict = {
-    #         "type": "ds_model",
-    #         "version": 0.0,
-    #         "checkpoints": tuple(f"{checkpoint_path}/zero_pp_rank_{i}_mp_rank_00_model_states.pt" for i in range(world_size))
-    #     }
-
-    # print(f"[DEBUG] checkpoint_dict: {checkpoint_dict}")
-    ds_inference_engine = deepspeed.init_inference(
-        model=hf_model,
-        # config={
-        #    "tensor_parallel": { "tp_size": world_size },  # or 1 if just data parallel (aka 1 means to not spread model across gpus)
-        #    "dtype": "fp16",
-        #},
-        checkpoint=checkpoint_dict, 
-    )
-    ds_inference_engine.eval()
-
-    # deep_speed_model_engine.eval()
-
-    # get the metrics ready
-    total_test_loss = 0
-    predicted_captions = []
-    predicted_tokens = []
-    ground_truth_captions = []
-    ground_truth_tokens = []
-    all_filenames = []
-
-    bleu1_metric = BLEUScore(n_gram=1)
-    bleu2_metric = BLEUScore(n_gram=2)
-    bleu3_metric = BLEUScore(n_gram=3)
-    bleu4_metric = BLEUScore(n_gram=4)
-    # perplexity_metric = Perplexity().to(device)
-    word_error_rate_metric = WordErrorRate()
-    word_info_lost_metric = WordInformationLost()
-    word_info_preserved_metric = WordInformationPreserved()
-    cider_metric = Cider()
-    meteor_metric = Meteor()
-    rouge_metric = Rouge()
-    spice_metric = Spice()
-
-    gen_kwargs = {
-        "min_length": min_caption_length,
-        "max_length": max_caption_length,
-        "num_beams": num_beams,
-        "no_repeat_ngram_size": no_repeat_ngram_size,
-        "early_stopping": True # if false, then it skips eos token until we reach max_length
-    }
-
-    for i, batch in enumerate(test_dataloader):
-        # print(f"batch {i}")
-        # batch = {k: v.to(device) for k, v in batch.items()}
-        print("DEBUG did we make it here? 0.1")
-        inputs = {}
-        for idx, values in batch.items():
-            if idx == 'pixel_values':
-                inputs[idx] = values.to(device, dtype=torch.float16)  # important!
-            elif idx == 'labels':
-                inputs[idx] = values.to(device)  # leave labels as is
-
-        print("DEBUG did we make it here? 0.2")
-        # with torch.autocast(device_type='cuda', dtype=torch.float16), torch.no_grad():       
-        with torch.no_grad():       
-            # outputs = ds_inference_engine(**inputs)
-            # loss = outputs.loss
-            # total_test_loss += loss.item()
-
-            # perplexity_metric.update(outputs.logits, inputs['labels'])
-
-            print("DEBUG did we make it here? 0.3")
-            # tokens = ds_inference_engine.generate(**inputs, **gen_kwargs)
-            start = time.time()
-            tokens = ds_inference_engine.module.generate(**inputs, **gen_kwargs, pad_token_id=tokenizer.eos_token_id)
-            end = time.time()
-            print("DEBUG did we make it here? 0.4")
-            print(f"Rank {local_rank}'s generation took {end - start} seconds..")
-            predicted_tokens.extend(tokens)
-            print("DEBUG did we make it here? 0.5")
-
-            decoded_predicted_caption = tokenizer.batch_decode(tokens, skip_special_tokens=True)
-            print("DEBUG did we make it here? 0.6")
-
-        print("DEBUG did we make it here? 1")
-        predicted_captions.extend(decoded_predicted_caption)
-        print("DEBUG did we make it here? 2")
-
-        ground_truth_caption = inputs['labels']
-        print("DEBUG did we make it here? 3")
-        ground_truth_tokens.extend(ground_truth_caption)
-        print("DEBUG did we make it here? 4")
-
-        decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
-        print("DEBUG did we make it here? 5")
-        ground_truth_captions.extend(decoded_ground_truth_caption)
-        print("DEBUG did we make it here? 6")
-
-        all_filenames.extend(batch['filenames'])
-
-    print("DEBUG did we make it here? 7")
-    print("[DEBUG] ground_truth_captions:", ground_truth_captions)
-    print("[DEBUG] predicted_captions:", predicted_captions)
-
-    # Aggregate loss across GPUs
-    loss_tensor = torch.tensor(total_test_loss, device=device)
-    # if dist.is_initialized():
-    #     dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
-    total_test_loss = loss_tensor.item()
-
-    # Gather lists from all GPUs (requires PyTorch 1.8+)
-    # gathered_predicted = [None for _ in range(world_size)]
-    # gathered_gt = [None for _ in range(world_size)]
-    # gathered_filenames = [None for _ in range(world_size)]
-    # if dist.is_initialized():
-    #     dist.all_gather_object(gathered_predicted, predicted_captions)
-    #     dist.all_gather_object(gathered_gt, ground_truth_captions)
-    #     dist.all_gather_object(gathered_filenames, all_filenames)
-        
-    #     predicted_captions = [item for sublist in gathered_predicted for item in sublist]
-    #     ground_truth_captions = [item for sublist in gathered_gt for item in sublist]
-    #     all_filenames = [item for sublist in gathered_filenames for item in sublist]
-
-    if local_rank == 0:
-        avg_loss = total_test_loss / (len(test_dataloader) * world_size)
-        print(f"Average Test Loss: {avg_loss}")
-
-        # bleu1_metric = BLEUScore(n_gram=1)
-        # bleu2_metric = BLEUScore(n_gram=2)
-        # bleu3_metric = BLEUScore(n_gram=3)
-        # bleu4_metric = BLEUScore(n_gram=4)
-        
-        # word_error_rate_metric = WordErrorRate()
-        # word_info_lost_metric = WordInformationLost()
-        # word_info_preserved_metric = WordInformationPreserved()
-        # cider_metric = Cider()
-        # meteor_metric = Meteor()
-        # rouge_metric = Rouge()
-        # spice_metric = Spice()
-
-        metrics_dict = {}       
-        metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
-
-        ground_truth_captions_flattened = [[x.replace('\n', ' ').strip()] for x in ground_truth_captions]
-        predicted_captions_flattened = [[x.replace('\n', ' ').strip()] for x in predicted_captions]
-        ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions_flattened))
-        predicted_captions_dict = dict((zip(all_filenames, predicted_captions_flattened)))
-        
-        metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
-        metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
-        metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
-        metrics_dict["blue4_score"] = bleu4_metric.update(predicted_captions, ground_truth_captions).compute().item()
-        # metrics_dict["perplexity_score"] = perplexity_metric.compute().item()
-        metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(predicted_captions, ground_truth_captions).compute().item()
-        metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(predicted_captions, ground_truth_captions).compute().item()
-        metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(predicted_captions, ground_truth_captions).compute().item()
-
-        print(f"\n\nDEBUG ground_truth_captions_dict: {ground_truth_captions_dict}\n\n")
-        print(f"\n\nDEBUG predicted_captions_dict: {predicted_captions_dict}\n\n")
-        metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-        metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-        metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-        metrics_dict["spice_score"], spice_scores = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-
-        print(f"Average test loss: {metrics_dict['avg_test_loss']}")
-        print(metrics_dict)
-
-        wandb.log(metrics_dict)
-        wandb.finish()
-
-        # Run the qualitative if we are doing that
-        os.makedirs(output_dir, exist_ok=True)
-        with open(os.path.join(output_dir, experiment_name +".csv"), 'w') as f:
-            for i,filename in enumerate(ground_truth_captions_dict):
-                f.writelines(filename + "," + predicted_captions[i][0] + "," + ground_truth_captions[i][0] + "\n")
-
-        mean = torch.tensor(image_processor.image_mean).view(1, 3, 1, 1)
-        std = torch.tensor(image_processor.image_std).view(1, 3, 1, 1)
-
-        # path_to_8_frames = '/data1/juve/datasets/youdescribe/videos/8-framed_images/'
-        # /data2/juve/dataset/youdescribe/npz_datasets/YD3_8_frames/G_QWtUFFAFQ_100000_110000_58e7cf3e46e13dfd851a2932.npz
-        # /data1/juve/datasets/youdescribe/videos/8-framed_images/00-u98sOE4s_000049_000059.png
-
-        # in progress
-        # # make a qualitative report, don't print all test set (could be too big)
-        # with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
-        #     f.write(f"""<!DOCTYPE html>
-        #                 <html><head></head>
-        #                 <body>
-        #             """)
-        #     for i,filename in enumerate(ground_truth_captions_dict):
-        #         clip_id = filename.split("_")[-1]
-        #         end_time = int(float(filename.split("_")[-2]) / 1000)
-        #         start_time = int(float(filename.split("_")[-3]) / 1000)
-        #         video_id = filename[:11]
-        #         new_filename = f"{video_id}_{start_time:06}_{end_time:06}.png"
-
-        #         f.write(f"<p>{i}, {filename} {new_filename} <br>Predicted Caption: {predicted_captions[i][0]}<br>Ground-Truth Caption: {ground_truth_captions[i][0]}</p><br>\n")
-        #         f.write(f'<img loading="lazy" src="8-framed_images/{new_filename}">')
-        #         f.write("<br>\n")
-        #         if i > num_qualitative:
-        #             break
-        #     f.write(f"</body></html>")
-
-
-        # good working code, but does not scale 
-
-        with open(os.path.join(output_dir, experiment_name + ".html"), 'w') as f:
-            f.write(f"""<!DOCTYPE html>
-                        <html><head><style>
-                        .sample {{  width: 1024px; border: 1px solid black; padding: 10px; margin: 10px; }}
-
-                        .grid-container {{
-                            display: grid;
-                            grid-template-columns: repeat(4, 1fr); /* Creates 4 equal columns */
-                            grid-template-rows: repeat(2, 1fr); /* Creates 2 equal rows */
-                            place-items: center;                                    
-                            gap: 10px; /* Optional: Add spacing between grid items */
-                        }}
-
-                        .grid-container img {{
-                            width: 224px; /* Make images fill the grid cells */                                 
-                            height: 224px;                                                                      
-                            object-fit: cover; /* Maintain aspect ratio and cover the cell */
-                        }}
-                        </style></head>
-                        <body>
-                    """)
-            for i,filename in enumerate(ground_truth_captions_dict):
-                npz_data = np.load(os.path.join(data_dir, "test", filename))
-                processed_images = torch.tensor(npz_data['arr_0'])
-                unprocessed_images = processed_images * std + mean
-
-                f.write(f"<div class='sample'><p>{i}, {filename}<br>Predicted Caption: {predicted_captions_dict[filename]}<br>Ground-Truth Caption: {ground_truth_captions_dict[filename]}</p>\n<div class='grid-container'>\n")
-                # for j in range(npz_data['arr_0'].shape[0]):
-                for j in range(unprocessed_images.shape[0]):
-                    an_image = unprocessed_images[j]
-                    transform = transforms.ToPILImage()
-                    pil_image = transform(an_image)
-                    buffer = io.BytesIO()
-                    pil_image.save(buffer, format="PNG")
-                    buffer.seek(0) # Rewind the buffer to the beginning
-                    base64_string = base64.b64encode(buffer.read()).decode()
-                    img_tag = f'<img src="data:image/png;base64,{base64_string}">' 
-                    f.write(f"{img_tag}\n")
-                f.write("</div></div>\n")
-                if i >= num_qualitative:
-                    break
-            f.write(f"</body></html>")
-            
-# dist.barrier()
-# dist.destroy_process_group()
+           
+dist.barrier()
+dist.destroy_process_group()
