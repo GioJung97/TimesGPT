@@ -162,10 +162,10 @@ config_decoder.n_layer = args.num_layers_decoder
 config_decoder.n_head = args.num_heads_decoder
 
 # Disable flash attention for compatibility
-config_decoder.use_flash_attn = False
-config_decoder.fused_mlp = False
-config_decoder.fused_bias_fc = False
-config_decoder.fused_dropout_add_ln = False
+config_decoder.use_flash_attn = True
+config_decoder.fused_mlp = True
+config_decoder.fused_bias_fc = True
+config_decoder.fused_dropout_add_ln = True
 
 # Ensure hidden sizes match for cross-attention
 config_decoder.n_embd = config_encoder.hidden_size
@@ -273,16 +273,171 @@ class DataLoaderAsDataset(Dataset):
             self._create_batches()
         return self._flattened_items[idx]
 
+# Replace DataLoaderAsDataset with an index-only version
+class IndexOnlyDataset(Dataset):
+    def __init__(self, dataset, sampler):
+        self.dataset = dataset
+        self.sampler = sampler
+        self.current_epoch = -1
+        self._indices = []
+
+    def set_epoch(self, epoch):
+        """Only shuffles and stores indices - no data loading"""
+        if epoch != self.current_epoch:
+            self.current_epoch = epoch
+            self.sampler.set_epoch(epoch)
+            # Just store the shuffled indices - instant operation
+            self._indices = list(self.sampler)
+
+    def __len__(self):
+        if not self._indices:
+            self._indices = list(self.sampler)
+        return len(self._indices)
+
+    def __getitem__(self, idx):
+        """Load data only when DeepSpeed requests this specific item"""
+        if not self._indices:
+            self._indices = list(self.sampler)
+        
+        # Get the actual dataset index
+        dataset_idx = self._indices[idx]
+        
+        # Load data on-demand - only this one sample
+        pixel_vals, labels = self.dataset[dataset_idx]
+        pixel_vals = pixel_vals.unsqueeze(0)  # Add batch dimension
+        
+        return [pixel_vals, labels]
+
+def verify_dataloader_samples(dataset, tokenizer, num_samples=20, shuffle=False):
+    """
+    Verify that the distributed dataloader is correctly cycling through captions.
+    Gathers samples from all ranks to reconstruct the original order.
+    """
+    if local_rank == 0:
+        print(f"=== Distributed Dataloader Verification (num_captions={dataset.dataset.num_caption}) ===")
+        print(f"Expected behavior: Every {dataset.dataset.num_caption} samples should have same pixel_values, different captions\n")
+    
+    # Set up the dataloader with known state
+    dataset.sampler.shuffle = shuffle
+    dataset.set_epoch(0)  # Reset to epoch 0 for consistent testing
+    
+    # Each rank collects its assigned samples
+    local_samples = []
+    samples_per_rank = min(num_samples // world_size + 1, len(dataset))
+    
+    for i in range(samples_per_rank):
+        if i >= len(dataset):
+            break
+            
+        sample = dataset[i]
+        pixel_vals, labels = sample[0], sample[1]
+        
+        # Remove batch dimension for analysis
+        pixel_vals_display = pixel_vals.squeeze(0) if pixel_vals.dim() == 5 else pixel_vals
+        labels_display = labels.squeeze(0) if labels.dim() == 2 else labels
+        
+        # Get the original dataset index this sample corresponds to
+        original_idx = dataset._indices[i]
+        
+        # Decode caption
+        caption = tokenizer.decode(labels_display, skip_special_tokens=True)
+        
+        # Store sample info with rank and original index
+        sample_info = {
+            'rank': local_rank,
+            'local_idx': i,
+            'original_idx': original_idx,
+            'pixel_shape': list(pixel_vals_display.shape),
+            'pixel_hash': hash(pixel_vals_display.flatten().sum().item()),
+            'labels_shape': list(labels_display.shape),
+            'caption': caption[:100] + "..." if len(caption) > 100 else caption,
+            'file_idx': original_idx // dataset.dataset.num_caption,
+            'caption_idx': original_idx % dataset.dataset.num_caption
+        }
+        local_samples.append(sample_info)
+    
+    # Gather all samples from all ranks
+    import torch.distributed as dist
+    
+    # Convert to tensors and strings that can be gathered
+    gathered_samples = [None] * world_size
+    dist.all_gather_object(gathered_samples, local_samples)
+    
+    # Only rank 0 processes and displays results
+    if local_rank == 0:
+        # Flatten and sort by original_idx to reconstruct the consecutive order
+        all_samples = []
+        for rank_samples in gathered_samples:
+            all_samples.extend(rank_samples)
+        
+        # Sort by original dataset index to see the true consecutive order
+        all_samples.sort(key=lambda x: x['original_idx'])
+        
+        # Limit to requested number of samples
+        all_samples = all_samples[:num_samples]
+        
+        # Display results
+        print(f"{'Orig':<4} {'Rank':<4} {'Local':<5} {'File':<4} {'Cap':<3} {'Pixel Hash':<12} {'Pixel Shape':<20} {'Caption':<60}")
+        print("-" * 130)
+        
+        for sample in all_samples:
+            print(f"{sample['original_idx']:<4} {sample['rank']:<4} {sample['local_idx']:<5} "
+                  f"{sample['file_idx']:<4} {sample['caption_idx']:<3} "
+                  f"{sample['pixel_hash']:<12} {str(sample['pixel_shape']):<20} {sample['caption']:<60}")
+        
+        # Verify caption cycling
+        print(f"\n=== Verification Results ===")
+        
+        # Check if first num_captions samples have same pixel_values
+        if len(all_samples) >= dataset.dataset.num_caption:
+            first_group_hashes = [all_samples[i]['pixel_hash'] for i in range(dataset.dataset.num_caption)]
+            all_same_pixels = all(h == first_group_hashes[0] for h in first_group_hashes)
+            
+            print(f"✓ First {dataset.dataset.num_caption} samples have same pixel_values: {all_same_pixels}")
+            
+            # Check if captions are different
+            first_group_captions = [all_samples[i]['caption'] for i in range(dataset.dataset.num_caption)]
+            all_different_captions = len(set(first_group_captions)) == len(first_group_captions)
+            
+            print(f"✓ First {dataset.dataset.num_caption} samples have different captions: {all_different_captions}")
+            
+            # Check cycling pattern
+            if len(all_samples) >= dataset.dataset.num_caption * 2:
+                second_group_hashes = [all_samples[i]['pixel_hash'] for i in range(dataset.dataset.num_caption, dataset.dataset.num_caption * 2)]
+                different_from_first = any(h != first_group_hashes[0] for h in second_group_hashes)
+                print(f"✓ Second group ({dataset.dataset.num_caption}-{dataset.dataset.num_caption*2-1}) uses different pixel_values: {different_from_first}")
+        
+        # Show distribution across ranks
+        rank_distribution = {}
+        for sample in all_samples:
+            rank = sample['rank']
+            rank_distribution[rank] = rank_distribution.get(rank, 0) + 1
+        
+        print(f"\n=== Distribution Across Ranks ===")
+        for rank in sorted(rank_distribution.keys()):
+            print(f"Rank {rank}: {rank_distribution[rank]} samples")
+        
+        return all_samples
+    
+    # Synchronize all ranks
+    dist.barrier()
+    return None
+
 # Create datasets and loaders
 train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
-train_sampler = DistributedSampler(train_dataset, shuffle=True, num_replicas=world_size, rank=local_rank)
+train_sampler = DistributedSampler(train_dataset, shuffle=False, num_replicas=world_size, rank=local_rank)
 
-my_train_loader = DataLoaderAsDataset(
-    train_dataset, 
-    batch_size=ds_config['pipeline'].get('micro_batch_size', args.train_batch_size), 
-    sampler=train_sampler,
-    collate_fn=default_collate  
-)
+# my_train_loader = DataLoaderAsDataset(
+#     train_dataset, 
+#     batch_size=ds_config['pipeline'].get('micro_batch_size', args.train_batch_size), 
+#     sampler=train_sampler,
+#     collate_fn=default_collate  
+# )
+
+my_train_loader = IndexOnlyDataset(train_dataset, train_sampler)
+samples = verify_dataloader_samples(my_train_loader, tokenizer, num_samples=25, shuffle=False)
+print(samples)
+sys.exit()
 
 # Pipeline block creation
 def to_pipeline_blocks(hf_model):
