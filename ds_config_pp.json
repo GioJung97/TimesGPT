@@ -5,26 +5,24 @@
     "trial_duration": 4,
     "trial_interval": 2
   },
-  "gradient_accumulation_steps": 4,
-  "num_gpus": 2,
+  "distributed_training": {
+    "world_size": 2
+  },
+  "gradient_accumulation_steps": 2,
   "train_micro_batch_size_per_gpu": 2,
-  "train_batch_size": 8,
+  "train_batch_size": 4,
   "steps_per_print": 50,
-  "train_world_size": 2,
-  "world_size": 2,
   "pipeline": {
     "enabled": true,
-    "world_size": 2,
-    "stages": 2,
-    "partition": "parameters",
+    "partition": "type:transformer",
     "seed_layers": true,
     "activation_checkpoint_interval": 1,
     "activation_checkpoint_func": "deepspeed.checkpointing.checkpoint",
-        "micro_batch_size": 1,
-        "pipeline_parallel_size": 2
+    "micro_batch_size": 2,
+    "pipeline_parallel_size": 2,
   },
   "optimizer": {
-    "type": "Adam",
+    "type": "AdamW",
     "params": {
       "lr": 0.0000005,
       "betas": [
@@ -36,7 +34,9 @@
     }
   },
   "fp16": {
-    "enabled": true
+    "enabled": true,
+    "auto_cast": false,
+    "type": "torch"
   },
   "zero_optimization": {
     "stage": 1
