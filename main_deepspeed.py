@@ -162,10 +162,10 @@ config_decoder.n_layer = args.num_layers_decoder
 config_decoder.n_head = args.num_heads_decoder
 
 # Disable flash attention for compatibility
-config_decoder.use_flash_attn = True
-config_decoder.fused_mlp = True
-config_decoder.fused_bias_fc = True
-config_decoder.fused_dropout_add_ln = True
+config_decoder.use_flash_attn = False
+config_decoder.fused_mlp = False
+config_decoder.fused_bias_fc = False
+config_decoder.fused_dropout_add_ln = False
 
 # Ensure hidden sizes match for cross-attention
 config_decoder.n_embd = config_encoder.hidden_size
@@ -435,9 +435,11 @@ train_sampler = DistributedSampler(train_dataset, shuffle=False, num_replicas=wo
 # )
 
 my_train_loader = IndexOnlyDataset(train_dataset, train_sampler)
-samples = verify_dataloader_samples(my_train_loader, tokenizer, num_samples=25, shuffle=False)
-print(samples)
-sys.exit()
+
+# Verify the dataloader samples produces the correct output
+# samples = verify_dataloader_samples(my_train_loader, tokenizer, num_samples=25, shuffle=False)
+# print(samples)
+# sys.exit()
 
 # Pipeline block creation
 def to_pipeline_blocks(hf_model):

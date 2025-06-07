@@ -6,11 +6,11 @@
     "trial_interval": 2
   },
   "distributed_training": {
-    "world_size": 2
+    "world_size": 3
   },
-  "gradient_accumulation_steps": 2,
-  "train_micro_batch_size_per_gpu": 2,
-  "train_batch_size": 4,
+  "gradient_accumulation_steps": 3,
+  "train_micro_batch_size_per_gpu": 4,
+  "train_batch_size": 12,
   "steps_per_print": 50,
   "pipeline": {
     "enabled": true,
@@ -18,8 +18,8 @@
     "seed_layers": true,
     "activation_checkpoint_interval": 1,
     "activation_checkpoint_func": "deepspeed.checkpointing.checkpoint",
-    "micro_batch_size": 2,
-    "pipeline_parallel_size": 2,
+    "micro_batch_size": 4,
+    "pipeline_parallel_size": 3
   },
   "optimizer": {
     "type": "AdamW",
@@ -49,5 +49,11 @@
     "group": "sfsuml",
     "team": "sfsuml",
     "project": "nairr"
+  },
+  "comms_logger": {
+    "enabled": false,
+    "verbose": false,
+    "prof_all": false,
+    "debug": false
   }
 }
