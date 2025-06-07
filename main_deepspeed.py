@@ -74,6 +74,7 @@ parser.add_argument('--pipeline_parallel', action='store_true', help="Use pipeli
 parser.add_argument('--do_train', action="store_true", help="Run training phase")
 parser.add_argument('--do_val', action="store_true", help="Run validation phase")
 parser.add_argument('--do_test', action="store_true", help="Run test phase")
+parser.add_argument('--disable_tied_weights', action='store_true', help="Disable weight tying between embeddings and LM head for pipeline compatibility")
 
 args = parser.parse_args()
 
@@ -308,6 +309,31 @@ class IndexOnlyDataset(Dataset):
         
         return [pixel_vals, labels]
 
+def verify_weight_tying(model, local_rank=0):
+    """Verify the current state of weight tying"""
+    if local_rank == 0:
+        wte_weight = model.decoder.transformer.wte.weight
+        lm_head_weight = model.decoder.lm_head.weight
+        
+        same_object = id(wte_weight) == id(lm_head_weight)
+        same_values = torch.equal(wte_weight, lm_head_weight)
+        
+        print(f"=== Weight Tying Verification ===")
+        print(f"Same memory object: {same_object}")
+        print(f"Same values: {same_values}")
+        print(f"WTE shape: {wte_weight.shape}")
+        print(f"LM head shape: {lm_head_weight.shape}")
+        print(f"WTE requires_grad: {wte_weight.requires_grad}")
+        print(f"LM head requires_grad: {lm_head_weight.requires_grad}")
+        
+        if same_object:
+            print("✓ Weights are tied (sharing same memory)")
+        elif same_values:
+            print("⚠ Weights have same values but are separate objects")
+        else:
+            print("✓ Weights are separate and potentially different")
+        print("=" * 35)
+
 def verify_dataloader_samples(dataset, tokenizer, num_samples=20, shuffle=False):
     """
     Verify that the distributed dataloader is correctly cycling through captions.
@@ -439,11 +465,52 @@ my_train_loader = IndexOnlyDataset(train_dataset, train_sampler)
 # Verify the dataloader samples produces the correct output
 # samples = verify_dataloader_samples(my_train_loader, tokenizer, num_samples=25, shuffle=False)
 # print(samples)
+# Add this call after model creation
+verify_weight_tying(hf_model, local_rank)
 # sys.exit()
+
+# Add this after creating the model but before pipeline conversion
+if args.disable_tied_weights:
+    # Break the tie by creating separate weights for lm_head
+    if hasattr(hf_model.decoder.transformer.wte, 'weight') and hasattr(hf_model.decoder, 'lm_head'):
+        # Check if weights are currently tied
+        if id(hf_model.decoder.transformer.wte.weight) == id(hf_model.decoder.lm_head.weight):
+            if local_rank == 0:
+                print("INFO: Breaking weight tie - creating separate lm_head weights")
+            
+            # Create a copy of the embedding weights for lm_head
+            hf_model.decoder.lm_head.weight = nn.Parameter(
+                hf_model.decoder.transformer.wte.weight.clone().detach()
+            )
+        else:
+            if local_rank == 0:
+                print("INFO: Weights were already untied")
+    
+    if local_rank == 0:
+        print("INFO: Weight tying disabled via --disable_tied_weights flag")
 
 # Pipeline block creation
 def to_pipeline_blocks(hf_model):
     blocks = []
+
+        # Check for tied weights
+    wte_weights = hf_model.decoder.transformer.wte.weight
+    lm_head_weights = hf_model.decoder.lm_head.weight
+    
+    # Check both weight equality and object identity
+    weights_are_tied = (
+        torch.equal(wte_weights, lm_head_weights) and 
+        id(wte_weights) == id(lm_head_weights)
+    )
+    
+    if local_rank == 0:
+        print(f"INFO: Word embeddings and LM head weights are tied: {weights_are_tied}")
+        if args.disable_tied_weights and weights_are_tied:
+            print("WARNING: Tied weights detected despite --disable_tied_weights flag!")
+        elif not args.disable_tied_weights and weights_are_tied:
+            print("INFO: Using tied weights (standard GPT2 behavior)")
+        else:
+            print("INFO: Using separate weights for embeddings and LM head")
     
     # Input wrapper - handles encoder embeddings
     class InputWrapper(nn.Module):
@@ -500,14 +567,15 @@ def to_pipeline_blocks(hf_model):
     
     blocks.append(Adapter())
 
-    # Token embedding wrapper
+    # Modified TokenEmbedWrapper to handle tied weights
     class TokenEmbedWrapper(nn.Module):
-        def __init__(self, wte, wpe, drop):
+        def __init__(self, wte, wpe, drop, is_tied=False):
             super().__init__()
             self.wte = wte
             self.wpe = wpe
             self.drop = drop
             self.vocab_size = wte.num_embeddings
+            self.is_tied = is_tied
 
         def forward(self, inputs):
             encoder_out, labels = inputs
@@ -543,7 +611,8 @@ def to_pipeline_blocks(hf_model):
     blocks.append(TokenEmbedWrapper(
         hf_model.decoder.transformer.wte,
         hf_model.decoder.transformer.wpe,
-        hf_model.decoder.transformer.drop
+        hf_model.decoder.transformer.drop,
+        is_tied=weights_are_tied
     ))
     
     # Decoder transformer blocks
@@ -571,12 +640,18 @@ def to_pipeline_blocks(hf_model):
         
         blocks.append(DecBlockWrapper(dec_block))
 
-    # Final output layer
+    # Modified FinalWrapper to handle tied weights
     class FinalWrapper(nn.Module):
-        def __init__(self, ln_f, lm_head):
+        def __init__(self, ln_f, lm_head, wte=None, is_tied=False):
             super().__init__()
             self.ln = ln_f
             self.head = lm_head
+            self.wte = wte
+            self.is_tied = is_tied
+            
+            # If tied, ensure they reference the same weights
+            if is_tied and wte is not None:
+                self.head.weight = wte.weight
 
         def forward(self, inputs):
             encoder_out, hidden, labels = inputs
@@ -586,7 +661,9 @@ def to_pipeline_blocks(hf_model):
     
     blocks.append(FinalWrapper(
         hf_model.decoder.transformer.ln_f,
-        hf_model.decoder.lm_head
+        hf_model.decoder.lm_head,
+        wte=hf_model.decoder.transformer.wte if weights_are_tied else None,
+        is_tied=weights_are_tied
     ))
 
     return blocks
