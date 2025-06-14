@@ -95,6 +95,7 @@ num_captions = args.num_captions
 data_dir = '/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames'
 training_artifacts = '/data2/juve/training_artifacts/'
 train_data_dir = os.path.join(data_dir, 'train')
+val_data_dir = os.path.join(data_dir, 'val')
 experiment_name = f"{args.experiment_name}_ws_{num_gpus}_nc_{num_captions}_ep_{num_epochs}_ss_{subsample_size}"
 
 # Set seeds
@@ -219,6 +220,23 @@ class NPZDataset(Dataset):
 
 # Create datasets and loaders
 train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
+val_dataset = NPZDataset(val_data_dir, num_captions, subsample_size)
+
+val_sampler = DistributedSampler(
+    val_dataset,
+    num_replicas=world_size,
+    rank=local_rank,
+    shuffle=False
+)
+
+val_dataloader = DataLoader(
+    val_dataset,
+    sampler=val_sampler,
+    batch_size=ds_config["train_micro_batch_size_per_gpu"],
+    collate_fn=default_collate,
+    drop_last=True
+)
+
 # train_sampler = DistributedSampler(
 #     train_dataset,
 #     num_replicas=world_size,
@@ -493,5 +511,24 @@ if args.do_train:
         
         deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
 
+        if args.do_val:
+            deep_speed_model_engine.eval()
+            val_iter = iter(RepeatingLoader(val_dataloader))
+
+            num_val_batches = len(val_dataset) // (
+                ds_config['train_micro_batch_size_per_gpu'] * ds_config['gradient_accumulation_steps']
+            )
+
+            total_loss = 0.0
+
+            with torch.no_grad():
+                for _ in range(num_val_batches):
+                    loss = deep_speed_model_engine.eval_batch(data_iter=val_iter)
+                    if deep_speed_model_engine.is_last_stage():
+                        total_loss += loss.item()
+
+            if local_rank == 0:
+                avg_loss = total_loss / num_val_batches
+                print(f"Validation Loss: {avg_loss}")
 dist.barrier()
 dist.destroy_process_group()
