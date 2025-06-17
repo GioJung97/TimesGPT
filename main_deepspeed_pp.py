@@ -237,21 +237,6 @@ val_dataloader = DataLoader(
     drop_last=True
 )
 
-# train_sampler = DistributedSampler(
-#     train_dataset,
-#     num_replicas=world_size,
-#     rank=local_rank,
-#     shuffle=True
-# )
-
-# train_dataloader = DataLoader(
-#     train_dataset,
-#     sampler=train_sampler,
-#     batch_size=ds_config["train_micro_batch_size_per_gpu"],
-#     collate_fn=default_collate,
-#     drop_last=True
-# )
-
 # Pipeline block creation
 def to_pipeline_blocks(hf_model):
     blocks = []
@@ -518,17 +503,17 @@ if args.do_train:
             num_val_batches = len(val_dataset) // (
                 ds_config['train_micro_batch_size_per_gpu'] * ds_config['gradient_accumulation_steps']
             )
-
             total_loss = 0.0
 
             with torch.no_grad():
                 for _ in range(num_val_batches):
                     loss = deep_speed_model_engine.eval_batch(data_iter=val_iter)
                     if deep_speed_model_engine.is_last_stage():
+                        # LAST STAGE(GPU) HAS THE LOSSES
                         total_loss += loss.item()
 
-            if local_rank == 0:
-                avg_loss = total_loss / num_val_batches
-                print(f"Validation Loss: {avg_loss}")
+            if local_rank == (args.num_gpus - 1):
+                val_loss = total_loss / num_val_batches
+                print(f"Validation Loss: {val_loss}")
 dist.barrier()
 dist.destroy_process_group()
