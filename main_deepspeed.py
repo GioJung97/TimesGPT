@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import pathlib
+import socket
 import numpy as np
 import torch
 import torch.nn as nn
@@ -42,6 +43,44 @@ if not dist.is_initialized():
 
 local_rank = int(os.environ.get('LOCAL_RANK'))
 world_size = int(os.environ.get('WORLD_SIZE'))
+
+
+def check_environment():
+    """Check distributed environment variables and setup"""
+    
+    print("ENVIRONMENT VARIABLES CHECK")
+    print("="*60)
+    
+    # Check required environment variables
+    required_vars = [
+        'MASTER_ADDR', 'MASTER_PORT', 'WORLD_SIZE', 'RANK',
+        'LOCAL_RANK', 'CUDA_VISIBLE_DEVICES'
+    ]
+    
+    for var in required_vars:
+        value = os.environ.get(var, 'NOT SET')
+        status = "✓" if value != 'NOT SET' else "✗"
+        print(f"{status} {var}: {value}")
+    
+    # Network connectivity check
+    master_addr = os.environ.get('MASTER_ADDR')
+    master_port = os.environ.get('MASTER_PORT')
+    
+    if master_addr and master_port:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            result = sock.connect_ex((master_addr, int(master_port)))
+            sock.close()
+            
+            if result == 0:
+                print(f"✓ Network connectivity to {master_addr}:{master_port}: GOOD")
+            else:
+                print(f"✗ Network connectivity to {master_addr}:{master_port}: FAILED")
+        except Exception as e:
+            print(f"✗ Network check error: {e}")
+    
+    print("="*60)
 
 # Argument parser
 parser = argparse.ArgumentParser()
@@ -223,58 +262,10 @@ class NPZDataset(Dataset):
         assert label_tensor.shape[1] == 1024, f"Expected label_tensor second dim to be 1024, got {label_tensor.shape[1]}"
 
         return pixel_values, label_tensor
+        # returns a tuple of ((8,3,224,224), (1,1024))
+        # (1, 1024), (, 1024), (1024), or 1024
 
-# Custom dataset wrapper for DeepSpeed pipeline
-class DataLoaderAsDataset(Dataset):
-    def __init__(self, dataset, batch_size, sampler, collate_fn=None):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.sampler = sampler
-        self.collate_fn = collate_fn or default_collate
-        self.current_epoch = -1
-        self._flattened_items = []
-
-    def _create_batches(self):
-        """Recreate batches for the current epoch"""
-        self._flattened_items = []
-        sampler_iter = iter(self.sampler)
-        
-        while True:
-            batch_indices = []
-            try:
-                for _ in range(self.batch_size):
-                    batch_indices.append(next(sampler_iter))
-            except StopIteration:
-                if batch_indices:
-                    for idx in batch_indices:
-                        pixel_vals, labels = self.dataset[idx]
-                        pixel_vals = pixel_vals.unsqueeze(0)  # Add batch dimension
-                        self._flattened_items.append([pixel_vals, labels])
-                break
-            
-            for idx in batch_indices:
-                pixel_vals, labels = self.dataset[idx]
-                pixel_vals = pixel_vals.unsqueeze(0)  # Add batch dimension
-                self._flattened_items.append([pixel_vals, labels])
-
-    def set_epoch(self, epoch):
-        """Call this method at the beginning of each epoch"""
-        if epoch != self.current_epoch:
-            self.current_epoch = epoch
-            self.sampler.set_epoch(epoch)
-            self._create_batches()
-
-    def __len__(self):
-        if not self._flattened_items:
-            self._create_batches()
-        return len(self._flattened_items)
-
-    def __getitem__(self, idx):
-        if not self._flattened_items:
-            self._create_batches()
-        return self._flattened_items[idx]
-
-# Replace DataLoaderAsDataset with an index-only version
+# index-only dataloader
 class IndexOnlyDataset(Dataset):
     def __init__(self, dataset, sampler):
         self.dataset = dataset
@@ -307,7 +298,8 @@ class IndexOnlyDataset(Dataset):
         pixel_vals, labels = self.dataset[dataset_idx]
         pixel_vals = pixel_vals.unsqueeze(0)  # Add batch dimension
         
-        return [pixel_vals, labels]
+        # Return a tuple to ensure correct collate and pipeline input unpacking
+        return pixel_vals, labels
 
 def verify_weight_tying(model, local_rank=0):
     """Verify the current state of weight tying"""
@@ -452,17 +444,19 @@ def verify_dataloader_samples(dataset, tokenizer, num_samples=20, shuffle=False)
 # Create datasets and loaders
 train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
 train_sampler = DistributedSampler(train_dataset, shuffle=False, num_replicas=world_size, rank=local_rank)
-
-# my_train_loader = DataLoaderAsDataset(
-#     train_dataset, 
-#     batch_size=ds_config['pipeline'].get('micro_batch_size', args.train_batch_size), 
-#     sampler=train_sampler,
-#     collate_fn=default_collate  
-# )
-
 my_train_loader = IndexOnlyDataset(train_dataset, train_sampler)
 
-# Verify the dataloader samples produces the correct output
+# Create evaluation datasets
+val_dataset = NPZDataset(os.path.join(data_dir, 'val'), num_captions, subsample_size)
+val_sampler = DistributedSampler(val_dataset, shuffle=False, num_replicas=world_size, rank=local_rank)
+val_loader = IndexOnlyDataset(val_dataset, val_sampler)
+
+test_dataset = NPZDataset(os.path.join(data_dir, 'test'), num_captions, subsample_size)
+test_sampler = DistributedSampler(test_dataset, shuffle=False, num_replicas=world_size, rank=local_rank)
+test_loader = IndexOnlyDataset(test_dataset, test_sampler)
+
+
+# Temporarily disable dataloader verification (can hang across ranks)
 # samples = verify_dataloader_samples(my_train_loader, tokenizer, num_samples=25, shuffle=False)
 # print(samples)
 # Add this call after model creation
@@ -519,25 +513,22 @@ def to_pipeline_blocks(hf_model):
             self.block = block
 
         def forward(self, inputs):
-            pixel_values = inputs
-            
-            # DeepSpeed batches items: [batch_size, 1, num_frames, channels, height, width]
-            # Expected: [batch_size, num_frames, channels, height, width]
-            if pixel_values.dim() == 6:
-                pixel_values = pixel_values.squeeze(1)
-            
+            # Flatten single-element nesting and unpack dataset output
+            while isinstance(inputs, (tuple, list)) and len(inputs) == 1:
+                inputs = inputs[0]
+            # inputs now [pixel_values, labels]
+            pixel_values, labels = inputs
+
+            # Remove the dataset-added batch dim (1)
+            pixel_values = pixel_values.squeeze(1)
+
             activation = self.block(pixel_values)
             if isinstance(activation, tuple):
                 activation = activation[0]
             elif hasattr(activation, "last_hidden_state"):
                 activation = activation.last_hidden_state
-            
-            # Create dummy labels tensor for pipeline flow
-            batch_size = activation.size(0)
-            dummy_labels = torch.randint(0, 50256, (batch_size, 1024), 
-                                       device=activation.device, dtype=torch.long)
-            
-            return activation, dummy_labels
+
+            return activation, labels
 
     blocks.append(InputWrapper(hf_model.encoder.embeddings))
     
@@ -682,6 +673,54 @@ def compute_loss(outputs, labels=None):
         ignore_index=tokenizer.eos_token_id
     )
 
+hf_model = hf_model.half()
+
+def patch_all_broadcasts():
+    """Patch all problematic broadcast calls in pipeline evaluation"""
+    
+    from deepspeed.runtime.pipe.engine import PipelineEngine
+    
+    # Store original methods
+    original_bcast_pipe_scalar = PipelineEngine._bcast_pipe_scalar
+    original_reduce_outputs = PipelineEngine._reduce_outputs
+    
+    def _bcast_pipe_scalar_noop(self, data, src_rank=None, dtype=torch.float32):
+        """No-op version that just returns the data on last stage, zeros elsewhere"""
+        print(f"DEBUG _bcast_pipe_scalar_noop() rank={self.global_rank} stage={self.stage_id}")
+        
+        if self.is_last_stage():
+            result = data.clone().detach().type(dtype).to(self.device)
+            print(f"DEBUG last stage returning data: {result}")
+        else:
+            # Return appropriate zero tensor based on data shape
+            if hasattr(data, 'shape'):
+                result = torch.zeros_like(data, dtype=dtype, device=self.device)
+            else:
+                result = torch.tensor(0.0, dtype=dtype, device=self.device)
+            print(f"DEBUG non-last stage returning zeros: {result}")
+        
+        return result
+    
+    def _reduce_outputs_noop(self, outputs, reduce='avg', reduce_dp=True, micro_batches=None):
+        """No-op version that skips reduction during validation"""
+        print(f"DEBUG _reduce_outputs_noop() rank={self.global_rank} stage={self.stage_id}")
+        
+        if self.is_last_stage() and outputs is not None:
+            print(f"DEBUG last stage has outputs: {type(outputs)}")
+            return outputs
+        else:
+            print(f"DEBUG non-last stage returning None")
+            return None
+    
+    # Apply patches
+    PipelineEngine._bcast_pipe_scalar = _bcast_pipe_scalar_noop
+    PipelineEngine._reduce_outputs = _reduce_outputs_noop
+    
+    print("DEBUG: Applied broadcast and reduce patches")
+
+# Apply this comprehensive patch
+# patch_all_broadcasts()
+
 # Convert to pipeline if specified
 if args.pipeline_parallel:
     blocks = to_pipeline_blocks(hf_model)
@@ -700,6 +739,9 @@ optimizer = AdamW([p for p in hf_model.parameters() if p.requires_grad],
                   eps=1e-8,
                   weight_decay=5e-9)
 
+print("DEBUG: Optimizer initialized with parameters:")
+# Add rank prints around DeepSpeed initialization for debugging
+print(f"RANK {local_rank} ➜ before deepspeed.initialize()")
 # Initialize DeepSpeed
 deep_speed_model_engine, optimizer, train_dataloader, lr_scheduler = deepspeed.initialize(
     args=args,
@@ -708,8 +750,10 @@ deep_speed_model_engine, optimizer, train_dataloader, lr_scheduler = deepspeed.i
     model_parameters=[p for p in hf_model.parameters() if p.requires_grad],
     training_data=my_train_loader,
     config=ds_config_file,
-    dist_init_required=None,
+    dist_init_required=False,  # disable redundant distributed init
 )
+print(f"RANK {local_rank} ➜ after deepspeed.initialize()")
+print("DEBUG: DeepSpeed model engine initialized")
 
 # Resume from checkpoint if specified
 if args.resume_from_checkpoint is not None:
@@ -717,6 +761,7 @@ if args.resume_from_checkpoint is not None:
         os.path.join(training_artifacts, experiment_name), 
         tag=f"epoch_{args.resume_from_checkpoint}"
     )
+print("DEBUG: Resumed from checkpoint if specified")
 
 # Freeze parameters if specified
 if args.freeze_encoder_decoder:
@@ -728,30 +773,101 @@ if args.freeze_encoder_decoder:
             if "crossatt" in name or 'ln_cross_attn' in name or 'mlp' in name:
                 param.requires_grad = True
 
-# Training loop
-if args.do_train:
-    for epoch in range(num_epochs):
-        my_train_loader.set_epoch(epoch)
+print("DEBUG: Encoder/decoder parameters frozen except cross-attention and MLP layers")            
 
+# get one sample from dataloader
+# input_tensor, _ = next(iter(my_train_loader))
+# print model diagram
+# from torchviz import make_dot
+# output = deep_speed_model_engine.module(input_tensor) # Get an output tensor
+# dot = make_dot(output, params=dict(deep_speed_model_engine.module.named_parameters()))
+# dot.render("model_graph", view=True) # Save as PDF and open
+
+# from torch.fx import symbolic_trace
+# model = deep_speed_model_engine.module
+# traced = symbolic_trace(model)
+# print(traced.graph)  # should show all ops
+# sys.exit()
+
+# from torchview import draw_graph
+# graph = draw_graph(deep_speed_model_engine.module, input_data=(input_tensor,), expand_nested=True)
+# graph.visual_graph.render("model_graph", format="pdf", view=True)
+
+# sys.exit()
+
+
+# Training loop with validation after each epoch
+if args.do_train:
+    print(f"DEBUG: Starting training with {len(my_train_loader)} samples")
+
+    if local_rank == 0:
+        print(f"\n{'='*60}")
+        print(f"STARTING TRAINING: {experiment_name}")
+        print('='*60)
+
+    # Check distributed environment
+    check_environment()
+
+    for epoch in range(num_epochs):
+        
+        if local_rank == 0:
+            print(f"\n{'='*60}")
+            print(f"EPOCH {epoch+1}/{num_epochs}")
+            print('='*60)
+        
+        # Training phase
+        my_train_loader.set_epoch(epoch)
+        deep_speed_model_engine.train()
+        
         steps_per_epoch = len(train_dataset) // (
             args.train_batch_size * world_size * ds_config['gradient_accumulation_steps']
         )
-
-        deep_speed_model_engine.train()
         
+        if local_rank == 0:
+            print(f"DEBUG: Starting training with {steps_per_epoch} steps")
+        
+        dist.barrier()  # Ensure all ranks synchronize before saving
         for step in range(steps_per_epoch):
+            dist.barrier()  # Ensure all ranks synchronize before saving
             loss = deep_speed_model_engine.train_batch()
-            if deep_speed_model_engine.is_last_stage():
-                print(f"Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss.item():.4f}")
+            
+            if deep_speed_model_engine.is_last_stage() and local_rank == 0:
+                if step % 10 == 0:
+                    print(f"Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss.item():.4f}")
         
-        dist.barrier()
+        if local_rank == 0:
+            print(f"DEBUG: Completed training for epoch {epoch+1}")
         
         # Save checkpoint
         checkpoint_path = os.path.join(training_artifacts, experiment_name)
         if local_rank == 0:
             os.makedirs(checkpoint_path, exist_ok=True)
         
+        dist.barrier()  # Ensure all ranks synchronize before saving
         deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
 
-dist.barrier()
-dist.destroy_process_group()
+        if False and args.do_val:
+            if local_rank == 0:
+                print(f"\n{'='*60}")
+                print(f"VALIDATION AFTER EPOCH {epoch+1}")
+                print('='*60)
+
+            check_environment()
+
+            print("DEBUG: Running validation...")
+            deep_speed_model_engine.eval()
+
+            print("DEBUG: Calling eval_batch()...")
+            loss, logits = deep_speed_model_engine.eval_batch(data_iter=deepspeed.utils.RepeatingLoader(val_loader), 
+                                                      return_logits=True, 
+                                                      compute_loss=True, 
+                                                      reduce_output='avg', 
+                                                      bcast_loss=False, 
+                                                      num_micro_batches=None)
+            print("DEBUG: after eval_batch() loss:", loss)
+                    
+if local_rank == 0:
+    print("Training and evaluation completed!")
+
+# dist.barrier()
+# dist.destroy_process_group()
