@@ -89,19 +89,19 @@ class NPZDataset(Dataset):
         # returns a tuple of ((8,3,224,224), (1,1024))
 
 num_captions = 10
-subsample_size = 1.0
+subsample_size = 0.001
 world_size = 2
 local_rank = None
 train_data_dir = ""
 val_data_dir = ""
-num_epochs = 5
+num_epochs = 3
 data_dir = '/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames'
 train_data_dir = os.path.join(data_dir, 'train')
 val_data_dir = os.path.join(data_dir, 'val')
 test_data_dir = os.path.join(data_dir, 'test')
 batch_size = 4
 training_artifacts = '/data2/juve/training_artifacts/'
-experiment_name = f"placeholder_experiment_while_testing"
+experiment_name = f"placeholder"
 
 deepspeed.init_distributed()
 local_rank = dist.get_rank()
@@ -127,53 +127,6 @@ test_dataset = NPZDataset(test_data_dir, num_captions, subsample_size)
 test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
 test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=batch_size//world_size, collate_fn=default_collate, drop_last=True)
 
-# NPZDatset getitme returns:
-# (8,3,224,224), (1,1024)
-# If this were in a batch of things, can do it two ways:
-# [(8,3,224,224), (1,1024)]
-# bs=4
-# (4,8,3,224,244), (4,1024) <--- a batch should be returned like this
-
-# Dataloader returns ((8,3,224,224), (1,1024))
-# stage=0 layers=14
-#      0: InputWrapper input: [(4,8,3,224,224), (4,1024)] output: [(4,8,224,224), (4,1024)]
-#      1: BlockWrapper input: [(8,3,224,224), (1,1024)] output: 
-#      2: BlockWrapper
-#      3: BlockWrapper
-#      4: BlockWrapper
-#      5: BlockWrapper
-#      6: BlockWrapper
-#      7: BlockWrapper
-#      8: BlockWrapper
-#      9: BlockWrapper
-#     10: BlockWrapper
-#     11: BlockWrapper
-#     12: BlockWrapper
-#     13: Adapter 
-# stage=1 layers=14
-#     14: TokenEmbedWrapper
-#     15: DecBlockWrapper
-#     16: DecBlockWrapper
-#     17: DecBlockWrapper
-#     18: DecBlockWrapper
-#     19: DecBlockWrapper
-#     20: DecBlockWrapper
-#     21: DecBlockWrapper
-#     22: DecBlockWrapper
-#     23: DecBlockWrapper
-#     24: DecBlockWrapper
-#     25: DecBlockWrapper
-#     26: DecBlockWrapper
-#     27: FinalWrapper   
-
-# TODO: Define the following:
-# InputWrapper, EncBlockWrapper, AdapterWrapper, DecTokenEmbedWrapper, DecBlockWrapper, FinalWrapper
-#
-# Pass labels all the way through the pipeline or not?
-# Yes! Having the labels allows more flexibility, and does not use up large amounts of exatra memory.
-
-# ASSUME BATCH SIZE IS 4 for examples in comments below
-
 # Input wrapper - handles encoder embeddings - is batch aware!
 class InputWrapper(nn.Module):
     def __init__(self, block):
@@ -181,15 +134,9 @@ class InputWrapper(nn.Module):
         self.block = block
 
     def forward(self, inputs):
-        # print("DEBUG InputWrapper type(inputs):", type(inputs))
-        # print("DEBUG InputWrapper len(inputs):", len(inputs))
-        # # print("DEBUG inputs.shape:", inputs.shape)
-        # print("DEBUG InputWrapper inputs[0].shape, inputs[1].shape:", inputs[0].shape, inputs[1].shape)
-
-        pixel_values, labels = inputs # [ pixel_values, labels ]
+        pixel_values, labels = inputs 
         hidden = self.block(pixel_values)
-        return hidden, labels
-        # outputs: (4, 768), (4, 1024)
+        return hidden, labels 
 
 class EncBlockWrapper(nn.Module):
     def __init__(self, block):
@@ -198,34 +145,13 @@ class EncBlockWrapper(nn.Module):
 
     def forward(self, inputs):
         hidden, labels = inputs
-        # print("DEBUG EncBlockWrapper type(inputs):", type(inputs))
-        # print("DEBUG EncBlockWrapper len(inputs):", len(inputs))
-        # print("DEBUG EncBlockWrapper inputs[0].shape, inputs[1].shape:", inputs[0].shape, inputs[1].shape)
-
-        hidden = self.block(hidden) # this returns a onepul (tuple of one) 
-
-        # print("DEBUG EncBlockWrapper type(hidden[0]), type(labels):", type(hidden[0]), type(labels))
-        # print("DEBUG EncBlockWrapper len(hidden):", len(hidden[0])) # ((),)
-        # print("DEBUG EncBlockWrapper hidden[0].shape:", hidden[0].shape)
-        
+        hidden = self.block(hidden)
         return hidden[0], labels
-        # outputs: (4, 768), (4, 1024)
-
-##########################################################
-##########################################################
-##########################################################
-##########################################################
-##########################################################
 
 # Adapter between encoder and decoder
 class Adapter(nn.Module):
     def forward(self, inputs):
-        # hidden, labels = inputs[0], inputs[1]
         hidden, labels = inputs
-        # print("DEBUG Adapter type(inputs):", type(inputs))
-        # print("DEBUG Adapter len(inputs):", len(inputs))
-        # print("DEBUG Adapter inputs[0].shape, inputs[1].shape:", inputs[0].shape, inputs[1].shape)
-
         return hidden, labels
 
 # Token embedding wrapper
@@ -238,23 +164,13 @@ class DecTokenEmbedWrapper(nn.Module):
         self.vocab_size = wte.num_embeddings
 
     def forward(self, inputs):
-        # hidden, labels = inputs[0], inputs[1]
         hidden, labels = inputs
         batch_size = hidden.shape[0]
         seq_len = labels.shape[-1]
-        
-        # print("DEBUG DecTokenEmbedWrapper type(inputs):", type(inputs))
-        # print("DEBUG DecTokenEmbedWrapper len(inputs):", len(inputs))
-        # print("DEBUG DecTokenEmbedWrapper inputs[0].shape, inputs[1].shape:", inputs[0].shape, inputs[1].shape)
-        # Create embeddings
         pos_ids = torch.arange(seq_len, device=labels.device).unsqueeze(0).expand(batch_size, -1)
         token_embeddings = self.wte(labels)
         pos_embeddings = self.wpe(pos_ids)
         emb = self.drop(token_embeddings + pos_embeddings)
-        # print("DEBUG DecTokenEmbedkWrapper type(hidden), type(labels):", type(hidden), type(labels))
-        # print("DEBUG DecTokenEmbedWrapper len(hidden):", len(hidden)) # ((),)
-        # print("DEBUG DecTokenEmbedWrapper hidden.shape:", hidden.shape)
-        
         return hidden, emb, labels
 
 class DecBlockWrapper(nn.Module):
@@ -263,16 +179,8 @@ class DecBlockWrapper(nn.Module):
         self.block = block
         
     def forward(self, inputs):
-        # hidden_in, token_emb, labels = inputs[0], inputs[1], inputs[2]
         hidden_in, token_emb, labels = inputs
-        # print("DEBUG DecBlockWrapper type(hidden_in), type(labels):", type(hidden_in), type(labels))
-        # print("DEBUG DecBlockWrapper len(hidden_in):", len(hidden_in)) # ((),)
-        # print("DEBUG DecBlockWrapper hidden_in.shape:", hidden_in.shape)
         hidden_out = self.block(token_emb, encoder_hidden_states=hidden_in, use_cache=False,)
-        # print("DEBUG DecBlockWrapper type(hidden_out), type(labels):", type(hidden_out), type(labels))
-        # print("DEBUG DecBlockWrapper len(hidden_out):", len(hidden_out)) # ((),)
-        # print("DEBUG DecBlockWrapper type(hidden_out[0]):", type(hidden_out[0]))
-        # print("DEBUG DecBlockWrapper hidden_out[0].shape:", hidden_out[0].shape)
         return hidden_in, hidden_out[0], labels
 
 # Final output layer
@@ -287,27 +195,6 @@ class FinalWrapper(nn.Module):
         _, hidden, labels = inputs[0], inputs[1], inputs[2]
         hidden = self.ln(hidden)
         logits = self.head(hidden)
-        
-        # Compute loss internally
-        # loss = F.cross_entropy(
-        #     logits.view(-1, logits.size(-1)),
-        #     labels.view(-1),
-        #     ignore_index=self.eos_token_id
-        # )
-        # print("DEBUG FinalWrapper type(logits), type(labels):", type(logits), type(labels))
-        # print("DEBUG FinalWrapper len(logits):", len(logits)) # ((),)
-        # print("DEBUG FinalWrapper logits.shape:", logits.shape)
-
-        # print("DEBUG FinalWrapper type(hidden), type(labels):", type(hidden), type(labels))
-        # print("DEBUG FinalWrapper len(hidden):", len(hidden)) # ((),)
-        # print("DEBUG FinalWrapper hidden.shape:", hidden.shape)
-        # if local_rank == world_size - 1:
-        #     # Only the last stage will return the loss
-        #     print("DEBUG FinalWrapper loss:", loss.item())
-        # Return the loss for the last stage
-
-        
-
         return logits, labels
 
 # Pipeline block creation
@@ -333,14 +220,13 @@ def to_pipeline_blocks(hf_model):
         blocks.append(DecBlockWrapper(dec_block))
    
     blocks.append(FinalWrapper( hf_model.decoder.transformer.ln_f, hf_model.decoder.lm_head, tokenizer.eos_token_id))
-
     return blocks
 
 # Convert to pipeline if specified
 blocks = to_pipeline_blocks(hf_model)
 
+# Load DeepSpeed configuration
 ds_config = json.load(open("./ds_config_pp.json", "r"))
-
 
 def compute_loss(outputs, labels=None):
     if isinstance(outputs, tuple):
@@ -380,15 +266,6 @@ deep_speed_model_engine, optimizer, train_dataloader, scheduler  = deepspeed.ini
     dist_init_required=False,
 )
 
-
-# sanity check dataloader
-# instance = next(iter(train_dataloader))
-# print("DEBUG type(instance):", type(instance))
-# print("DEBUG len(instance):", len(instance))
-# print("DEBUG instance[0].shape, instance[1].shape:", instance[0].shape, instance[1].shape)
-# import sys
-# sys.exit()
-
 # Train
 for epoch in range(num_epochs):
     steps_per_epoch = len(train_dataset) // (
@@ -401,20 +278,17 @@ for epoch in range(num_epochs):
         total_train_loss = 0.0 
 
     for step in range(steps_per_epoch):
-
-        # loss = deep_speed_model_engine.train_batch(data_iter=iter(RepeatingLoader(train_dataloader)))
         loss = deep_speed_model_engine.train_batch()
+
         if local_rank == (world_size - 1):
             wandb.log({"Train/Batch Loss": loss.item()})
             total_train_loss += loss.item()
 
-        # loss = loss.cpu().detach().item() if isinstance(loss, torch.Tensor) else loss
-        # print("DEBUG loss:", loss)
-
-        if deep_speed_model_engine.is_last_stage():
-            print(f"Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss:.4f}")
+        if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
+            print(f"Train Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss:.4f}")
     
     if local_rank == (world_size - 1):
+        print("Train/Average Loss:", (total_train_loss/steps_per_epoch))
         wandb.log({"Train/Average Loss": (total_train_loss/steps_per_epoch) })
 
     dist.barrier()
@@ -431,16 +305,19 @@ for epoch in range(num_epochs):
     num_val_batches = len(val_dataset) // (
         ds_config['train_micro_batch_size_per_gpu'] * ds_config['gradient_accumulation_steps']
     )
-    print("DEBUG num_val_batches:", num_val_batches)
 
     total_val_loss = 0.0
-    for _ in range(num_val_batches):
+    for step in range(num_val_batches):
         loss = deep_speed_model_engine.eval_batch(data_iter=val_iter)
+
         if deep_speed_model_engine.is_last_stage():
             # LAST STAGE(GPU) HAS THE LOSSES
             total_val_loss += loss.item()
-            print("Batch Val loss:", loss.item())
+            # print("DEBUG Batch Val loss:", loss.item())
             # wandb.log({"Val/Batch Loss": loss.item()})
+
+        if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
+            print(f"Val Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss:.4f}")
 
     if local_rank == (world_size - 1):
         val_loss = total_val_loss / num_val_batches
@@ -452,13 +329,12 @@ for epoch in range(num_epochs):
 # Test set evaluation
 
 deep_speed_model_engine.eval()
-
 test_iter = iter(RepeatingLoader(test_dataloader))
 num_test_batches = len(test_dataset) // ( ds_config['train_micro_batch_size_per_gpu'] * ds_config['gradient_accumulation_steps'])
 print("DEBUG num_test_batches:", num_test_batches)
 
 total_test_loss = 0.0
-for _ in range(num_test_batches):
+for step in range(num_test_batches):
     loss, logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True)
     if deep_speed_model_engine.is_last_stage():
         # LAST STAGE(GPU) HAS THE LOSSES
@@ -466,10 +342,14 @@ for _ in range(num_test_batches):
         # print("DEBUG Batch Test loss:", loss)
         # wandb.log({"Test/Batch Loss": loss.item()})
 
+    if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
+            print(f"Test Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss:.4f}")
+
 if local_rank == (world_size - 1):
     test_loss = total_test_loss / num_test_batches
     print(f"Average Test Loss: {test_loss}")
     wandb.log({"Test/Average Loss:": test_loss})
+
 
 if local_rank == (world_size - 1):
     wandb.finish()
