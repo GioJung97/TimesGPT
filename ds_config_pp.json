@@ -1,59 +1,38 @@
 {
-  "autotuning": {
-    "enabled": false,
-    "mode": "run",
-    "trial_duration": 4,
-    "trial_interval": 2
-  },
-  "distributed_training": {
-    "world_size": 3
-  },
-  "gradient_accumulation_steps": 3,
-  "train_micro_batch_size_per_gpu": 4,
-  "train_batch_size": 12,
+  "train_micro_batch_size_per_gpu": 2,
+  "gradient_accumulation_steps": 1,
   "steps_per_print": 50,
-  "pipeline": {
-    "enabled": true,
-    "partition": "type:transformer",
-    "seed_layers": true,
-    "activation_checkpoint_interval": 1,
-    "activation_checkpoint_func": "deepspeed.checkpointing.checkpoint",
-    "micro_batch_size": 4,
-    "pipeline_parallel_size": 3
+  "zero_optimization": {
+    "stage": 1
   },
   "optimizer": {
     "type": "AdamW",
     "params": {
-      "lr": 0.0000005,
-      "betas": [
-        0.8,
-        0.999
-      ],
+      "lr": 5e-7,
+      "betas": [0.8, 0.999],
       "eps": 1e-8,
       "weight_decay": 5e-9
     }
   },
   "fp16": {
     "enabled": true,
-    "auto_cast": false,
-    "type": "torch"
+    "auto_cast": false
   },
-  "zero_optimization": {
-    "stage": 1
-  },
-  "gradient_clipping": 1.0,
-  "prescale_gradients": false,
-  "wall_clock_breakdown": false,
-  "wandb": {
-    "enabled": true,
-    "group": "sfsuml",
-    "team": "sfsuml",
-    "project": "nairr"
+  "pipeline_parallel_size": 2,
+  "pipeline": {
+    "partition_method": "uniform",
+    "seed_layers": true,
+    "activation_checkpoint_interval": 1,
+    "activation_checkpoint_func": "deepspeed.checkpointing.checkpoint"
   },
   "comms_logger": {
     "enabled": false,
-    "verbose": false,
-    "prof_all": false,
-    "debug": false
+    "verbose": false 
+  },
+  "wandb": {
+    "enabled": false,
+    "group": "sfsuml",
+    "team": "sfsuml",
+    "project": "nairr"
   }
 }

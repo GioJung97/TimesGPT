@@ -89,19 +89,30 @@ class NPZDataset(Dataset):
         # returns a tuple of ((8,3,224,224), (1,1024))
 
 num_captions = 10
-subsample_size = 0.001
+subsample_size = 1.0
 world_size = 2
-local_rank = 0
+local_rank = None
 train_data_dir = ""
 val_data_dir = ""
 num_epochs = 5
 data_dir = '/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames'
 train_data_dir = os.path.join(data_dir, 'train')
 val_data_dir = os.path.join(data_dir, 'val')
+test_data_dir = os.path.join(data_dir, 'test')
 batch_size = 4
+training_artifacts = '/data2/juve/training_artifacts/'
+experiment_name = f"placeholder_experiment_while_testing"
 
 deepspeed.init_distributed()
 local_rank = dist.get_rank()
+
+if local_rank == (world_size - 1):
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="nairr",
+        group="sfsuml",
+        name=experiment_name
+    )
 
 # Create datasets and loaders
 train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
@@ -112,13 +123,16 @@ val_dataset = NPZDataset(val_data_dir, num_captions, subsample_size)
 val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
 val_dataloader = DataLoader(val_dataset, sampler=val_sampler, batch_size=batch_size//world_size, collate_fn=default_collate, drop_last=True)
 
+test_dataset = NPZDataset(test_data_dir, num_captions, subsample_size)
+test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
+test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=batch_size//world_size, collate_fn=default_collate, drop_last=True)
+
 # NPZDatset getitme returns:
 # (8,3,224,224), (1,1024)
 # If this were in a batch of things, can do it two ways:
 # [(8,3,224,224), (1,1024)]
 # bs=4
 # (4,8,3,224,244), (4,1024) <--- a batch should be returned like this
-
 
 # Dataloader returns ((8,3,224,224), (1,1024))
 # stage=0 layers=14
@@ -375,6 +389,7 @@ deep_speed_model_engine, optimizer, train_dataloader, scheduler  = deepspeed.ini
 # import sys
 # sys.exit()
 
+# Train
 for epoch in range(num_epochs):
     steps_per_epoch = len(train_dataset) // (
         batch_size * world_size * ds_config['gradient_accumulation_steps']
@@ -382,9 +397,16 @@ for epoch in range(num_epochs):
 
     deep_speed_model_engine.train()
     
+    if local_rank == (world_size - 1):
+        total_train_loss = 0.0 
+
     for step in range(steps_per_epoch):
+
         # loss = deep_speed_model_engine.train_batch(data_iter=iter(RepeatingLoader(train_dataloader)))
         loss = deep_speed_model_engine.train_batch()
+        if local_rank == (world_size - 1):
+            wandb.log({"Train/Batch Loss": loss.item()})
+            total_train_loss += loss.item()
 
         # loss = loss.cpu().detach().item() if isinstance(loss, torch.Tensor) else loss
         # print("DEBUG loss:", loss)
@@ -392,14 +414,18 @@ for epoch in range(num_epochs):
         if deep_speed_model_engine.is_last_stage():
             print(f"Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss:.4f}")
     
+    if local_rank == (world_size - 1):
+        wandb.log({"Train/Average Loss": (total_train_loss/steps_per_epoch) })
+
     dist.barrier()
     
     # Save checkpoint
-    # checkpoint_path = os.path.join(training_artifacts, experiment_name)
-    # if local_rank == 0:
-    #     os.makedirs(checkpoint_path, exist_ok=True)
-    # deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
+    checkpoint_path = os.path.join(training_artifacts, experiment_name)
+    if local_rank == 0:
+        os.makedirs(checkpoint_path, exist_ok=True)
+    deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
 
+    # Validation every epoch
     deep_speed_model_engine.eval()
     val_iter = iter(RepeatingLoader(val_dataloader))
     num_val_batches = len(val_dataset) // (
@@ -407,15 +433,43 @@ for epoch in range(num_epochs):
     )
     print("DEBUG num_val_batches:", num_val_batches)
 
-    total_loss = 0.0
+    total_val_loss = 0.0
     for _ in range(num_val_batches):
         loss = deep_speed_model_engine.eval_batch(data_iter=val_iter)
         if deep_speed_model_engine.is_last_stage():
             # LAST STAGE(GPU) HAS THE LOSSES
-            total_loss += loss.item()
+            total_val_loss += loss.item()
+            print("Batch Val loss:", loss.item())
+            # wandb.log({"Val/Batch Loss": loss.item()})
 
     if local_rank == (world_size - 1):
-        val_loss = total_loss / num_val_batches
-        print(f"Validation Loss: {val_loss}")
+        val_loss = total_val_loss / num_val_batches
+        print(f"Average Val Loss: {val_loss}")
+        wandb.log({"Val/Average Loss": val_loss})
 
+# Destroy model engine and free resources
+# then re-init deepspeed, and run train_batch()
+# Test set evaluation
 
+deep_speed_model_engine.eval()
+
+test_iter = iter(RepeatingLoader(test_dataloader))
+num_test_batches = len(test_dataset) // ( ds_config['train_micro_batch_size_per_gpu'] * ds_config['gradient_accumulation_steps'])
+print("DEBUG num_test_batches:", num_test_batches)
+
+total_test_loss = 0.0
+for _ in range(num_test_batches):
+    loss, logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True)
+    if deep_speed_model_engine.is_last_stage():
+        # LAST STAGE(GPU) HAS THE LOSSES
+        total_test_loss += loss.item()
+        # print("DEBUG Batch Test loss:", loss)
+        # wandb.log({"Test/Batch Loss": loss.item()})
+
+if local_rank == (world_size - 1):
+    test_loss = total_test_loss / num_test_batches
+    print(f"Average Test Loss: {test_loss}")
+    wandb.log({"Test/Average Loss:": test_loss})
+
+if local_rank == (world_size - 1):
+    wandb.finish()
