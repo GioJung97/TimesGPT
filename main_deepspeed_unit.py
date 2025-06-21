@@ -41,6 +41,7 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from torch.optim import AdamW
 from deepspeed.pipe import PipelineModule
 from deepspeed.utils import RepeatingLoader
+from torchinfo import summary
 
 # Load pretrained components
 pre_trained_video_encoder = "facebook/timesformer-base-finetuned-k600"
@@ -50,6 +51,12 @@ tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
 config_encoder = TimesformerConfig.from_pretrained(pre_trained_video_encoder)
 config_decoder = GPT2Config.from_pretrained(pre_trained_text_decoder)
+
+# factors of 768 - 3 6 12 24 48 96 192 384
+config_encoder.num_hidden_layers = 3
+config_encoder.num_attention_heads = 3
+config_decoder.n_layer = 3
+config_decoder.n_head = 3
 
 # Create combined config and model
 combined_config = VisionEncoderDecoderConfig.from_encoder_decoder_configs(
@@ -84,22 +91,30 @@ class NPZDataset(Dataset):
         pixel_values = torch.from_numpy(data['arr_0']).to(dtype=torch.float16)
         label_tensor = torch.from_numpy(data['arr_1'][labels_offset]).to(dtype=torch.long)
 
+        # TODO: Discover why we need a nested tuple with two sets of label_tensor
+        # It appears that deepspeed engine is stripping off labels when passing samples
+        # to our PipelineModule. But our model needs labels in the middle to calculate 
+        # TokenEmbeddings for GPT2 -- using the nested tuple makes the labels available 
+        # to our PiplineModule inputs and so we can pass them from layer to layer until
+        # the DecTokenEmbedWrapper later. After that, it appears we don't need to preserve
+        # labels anymore because the PipelineModule will take care of that interally
+        # with its daata loader while calculating loss with the lsos_fn that was provided.
         return ((pixel_values, label_tensor), label_tensor)
         # return pixel_values, label_tensor
         # returns a tuple of ((8,3,224,224), (1,1024))
 
 num_captions = 10
 subsample_size = 0.001
-world_size = 2
+world_size = 3
 local_rank = None
 train_data_dir = ""
 val_data_dir = ""
-num_epochs = 3
+num_epochs = 5
 data_dir = '/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames'
 train_data_dir = os.path.join(data_dir, 'train')
 val_data_dir = os.path.join(data_dir, 'val')
 test_data_dir = os.path.join(data_dir, 'test')
-batch_size = 4
+batch_size = 12
 training_artifacts = '/data2/juve/training_artifacts/'
 experiment_name = f"placeholder"
 
@@ -108,7 +123,6 @@ local_rank = dist.get_rank()
 
 if local_rank == (world_size - 1):
     wandb.init(
-        # set the wandb project where this run will be logged
         project="nairr",
         group="sfsuml",
         name=experiment_name
@@ -195,7 +209,8 @@ class FinalWrapper(nn.Module):
         _, hidden, labels = inputs[0], inputs[1], inputs[2]
         hidden = self.ln(hidden)
         logits = self.head(hidden)
-        return logits, labels
+
+        return logits
 
 # Pipeline block creation
 def to_pipeline_blocks(hf_model):
@@ -207,7 +222,7 @@ def to_pipeline_blocks(hf_model):
         blocks.append(EncBlockWrapper(enc_block))
    
     # Maybe not needed
-    blocks.append(Adapter())
+    # blocks.append(Adapter())
 
     blocks.append(DecTokenEmbedWrapper(
         hf_model.decoder.transformer.wte,
@@ -229,11 +244,8 @@ blocks = to_pipeline_blocks(hf_model)
 ds_config = json.load(open("./ds_config_pp.json", "r"))
 
 def compute_loss(outputs, labels=None):
-    if isinstance(outputs, tuple):
-        logits, labels = outputs
-    else:
-        logits = outputs
-        labels = labels
+    logits = outputs
+    labels = labels
     
     return F.cross_entropy(
         logits.view(-1, logits.size(-1)),
@@ -266,6 +278,11 @@ deep_speed_model_engine, optimizer, train_dataloader, scheduler  = deepspeed.ini
     dist_init_required=False,
 )
 
+# Print model summary
+# summary(deep_speed_model_engine.module, input_size=[(1, 8, 3, 224, 224), (1, 1024)], dtypes=[torch.float, torch.long], col_names=["input_size", "output_size", "num_params", "trainable"], depth=4)
+# import sys
+# sys.exit()
+
 # Train
 for epoch in range(num_epochs):
     steps_per_epoch = len(train_dataset) // (
@@ -281,19 +298,19 @@ for epoch in range(num_epochs):
         loss = deep_speed_model_engine.train_batch()
 
         if local_rank == (world_size - 1):
-            wandb.log({"Train/Batch Loss": loss.item()})
+            wandb.log({"Exp/Train Batch Loss️": loss.item()})
             total_train_loss += loss.item()
 
         if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
-            print(f"Train Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss:.4f}")
+            print(f"Train Batch Loss Step {step+1}/{steps_per_epoch}, Loss: {loss.item():.4f}" )
     
     if local_rank == (world_size - 1):
-        print("Train/Average Loss:", (total_train_loss/steps_per_epoch))
-        wandb.log({"Train/Average Loss": (total_train_loss/steps_per_epoch) })
+        print(f"Train Average Epoch {epoch} Loss: {(total_train_loss/steps_per_epoch)}")
+        wandb.log({f"Exp/Train Average Loss": (total_train_loss/steps_per_epoch) })
 
     dist.barrier()
     
-    # Save checkpoint
+    # Save checkpoint every epoch
     checkpoint_path = os.path.join(training_artifacts, experiment_name)
     if local_rank == 0:
         os.makedirs(checkpoint_path, exist_ok=True)
@@ -311,45 +328,35 @@ for epoch in range(num_epochs):
         loss = deep_speed_model_engine.eval_batch(data_iter=val_iter)
 
         if deep_speed_model_engine.is_last_stage():
-            # LAST STAGE(GPU) HAS THE LOSSES
             total_val_loss += loss.item()
-            # print("DEBUG Batch Val loss:", loss.item())
-            # wandb.log({"Val/Batch Loss": loss.item()})
 
         if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
-            print(f"Val Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss:.4f}")
+            print(f"Val Batch Loss Step {step+1}/{num_val_batches}, Loss: {loss.item():.4f}" )
+            wandb.log({"Exp/Val Batch Loss": loss.item()})
 
     if local_rank == (world_size - 1):
         val_loss = total_val_loss / num_val_batches
-        print(f"Average Val Loss: {val_loss}")
-        wandb.log({"Val/Average Loss": val_loss})
-
-# Destroy model engine and free resources
-# then re-init deepspeed, and run train_batch()
-# Test set evaluation
+        print(f"Val Average Epoch {epoch} Loss: {val_loss}")
+        wandb.log({"Exp/Val Average Loss": val_loss})
 
 deep_speed_model_engine.eval()
 test_iter = iter(RepeatingLoader(test_dataloader))
 num_test_batches = len(test_dataset) // ( ds_config['train_micro_batch_size_per_gpu'] * ds_config['gradient_accumulation_steps'])
-print("DEBUG num_test_batches:", num_test_batches)
 
 total_test_loss = 0.0
 for step in range(num_test_batches):
-    loss, logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True)
     if deep_speed_model_engine.is_last_stage():
-        # LAST STAGE(GPU) HAS THE LOSSES
+        loss, logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True)
         total_test_loss += loss.item()
-        # print("DEBUG Batch Test loss:", loss)
-        # wandb.log({"Test/Batch Loss": loss.item()})
+    else:
+        loss = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=False)
 
     if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
-            print(f"Test Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss:.4f}")
-
+        print(f"Test Batch Loss Step {step+1}/{num_test_batches}, Loss: {loss.item():.4f}" )
+        wandb.log({"Exp/Test Batch Loss": loss.item()})
+  
 if local_rank == (world_size - 1):
     test_loss = total_test_loss / num_test_batches
-    print(f"Average Test Loss: {test_loss}")
-    wandb.log({"Test/Average Loss:": test_loss})
-
-
-if local_rank == (world_size - 1):
+    print(f"Test Average Epoch {epoch} Loss: {test_loss}")
+    wandb.log({"Exp/Test Average Loss": test_loss})
     wandb.finish()
