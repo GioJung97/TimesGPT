@@ -258,7 +258,6 @@ hf_model = PipelineModule(
     loss_fn=compute_loss,
     num_stages=world_size,
     partition_method='uniform',
-    activation_checkpoint_interval=ds_config['pipeline']['activation_checkpoint_interval'],
 )
 
 # Initialize optimizer

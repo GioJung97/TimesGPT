@@ -28,146 +28,126 @@ import deepspeed
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from torch.optim import AdamW
 from deepspeed.pipe import PipelineModule
+
+import main_deepspeed_utils as dsutils
         
 # Initialize distributed environment
-if 'LOCAL_RANK' in os.environ:
-    local_rank = int(os.environ['LOCAL_RANK'])
-else:
-    local_rank = 0
-
-torch.cuda.set_device(local_rank)
-device = torch.device("cuda", local_rank)
-
 if not dist.is_initialized():
     deepspeed.init_distributed()
 
-local_rank = int(os.environ.get('LOCAL_RANK'))
-world_size = int(os.environ.get('WORLD_SIZE'))
-
-
-def check_environment():
-    """Check distributed environment variables and setup"""
-    
-    print("ENVIRONMENT VARIABLES CHECK")
-    print("="*60)
-    
-    # Check required environment variables
-    required_vars = [
-        'MASTER_ADDR', 'MASTER_PORT', 'WORLD_SIZE', 'RANK',
-        'LOCAL_RANK', 'CUDA_VISIBLE_DEVICES'
-    ]
-    
-    for var in required_vars:
-        value = os.environ.get(var, 'NOT SET')
-        status = "✓" if value != 'NOT SET' else "✗"
-        print(f"{status} {var}: {value}")
-    
-    # Network connectivity check
-    master_addr = os.environ.get('MASTER_ADDR')
-    master_port = os.environ.get('MASTER_PORT')
-    
-    if master_addr and master_port:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            result = sock.connect_ex((master_addr, int(master_port)))
-            sock.close()
-            
-            if result == 0:
-                print(f"✓ Network connectivity to {master_addr}:{master_port}: GOOD")
-            else:
-                print(f"✗ Network connectivity to {master_addr}:{master_port}: FAILED")
-        except Exception as e:
-            print(f"✗ Network check error: {e}")
-    
-    print("="*60)
+# local_rank = dist.get_rank()
+# world_size = dist.get_world_size()
+device = torch.device("cuda", dist.get_rank())
 
 # Argument parser
 parser = argparse.ArgumentParser()
-parser.add_argument('-ep', '--epochs', type=int, default=4, help="Number of epochs (default: 4)")
+parser.add_argument('-ep', '--num_epochs', type=int, default=4, help="Number of epochs (default: 4)")
 parser.add_argument('-lr', '--learning_rate', type=float, default=0.0000005, help="Learning rate (default: 0.0000005)")
-parser.add_argument('-dc', '--decay', type=float, default=0.000000005, help="Learning rate decay (default: 0.000000005)")
+parser.add_argument('-dc', '--learning_rate_decay', type=float, default=0.000000005, help="Learning rate decay (default: 0.000000005)")
 parser.add_argument('-bs', '--train_batch_size', type=int, default=1, help="Batch size (default: 1)")
 parser.add_argument('-pf', '--pretrained_model', default=None, type=str, help="Pretrained model path")
 parser.add_argument('-fw', '--fresh_weights', action="store_true", help="Start from HF base models")
 parser.add_argument('-re', '--resume_from_checkpoint', default=None, type=int, help="Checkpoint epoch to resume from")
-parser.add_argument('-en', '--experiment_name', type=str, default='unnamed_experiment', help="Experiment name")
-parser.add_argument('-nhle', '--num_hidden_layers_encoder', type=int, default=12, help="Encoder layers (default: 12)")
-parser.add_argument('-nahe', '--num_attention_heads_encoder', type=int, default=12, help="Encoder attention heads (default: 12)")
-parser.add_argument('-nld', '--num_layers_decoder', type=int, default=12, help="Decoder layers (default: 12)")
-parser.add_argument('-nhd', '--num_heads_decoder', type=int, default=12, help="Decoder attention heads (default: 12)")
-parser.add_argument('--attention_type_encoder', type=str, choices=['divided_space_time', 'space_only', 'joint_space_time'], 
-                    default='divided_space_time', help="Encoder attention type")
+parser.add_argument('-en', '--experiment_name_prefix', type=str, default=None, help="Experiment name prefix to prepend to experiement name")
+parser.add_argument('-ec', '--pretrained_encoder', type=str, default=None, help="Pretrained encoder model")
+parser.add_argument('-de', '--pretrained_decoder', type=str, default=None, help="Pretrained decoder model")
+parser.add_argument('-ip', '--image_preprocessor', type=str, default=None, help="Image preprocessor model")
+parser.add_argument('-to', '--tokenizer', type=str, default=None, help="Tokenizer model")
+parser.add_argument('-hl', '--num_hidden_layers', type=int, default=12, help="Encoder layers (default: 12)")
 parser.add_argument('--hidden_size_encoder', type=int, default=768, help="Encoder hidden size (default: 768)")
+parser.add_argument('--attention_type_encoder', type=str, choices=['divided_space_time', 'space_only', 'joint_space_time'], default='divided_space_time', help="Encoder attention type")
 parser.add_argument('--image_size_encoder', type=int, default=224, help="Image size (default: 224)")
 parser.add_argument('--intermediate_size_encoder', type=int, default=3072, help="Encoder intermediate size (default: 3072)")
 parser.add_argument('--num_frames_encoder', type=int, default=8, help="Number of frames (default: 8)")
 parser.add_argument('--patch_size_encoder', type=int, default=16, help="Patch size (default: 16)")
 parser.add_argument('-frz', '--freeze_encoder_decoder', action='store_true', help="Freeze encoder/decoder except cross-attention")
 parser.add_argument('-ss', '--subsample_size', default=1.0, type=float, help="Data subsample percentage (default: 1.0)")
-parser.add_argument('--num_captions', type=int, default=2, help="Number of captions to use")
+parser.add_argument('--num_captions', type=int, default=10, help="Number of captions to use per video (default: 10)")
 parser.add_argument('--num_gpus', type=int, default=2, help="Number of GPUs")
-parser.add_argument('--local_rank', type=int, default=0, help="Local rank")
-parser.add_argument('--world_size', type=int, default=0, help="World size")
+parser.add_argument('--num_beams', type=int, default=5, help="Number of Beams (default: 5)")
+parser.add_argument('--no_repeat_ngram_size', type=int, default=3, help="No repease ngram size. (default: 3)")
+parser.add_argument('--max_caption_length', type=int, default=500, help="Max size caption to generate. (default: 500)")
+parser.add_argument('--min_caption_length', type=int, default=10, help="Min size caption to generate. (default: 10)")
+parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help="Gradient accumulation steps. (default: 1)")
+parser.add_argument('--steps_per_print', type=int, default=50, help="How often to print loss output to console and wandb. (default: 50)")
+parser.add_argument('--zero_stage', type=int, default=1, help="ZeRO stage to use (0 disables, 1, 2 or 3). (default: 1)")
 parser.add_argument('--pipeline_parallel', action='store_true', help="Use pipeline parallelism")
 parser.add_argument('--do_train', action="store_true", help="Run training phase")
 parser.add_argument('--do_val', action="store_true", help="Run validation phase")
 parser.add_argument('--do_test', action="store_true", help="Run test phase")
+parser.add_argument('--flash_attention', action="store_true", help="Enable flash attention in decoder")
+parser.add_argument('--fused_attention', action="store_true", help="Enable fused attention in decoder")
 parser.add_argument('--disable_tied_weights', action='store_true', help="Disable weight tying between embeddings and LM head for pipeline compatibility")
+parser.add_argument('--fp16_enabled', action='store_true', help="Enable fp16 everywhere")
+parser.add_argument('--fp16_autocast', action='store_true', help="Enable fp16 autocasting")
+parser.add_argument('-rs', '--random_seed', type=int, default=42, help="Random seed for subset. (default: 3)")
+parser.add_argument('-ql', '--num_qualitative', type=int, default=100, help="Number of qualitative results to run (0 disables) (default: 100)")
+parser.add_argument('-od', '--checkpoint_path', default=pathlib.Path('./checkpoints/'), type=lambda p: pathlib.Path(p).resolve(strict=True),  help="Where to store all output files, CSVs, qualitative")
+parser.add_argument('-ld', '--log_dir', default=pathlib.Path('./logs/'), type=lambda p: pathlib.Path(p).resolve(strict=True),  help="Directory for logs")
+parser.add_argument('-dd', '--data_dir', default=pathlib.Path('./data_dir/'), type=lambda p: pathlib.Path(p).resolve(strict=True),  help="Directory for logs")
 
 args = parser.parse_args()
 
 # Configuration
-seed = 42  # Fixed seed for reproducibility
-num_epochs = args.epochs
-num_gpus = args.num_gpus
-learning_rate = args.learning_rate
-learning_rate_decay = args.decay
-subsample_size = args.subsample_size
-max_caption_length = 500
-min_caption_length = 10
-num_beams = 8
-no_repeat_ngram_size = 3
-num_captions = args.num_captions
+# seed = 42  # Fixed seed for reproducibility
+# num_epochs = args.num_epochs
+# num_gpus = args.num_gpus
+# learning_rate = args.learning_rate
+# learning_rate_decay = args.decay
+# subsample_size = args.subsample_size
+# max_caption_length = args.max_caption_length
+# min_caption_length = args.min_caption_length
+# num_beams = args.num_beams
+# no_repeat_ngram_size = args.no_repeat_ngram_size
+# num_captions = args.num_captions
 
 # Paths
-data_dir = '/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames'
-training_artifacts = '/data2/juve/training_artifacts/'
-train_data_dir = os.path.join(data_dir, 'train')
-experiment_name = f"{args.experiment_name}_ws_{num_gpus}_nc_{num_captions}_ep_{num_epochs}_ss_{subsample_size}"
+# data_dir = '/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames'
+# data_dir = args.data_dir
+# checkpoint_path = '/data2/juve/training_artifacts/checkpoints'
 
 # Set seeds
-random.seed(seed)
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
-deepspeed.runtime.utils.set_random_seed(seed)
+random.seed(args.random_seed)
+torch.manual_seed(args.random_seed)
+torch.cuda.manual_seed_all(args.random_seed)
+deepspeed.runtime.utils.set_random_seed(args.random_seed)
 
 # DeepSpeed config
-ds_config_file = "./ds_config_pp.json"
-with open(ds_config_file, 'r') as f:
-    ds_config = json.load(f)
+ds_config = {
+  "train_micro_batch_size_per_gpu": args.batch_size // args.num_gpus,
+  "gradient_accumulation_steps": args.gradient_accumulation_steps,
+  "steps_per_print": args.steps_per_print,
+  "zero_optimization": { "stage": args.zero_stage },
+  "fp16": { "enabled": args.fp16_enabled, "auto_cast": args.fp16_autocast, },
+  "pipeline_parallel_size": dist.get_world_size()
+}
+
+# Dynamic globals - use as few as possible
+experiment_name = f"{args.experiment_name_prefix}_ws{dist.get_world_size()}_nc{args.num_captions}_ep{args.num_epochs}_ss{args.subsample_size}_nl{args.num_hidden_layers}_hs{args.hidden_size_encoder}"
+experiment_path = os.path.join(args.checkpoint_path, experiment_name)
+
+###########################################################
 
 # Initialize wandb
-if local_rank == 0:
+if args.local_rank == 0:
     wandb.init(
         project="nairr",
         name=experiment_name,
         config={
-            "ds_config": ds_config_file,
             "architecture": "SpaceTimeGPT",
-            "dataset": data_dir,
-            "epochs": num_epochs,
-            "seed": seed,
-            "beams": num_beams,
-            "learning_rate": learning_rate,
-            "decay": learning_rate_decay,
-            "num_captions": num_captions,
-            "subsample_size": subsample_size,
+            "data_dir": args.data_dir,
+            "num_epochs": args.num_epochs,
+            "num_captions": args.num_captions,
+            "num_gpus": args.num_gpus,
+            "seed": args.random_seed,
+            "beams": args.num_beams,
             "batch_size": args.train_batch_size,
-            "min_caption_length": min_caption_length,
-            "max_caption_length": max_caption_length,
+            "subsample_size": args.subsample_size,
+            "num_hidden_layers": args.num_hidden_layers,
+            "hidden_size_encoder": args.hidden_size_encoder,
+            "min_caption_length": args.min_caption_length,
+            "max_caption_length": args.max_caption_length,
             "pretrained_model": args.pretrained_model,
-            "num_gpus": num_gpus,
         },
     )
 
@@ -179,17 +159,11 @@ tokenizer = AutoTokenizer.from_pretrained("gpt2")
 
 # Configure tokenizer
 tokenizer.pad_token = tokenizer.eos_token
-tokenizer.model_max_length = max_caption_length
-tokenizer.max_length = max_caption_length
+tokenizer.model_max_length = args.max_caption_length
+tokenizer.max_length = args.max_caption_length
 
-# Model configuration
+# https://huggingface.co/docs/transformers/en/model_doc/timesformer
 config_encoder = TimesformerConfig.from_pretrained(pre_trained_video_encoder)
-config_decoder = GPT2Config.from_pretrained(pre_trained_text_decoder)
-config_decoder.is_decoder = True
-config_decoder.add_cross_attention = True
-config_decoder.use_cache = False
-
-# Update configurations with CLI args
 config_encoder.num_hidden_layers = args.num_hidden_layers_encoder
 config_encoder.num_attention_heads = args.num_attention_heads_encoder
 config_encoder.attention_type = args.attention_type_encoder
@@ -198,14 +172,30 @@ config_encoder.intermediate_size = args.intermediate_size_encoder
 config_encoder.image_size = args.image_size_encoder
 config_encoder.num_frames = args.num_frames_encoder
 config_encoder.patch_size = args.patch_size_encoder
+
+# https://huggingface.co/docs/transformers/en/model_doc/gpt2
+config_decoder = GPT2Config.from_pretrained(pre_trained_text_decoder)
 config_decoder.n_layer = args.num_layers_decoder
 config_decoder.n_head = args.num_heads_decoder
+config_decoder.is_decoder = True
+config_decoder.add_cross_attention = True
+config_decoder.use_cache = False
 
-# Disable flash attention for compatibility
-config_decoder.use_flash_attn = False
-config_decoder.fused_mlp = False
-config_decoder.fused_bias_fc = False
-config_decoder.fused_dropout_add_ln = False
+# Enable/Disable flash attention 
+if args.fast_attention:
+    config_decoder.use_flash_attn = True
+else:
+    config_decoder.use_flash_attn = False
+
+# Enable/Disable fused attention
+if args.fused_attention:
+    config_decoder.fused_mlp = True
+    config_decoder.fused_bias_fc = True
+    config_decoder.fused_dropout_add_ln = True
+else: 
+    config_decoder.fused_mlp = False
+    config_decoder.fused_bias_fc = False
+    config_decoder.fused_dropout_add_ln = False
 
 # Ensure hidden sizes match for cross-attention
 config_decoder.n_embd = config_encoder.hidden_size
@@ -220,14 +210,16 @@ if args.fresh_weights:
     hf_model = VisionEncoderDecoderModel(combined_config)
     hf_model.encoder = TimesformerModel.from_pretrained(pre_trained_video_encoder, config=config_encoder)
     hf_model.decoder = GPT2LMHeadModel.from_pretrained(pre_trained_text_decoder, config=config_decoder)
-    hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
-    hf_model.config.pad_token_id = tokenizer.eos_token_id
-    hf_model.config.max_length = max_caption_length
-    hf_model.config.num_beams = num_beams
-    hf_model.config.no_repeat_ngram_size = no_repeat_ngram_size
-    hf_model = hf_model.to(device)
+
+    # is this needed?
+    # hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
+    # hf_model.config.pad_token_id = tokenizer.eos_token_id
+    # hf_model.config.max_length = args.max_caption_length
+    # hf_model.config.num_beams = args.num_beams
+    # hf_model.config.no_repeat_ngram_size = args.no_repeat_ngram_size
+
 elif args.pretrained_model is not None:
-    hf_model = VisionEncoderDecoderModel.from_pretrained(args.pretrained_model).to(device)
+    hf_model = VisionEncoderDecoderModel.from_pretrained(args.pretrained_model)
 else:
     print("ERROR: Must specify either --fresh_weights or --pretrained_model")
     sys.exit()
@@ -252,216 +244,44 @@ class NPZDataset(Dataset):
         data = np.load(file_path)
 
         pixel_values = torch.from_numpy(data['arr_0']).to(dtype=torch.float16)
-        label_tensor = torch.from_numpy(data['arr_1'][labels_offset]).to(dtype=torch.long).unsqueeze(0)
+        label_tensor = torch.from_numpy(data['arr_1'][labels_offset]).to(dtype=torch.long)
 
-        # Shape assertions
-        assert pixel_values.ndim == 4, f"Expected pixel_values to have 4 dims, got {pixel_values.shape}"
-        assert pixel_values.shape[0] >= 8, f"Expected at least 8 frames, got {pixel_values.shape[0]}"
-        assert label_tensor.ndim == 2, f"Expected label_tensor to have 2 dims, got {label_tensor.shape}"
-        assert label_tensor.shape[0] == 1, f"Expected first label dimension to be 1, got {label_tensor.shape[0]}"
-        assert label_tensor.shape[1] == 1024, f"Expected label_tensor second dim to be 1024, got {label_tensor.shape[1]}"
-
-        return pixel_values, label_tensor
+        # TODO: Discover why we need a nested tuple with two sets of label_tensor
+        # It appears that deepspeed engine is stripping off labels when passing samples
+        # to our PipelineModule. But our model needs labels in the middle to calculate 
+        # TokenEmbeddings for GPT2 -- using the nested tuple makes the labels available 
+        # to our PiplineModule inputs and so we can pass them from layer to layer until
+        # the DecTokenEmbedWrapper later. After that, it appears we don't need to preserve
+        # labels anymore because the PipelineModule will take care of that interally
+        # with its daata loader while calculating loss with the lsos_fn that was provided.
+        return ((pixel_values, label_tensor), label_tensor)
+        # return pixel_values, label_tensor
         # returns a tuple of ((8,3,224,224), (1,1024))
-        # (1, 1024), (, 1024), (1024), or 1024
-
-# index-only dataloader
-class IndexOnlyDataset(Dataset):
-    def __init__(self, dataset, sampler):
-        self.dataset = dataset
-        self.sampler = sampler
-        self.current_epoch = -1
-        self._indices = []
-
-    def set_epoch(self, epoch):
-        """Only shuffles and stores indices - no data loading"""
-        if epoch != self.current_epoch:
-            self.current_epoch = epoch
-            self.sampler.set_epoch(epoch)
-            # Just store the shuffled indices - instant operation
-            self._indices = list(self.sampler)
-
-    def __len__(self):
-        if not self._indices:
-            self._indices = list(self.sampler)
-        return len(self._indices)
-
-    def __getitem__(self, idx):
-        """Load data only when DeepSpeed requests this specific item"""
-        if not self._indices:
-            self._indices = list(self.sampler)
-        
-        # Get the actual dataset index
-        dataset_idx = self._indices[idx]
-        
-        # Load data on-demand - only this one sample
-        pixel_vals, labels = self.dataset[dataset_idx]
-        pixel_vals = pixel_vals.unsqueeze(0)  # Add batch dimension
-        
-        # Return a tuple to ensure correct collate and pipeline input unpacking
-        return pixel_vals, labels
-
-def verify_weight_tying(model, local_rank=0):
-    """Verify the current state of weight tying"""
-    if local_rank == 0:
-        wte_weight = model.decoder.transformer.wte.weight
-        lm_head_weight = model.decoder.lm_head.weight
-        
-        same_object = id(wte_weight) == id(lm_head_weight)
-        same_values = torch.equal(wte_weight, lm_head_weight)
-        
-        print(f"=== Weight Tying Verification ===")
-        print(f"Same memory object: {same_object}")
-        print(f"Same values: {same_values}")
-        print(f"WTE shape: {wte_weight.shape}")
-        print(f"LM head shape: {lm_head_weight.shape}")
-        print(f"WTE requires_grad: {wte_weight.requires_grad}")
-        print(f"LM head requires_grad: {lm_head_weight.requires_grad}")
-        
-        if same_object:
-            print("✓ Weights are tied (sharing same memory)")
-        elif same_values:
-            print("⚠ Weights have same values but are separate objects")
-        else:
-            print("✓ Weights are separate and potentially different")
-        print("=" * 35)
-
-def verify_dataloader_samples(dataset, tokenizer, num_samples=20, shuffle=False):
-    """
-    Verify that the distributed dataloader is correctly cycling through captions.
-    Gathers samples from all ranks to reconstruct the original order.
-    """
-    if local_rank == 0:
-        print(f"=== Distributed Dataloader Verification (num_captions={dataset.dataset.num_caption}) ===")
-        print(f"Expected behavior: Every {dataset.dataset.num_caption} samples should have same pixel_values, different captions\n")
-    
-    # Set up the dataloader with known state
-    dataset.sampler.shuffle = shuffle
-    dataset.set_epoch(0)  # Reset to epoch 0 for consistent testing
-    
-    # Each rank collects its assigned samples
-    local_samples = []
-    samples_per_rank = min(num_samples // world_size + 1, len(dataset))
-    
-    for i in range(samples_per_rank):
-        if i >= len(dataset):
-            break
-            
-        sample = dataset[i]
-        pixel_vals, labels = sample[0], sample[1]
-        
-        # Remove batch dimension for analysis
-        pixel_vals_display = pixel_vals.squeeze(0) if pixel_vals.dim() == 5 else pixel_vals
-        labels_display = labels.squeeze(0) if labels.dim() == 2 else labels
-        
-        # Get the original dataset index this sample corresponds to
-        original_idx = dataset._indices[i]
-        
-        # Decode caption
-        caption = tokenizer.decode(labels_display, skip_special_tokens=True)
-        
-        # Store sample info with rank and original index
-        sample_info = {
-            'rank': local_rank,
-            'local_idx': i,
-            'original_idx': original_idx,
-            'pixel_shape': list(pixel_vals_display.shape),
-            'pixel_hash': hash(pixel_vals_display.flatten().sum().item()),
-            'labels_shape': list(labels_display.shape),
-            'caption': caption[:100] + "..." if len(caption) > 100 else caption,
-            'file_idx': original_idx // dataset.dataset.num_caption,
-            'caption_idx': original_idx % dataset.dataset.num_caption
-        }
-        local_samples.append(sample_info)
-    
-    # Gather all samples from all ranks
-    import torch.distributed as dist
-    
-    # Convert to tensors and strings that can be gathered
-    gathered_samples = [None] * world_size
-    dist.all_gather_object(gathered_samples, local_samples)
-    
-    # Only rank 0 processes and displays results
-    if local_rank == 0:
-        # Flatten and sort by original_idx to reconstruct the consecutive order
-        all_samples = []
-        for rank_samples in gathered_samples:
-            all_samples.extend(rank_samples)
-        
-        # Sort by original dataset index to see the true consecutive order
-        all_samples.sort(key=lambda x: x['original_idx'])
-        
-        # Limit to requested number of samples
-        all_samples = all_samples[:num_samples]
-        
-        # Display results
-        print(f"{'Orig':<4} {'Rank':<4} {'Local':<5} {'File':<4} {'Cap':<3} {'Pixel Hash':<12} {'Pixel Shape':<20} {'Caption':<60}")
-        print("-" * 130)
-        
-        for sample in all_samples:
-            print(f"{sample['original_idx']:<4} {sample['rank']:<4} {sample['local_idx']:<5} "
-                  f"{sample['file_idx']:<4} {sample['caption_idx']:<3} "
-                  f"{sample['pixel_hash']:<12} {str(sample['pixel_shape']):<20} {sample['caption']:<60}")
-        
-        # Verify caption cycling
-        print(f"\n=== Verification Results ===")
-        
-        # Check if first num_captions samples have same pixel_values
-        if len(all_samples) >= dataset.dataset.num_caption:
-            first_group_hashes = [all_samples[i]['pixel_hash'] for i in range(dataset.dataset.num_caption)]
-            all_same_pixels = all(h == first_group_hashes[0] for h in first_group_hashes)
-            
-            print(f"✓ First {dataset.dataset.num_caption} samples have same pixel_values: {all_same_pixels}")
-            
-            # Check if captions are different
-            first_group_captions = [all_samples[i]['caption'] for i in range(dataset.dataset.num_caption)]
-            all_different_captions = len(set(first_group_captions)) == len(first_group_captions)
-            
-            print(f"✓ First {dataset.dataset.num_caption} samples have different captions: {all_different_captions}")
-            
-            # Check cycling pattern
-            if len(all_samples) >= dataset.dataset.num_caption * 2:
-                second_group_hashes = [all_samples[i]['pixel_hash'] for i in range(dataset.dataset.num_caption, dataset.dataset.num_caption * 2)]
-                different_from_first = any(h != first_group_hashes[0] for h in second_group_hashes)
-                print(f"✓ Second group ({dataset.dataset.num_caption}-{dataset.dataset.num_caption*2-1}) uses different pixel_values: {different_from_first}")
-        
-        # Show distribution across ranks
-        rank_distribution = {}
-        for sample in all_samples:
-            rank = sample['rank']
-            rank_distribution[rank] = rank_distribution.get(rank, 0) + 1
-        
-        print(f"\n=== Distribution Across Ranks ===")
-        for rank in sorted(rank_distribution.keys()):
-            print(f"Rank {rank}: {rank_distribution[rank]} samples")
-        
-        return all_samples
-    
-    # Synchronize all ranks
-    dist.barrier()
-    return None
 
 # Create datasets and loaders
-train_dataset = NPZDataset(train_data_dir, num_captions, subsample_size)
-train_sampler = DistributedSampler(train_dataset, shuffle=False, num_replicas=world_size, rank=local_rank)
-my_train_loader = IndexOnlyDataset(train_dataset, train_sampler)
+train_dataset = NPZDataset(os.path.join(args.data_dir, 'train'), args.num_captions, args.subsample_size)
+# train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
+# train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=batch_size, collate_fn=default_collate, drop_last=True)
 
-# Create evaluation datasets
-val_dataset = NPZDataset(os.path.join(data_dir, 'val'), num_captions, subsample_size)
-val_sampler = DistributedSampler(val_dataset, shuffle=False, num_replicas=world_size, rank=local_rank)
-val_loader = IndexOnlyDataset(val_dataset, val_sampler)
+val_dataset = NPZDataset(os.path.join(args.data_dir, 'val'), args.num_captions, args.subsample_size)
+val_sampler = DistributedSampler(val_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
+val_dataloader = DataLoader(val_dataset, sampler=val_sampler, batch_size=args.batch_size//dist.get_world_size(), collate_fn=default_collate, drop_last=True)
 
-test_dataset = NPZDataset(os.path.join(data_dir, 'test'), num_captions, subsample_size)
-test_sampler = DistributedSampler(test_dataset, shuffle=False, num_replicas=world_size, rank=local_rank)
-test_loader = IndexOnlyDataset(test_dataset, test_sampler)
+test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), args.num_captions, args.subsample_size)
+test_sampler = DistributedSampler(test_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
+test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size//dist.get_world_size(), collate_fn=default_collate, drop_last=True)
 
-
+# SANITY CHECK DATALOADER
 # Temporarily disable dataloader verification (can hang across ranks)
 # samples = verify_dataloader_samples(my_train_loader, tokenizer, num_samples=25, shuffle=False)
 # print(samples)
+
+# SANITY CHECK WEIGHT TIEING 
 # Add this call after model creation
-verify_weight_tying(hf_model, local_rank)
+# verify_weight_tying(hf_model, local_rank)
 # sys.exit()
+
+########## begin here next time
 
 # Add this after creating the model but before pipeline conversion
 if args.disable_tied_weights:
@@ -673,7 +493,8 @@ def compute_loss(outputs, labels=None):
         ignore_index=tokenizer.eos_token_id
     )
 
-hf_model = hf_model.half()
+if args.fp16_enabled:
+    hf_model = hf_model.half()
 
 def patch_all_broadcasts():
     """Patch all problematic broadcast calls in pipeline evaluation"""
@@ -729,7 +550,6 @@ if args.pipeline_parallel:
         loss_fn=compute_loss,
         num_stages=args.num_gpus,
         partition_method='uniform',
-        activation_checkpoint_interval=ds_config['pipeline']['activation_checkpoint_interval'],
     )
 
 # Initialize optimizer
@@ -737,11 +557,11 @@ optimizer = AdamW([p for p in hf_model.parameters() if p.requires_grad],
                   lr=args.learning_rate, 
                   betas=(0.8, 0.999),
                   eps=1e-8,
-                  weight_decay=5e-9)
+                  weight_decay=args.learning_rate_decay)
 
 print("DEBUG: Optimizer initialized with parameters:")
 # Add rank prints around DeepSpeed initialization for debugging
-print(f"RANK {local_rank} ➜ before deepspeed.initialize()")
+print(f"RANK {args.local_rank} ➜ before deepspeed.initialize()")
 # Initialize DeepSpeed
 deep_speed_model_engine, optimizer, train_dataloader, lr_scheduler = deepspeed.initialize(
     args=args,
@@ -749,19 +569,16 @@ deep_speed_model_engine, optimizer, train_dataloader, lr_scheduler = deepspeed.i
     optimizer=optimizer,
     model_parameters=[p for p in hf_model.parameters() if p.requires_grad],
     training_data=my_train_loader,
-    config=ds_config_file,
+    config=ds_config,
     dist_init_required=False,  # disable redundant distributed init
 )
-print(f"RANK {local_rank} ➜ after deepspeed.initialize()")
+print(f"RANK {args.local_rank} ➜ after deepspeed.initialize()")
 print("DEBUG: DeepSpeed model engine initialized")
 
 # Resume from checkpoint if specified
 if args.resume_from_checkpoint is not None:
-    deep_speed_model_engine.load_checkpoint(
-        os.path.join(training_artifacts, experiment_name), 
-        tag=f"epoch_{args.resume_from_checkpoint}"
-    )
-print("DEBUG: Resumed from checkpoint if specified")
+    deep_speed_model_engine.load_checkpoint( experiment_path, tag=f"epoch_{args.resume_from_checkpoint}")
+    print("DEBUG: Resumed from checkpoint!")
 
 # Freeze parameters if specified
 if args.freeze_encoder_decoder:
@@ -808,11 +625,11 @@ if args.do_train:
     # Check distributed environment
     check_environment()
 
-    for epoch in range(num_epochs):
+    for epoch in range(args.num_epochs):
         
         if local_rank == 0:
             print(f"\n{'='*60}")
-            print(f"EPOCH {epoch+1}/{num_epochs}")
+            print(f"EPOCH {epoch+1}/{args.num_epochs}")
             print('='*60)
         
         # Training phase
@@ -820,10 +637,10 @@ if args.do_train:
         deep_speed_model_engine.train()
         
         steps_per_epoch = len(train_dataset) // (
-            args.train_batch_size * world_size * ds_config['gradient_accumulation_steps']
+            args.train_batch_size * args.world_size * ds_config['gradient_accumulation_steps']
         )
         
-        if local_rank == 0:
+        if args.local_rank == 0:
             print(f"DEBUG: Starting training with {steps_per_epoch} steps")
         
         dist.barrier()  # Ensure all ranks synchronize before saving
@@ -831,20 +648,19 @@ if args.do_train:
             dist.barrier()  # Ensure all ranks synchronize before saving
             loss = deep_speed_model_engine.train_batch()
             
-            if deep_speed_model_engine.is_last_stage() and local_rank == 0:
+            if deep_speed_model_engine.is_last_stage() and args.local_rank == 0:
                 if step % 10 == 0:
-                    print(f"Epoch {epoch+1}/{num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss.item():.4f}")
+                    print(f"Epoch {epoch+1}/{args.num_epochs}, Step {step+1}/{steps_per_epoch}, Loss: {loss.item():.4f}")
         
-        if local_rank == 0:
+        if args.local_rank == 0:
             print(f"DEBUG: Completed training for epoch {epoch+1}")
         
         # Save checkpoint
-        checkpoint_path = os.path.join(training_artifacts, experiment_name)
-        if local_rank == 0:
-            os.makedirs(checkpoint_path, exist_ok=True)
+        if args.local_rank == 0:
+            os.makedirs(experiment_path, exist_ok=True)
         
         dist.barrier()  # Ensure all ranks synchronize before saving
-        deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
+        deep_speed_model_engine.save_checkpoint(experiment_path, tag=f"epoch_{epoch}")
 
         if False and args.do_val:
             if local_rank == 0:
