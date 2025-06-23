@@ -6,10 +6,11 @@ export CUDA_VISIBLE_DEVICES="3,4,0"
 
 NUM_EPOCHS=5
 NUM_CAPTIONS=10
-SUBSET_SIZE=1.0
+SUBSET_SIZE=0.001
 
 NUM_HIDDEN_LAYERS=12
 HIDDEN_SIZE_ENCODER=768
+GRADIENT_ACCUMULATION_STEPS=2
 
 EXPERIMENT_NAME="vatex"
 DATA_DIR="/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames"
@@ -34,7 +35,7 @@ deepspeed main_deepspeed.py  --fresh_weights  --num_gpus $NUM_GPU \
     --pretrained_encoder $PRETRAINED_ENC \
     --pretrained_decoder $PRETRAINED_DEC \
     --image_preprocessor $IMAGE_PP \
-    --tokenizer $TOKENIZER \
+    --tokenizer $TOKENIZER --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
     --num_hidden_layers $NUM_HIDDEN_LAYERS --hidden_size_encoder $HIDDEN_SIZE_ENCODER \
     --fp16_enabled \
     --do_train \

@@ -81,7 +81,7 @@ parser.add_argument('--num_beams', type=int, default=5, help="Number of Beams (d
 parser.add_argument('--no_repeat_ngram_size', type=int, default=3, help="No repease ngram size. (default: 3)")
 parser.add_argument('--max_caption_length', type=int, default=500, help="Max size caption to generate. (default: 500)")
 parser.add_argument('--min_caption_length', type=int, default=10, help="Min size caption to generate. (default: 10)")
-parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help="Gradient accumulation steps. (default: 1)")
+parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help="Gradient accumulation steps. (default: 1)")
 parser.add_argument('--steps_per_print', type=int, default=50, help="How often to print loss output to console and wandb. (default: 50)")
 parser.add_argument('--zero_stage', type=int, default=1, help="ZeRO stage to use (0 disables, 1, 2 or 3). (default: 1)")
 parser.add_argument('--do_train', action="store_true", help="Run training phase")
@@ -120,7 +120,11 @@ ds_config = {
 }
 
 # Dynamic globals - use as few as possible
-experiment_name = f"{args.experiment_name_prefix}_ws{dist.get_world_size()}_nc{args.num_captions}_ep{args.num_epochs}_ss{args.subsample_size}_nl{args.num_hidden_layers}_hs{args.hidden_size_encoder}_nf{args.num_frames_encoder}_ps{args.patch_size_encoder}_attn{args.attention_type_encoder}_lr{args.learning_rate}_bs{args.batch_size}_rs{args.random_seed}"
+att_type = {
+    'divided_space_time': 'dst',
+    'space_only': 'so',
+    'joint_space_time': 'jst'}
+experiment_name = f"{args.experiment_name_prefix}_ws{dist.get_world_size()}_nc{args.num_captions}_ep{args.num_epochs}_ss{args.subsample_size}_nl{args.num_hidden_layers}_hs{args.hidden_size_encoder}_nf{args.num_frames_encoder}_ps{args.patch_size_encoder}_attn_{att_type[args.attention_type_encoder]}_lr{args.learning_rate}_bs{args.batch_size}_rs{args.random_seed}"
 experiment_output_dir = os.path.join(args.output_dir, experiment_name)
 
 if os.path.exists(experiment_output_dir):
@@ -467,11 +471,10 @@ if args.do_train:
         dist.barrier()
         
         # Save checkpoint every epoch
-        if args.save_checkpoint:
-            checkpoint_path = os.path.join(experiment_output_dir, "checkpoints")
-            if dist.get_rank() == 0:
-                os.makedirs(checkpoint_path, exist_ok=True)
-            deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
+        checkpoint_path = os.path.join(experiment_output_dir, "checkpoints")
+        if dist.get_rank() == 0:
+            os.makedirs(checkpoint_path, exist_ok=True)
+        deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
 
         if args.do_val:
             # Validation every epoch
@@ -506,7 +509,7 @@ if args.do_test:
     deep_speed_model_engine.eval()
 
     test_iter = iter(RepeatingLoader(test_dataloader))
-    num_test_batches = len(test_dataset) // (ds_config['train_micro_batch_size_per_gpu'] * dis.get_world_size())
+    num_test_batches = len(test_dataset) // (ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size())
 
     total_test_loss = 0.0
     for step in range(num_test_batches):
