@@ -515,6 +515,17 @@ if args.do_train:
                 print(f"Val Average Epoch {epoch} Loss: {val_loss}")
                 wandb.log({"Exp/Val Average Loss": val_loss})
 
+# TODO: get_nlp_metrics()
+def get_nlp_metrics():
+    pass
+
+# TODO: get_qualitative()
+def get_qualitative():
+    pass
+
+# TODO: generate_report()
+def generate_report():
+    pass
 
 ##################################################
 # Testing Loop and qualitative report generation
@@ -522,6 +533,7 @@ if args.do_train:
 #       All available NLP metrics and visualization  of num_qualitative with frames,
 #       Predicted, and Ground_Truth - would be nice to display the other details all
 #       in one report as well
+# TODO: Also gererate .csv files, one for global (aggregate) results, and one for per instance
 if args.do_test:
 
     # TODO: Reinstantiate the model from the last checkpoint of this experiment
@@ -532,11 +544,15 @@ if args.do_test:
     test_iter = iter(RepeatingLoader(test_dataloader))
     num_test_batches = len(test_dataset) // (ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size())
 
+    # TODO: Setup lists and functions for NLP metrics HERE
     total_test_loss = 0.0
+
     for step in range(num_test_batches):
+        
         if deep_speed_model_engine.is_last_stage():
             loss, logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True)
             total_test_loss += loss.item()
+            # TODO: add loss, logits to lists, and call any functions like perplexity
         else:
             loss = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=False)
 
@@ -548,9 +564,9 @@ if args.do_test:
         test_loss = total_test_loss / num_test_batches
         print(f"Test Average Epoch {epoch} Loss: {test_loss}")
         wandb.log({"Exp/Test Average Loss": test_loss})
-    
-    # TODO: setup qualitative reporting
-    # call get_qualitiative_results() to get qualitative results
+        # TODO: setup qualitative reporting
+        # call generate_report() get qualitative results
+        # be sure to save copy of all results (complete report) to experiment_output_dir
 
 if dist.get_rank() == (dist.get_world_size() - 1):
     wandb.finish()
