@@ -58,10 +58,11 @@ config_encoder.num_attention_heads = 3
 config_decoder.n_layer = 3
 config_decoder.n_head = 3
 
+
 # Create combined config and model
 combined_config = VisionEncoderDecoderConfig.from_encoder_decoder_configs(
     encoder_config=config_encoder,
-    decoder_config=config_decoder
+    decoder_config=config_decoder,
 )
 
 hf_model = VisionEncoderDecoderModel(combined_config).to(device='cuda')

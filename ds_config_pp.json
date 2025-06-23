@@ -1,38 +1,13 @@
 {
-  "train_micro_batch_size_per_gpu": 2,
+  "train_micro_batch_size_per_gpu": 4,
   "gradient_accumulation_steps": 1,
   "steps_per_print": 50,
   "zero_optimization": {
-    "stage": 1
-  },
-  "optimizer": {
-    "type": "AdamW",
-    "params": {
-      "lr": 5e-7,
-      "betas": [0.8, 0.999],
-      "eps": 1e-8,
-      "weight_decay": 5e-9
-    }
+    "stage": 0
   },
   "fp16": {
     "enabled": true,
     "auto_cast": false
   },
-  "pipeline_parallel_size": 2,
-  "pipeline": {
-    "partition_method": "uniform",
-    "seed_layers": true,
-    "activation_checkpoint_interval": 1,
-    "activation_checkpoint_func": "deepspeed.checkpointing.checkpoint"
-  },
-  "comms_logger": {
-    "enabled": false,
-    "verbose": false 
-  },
-  "wandb": {
-    "enabled": false,
-    "group": "sfsuml",
-    "team": "sfsuml",
-    "project": "nairr"
-  }
+  "pipeline_parallel_size": 3
 }

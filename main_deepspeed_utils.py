@@ -174,3 +174,27 @@ def verify_dataloader_samples(dataset, tokenizer, num_samples=20, shuffle=False)
     # Synchronize all ranks
     dist.barrier()
     return None
+
+# TODO: Make a funciotn to pretty print network architecture with num params, layers, input and output dimensions
+
+
+# TODO: Add a function to visualize the model architecture as a network graph using graphviz or torchviz
+# get one sample from dataloader
+# input_tensor, _ = next(iter(my_train_loader))
+# print model diagram
+# from torchviz import make_dot
+# output = deep_speed_model_engine.module(input_tensor) # Get an output tensor
+# dot = make_dot(output, params=dict(deep_speed_model_engine.module.named_parameters()))
+# dot.render("model_graph", view=True) # Save as PDF and open
+
+# from torch.fx import symbolic_trace
+# model = deep_speed_model_engine.module
+# traced = symbolic_trace(model)
+# print(traced.graph)  # should show all ops
+# sys.exit()
+
+# from torchview import draw_graph
+# graph = draw_graph(deep_speed_model_engine.module, input_data=(input_tensor,), expand_nested=True)
+# graph.visual_graph.render("model_graph", format="pdf", view=True)
+
+# sys.exit()
