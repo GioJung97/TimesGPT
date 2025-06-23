@@ -35,6 +35,9 @@ from deepspeed.utils import RepeatingLoader
 
 # TODO: Review deepspeed optoins for multi-node training and slurm
 # https://huggingface.co/docs/transformers/en/deepspeed?multinode=torchrun#deploy
+
+# TODO: review resume from checkpoint logic 
+# for example, we pass in the epoch number to resume from 
         
 # Initialize distributed environment
 if not dist.is_initialized():
@@ -422,7 +425,7 @@ deep_speed_model_engine, optimizer, train_dataloader, scheduler  = deepspeed.ini
 # Resume from checkpoint if specified
 # TODO: needs to be tested
 if args.resume_from_checkpoint is not None:
-    deep_speed_model_engine.load_checkpoint(experiment_path, tag=f"epoch_{args.resume_from_checkpoint}")
+    deep_speed_model_engine.load_checkpoint(experiment_output_dir, tag=f"epoch_{args.resume_from_checkpoint}")
 
 # Freeze parameters if specified
 # TODO: needs to be tested
