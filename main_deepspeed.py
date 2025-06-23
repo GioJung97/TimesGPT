@@ -120,30 +120,29 @@ ds_config = {
 }
 
 # Dynamic globals - use as few as possible
-att_type = {
-    'divided_space_time': 'dst',
-    'space_only': 'so',
-    'joint_space_time': 'jst'}
+att_type = {'divided_space_time': 'dst', 'space_only': 'so', 'joint_space_time': 'jst'}
 experiment_name = f"{args.experiment_name_prefix}_ws{dist.get_world_size()}_nc{args.num_captions}_ep{args.num_epochs}_ss{args.subsample_size}_nl{args.num_hidden_layers}_hs{args.hidden_size_encoder}_nf{args.num_frames_encoder}_ps{args.patch_size_encoder}_attn_{att_type[args.attention_type_encoder]}_lr{args.learning_rate}_bs{args.batch_size}_rs{args.random_seed}"
 experiment_output_dir = os.path.join(args.output_dir, experiment_name)
 
 if os.path.exists(experiment_output_dir):
     print(f"WARNING: Output directory {experiment_output_dir} already exists. Overwriting.")
 
-# Initialize wandb
+# Setup and initialize wandb
 if dist.get_rank() == (dist.get_world_size() - 1):
-    wandb.init(
-        project="nairr",
-        name=experiment_name,
-        config={
+
+    # This dict can be used for generating a report at the end.
+    # (print this and all of the train, val, and test results)
+    wandb_config = {
             "architecture": "SpaceTimeGPT",
             "data_dir": args.data_dir,
             "num_epochs": args.num_epochs,
             "num_captions": args.num_captions,
+            "world_size": dist.get_world_size(),
             "num_gpus": args.num_gpus,
             "seed": args.random_seed,
             "beams": args.num_beams,
             "batch_size": args.batch_size,
+            "microbatch_size": args.batch_size // args.num_gpus,
             "subsample_size": args.subsample_size,
             "num_frames_encoder": args.num_frames_encoder,
             "hidden_size_encoder": args.hidden_size_encoder,
@@ -151,7 +150,18 @@ if dist.get_rank() == (dist.get_world_size() - 1):
             "min_caption_length": args.min_caption_length,
             "max_caption_length": args.max_caption_length,
             "pretrained_model": args.pretrained_model,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "steps_per_print": args.steps_per_print,
+            "zero_stage": args.zero_stage,
+            "fp16_enabled": args.fp16_enabled,
+            "fp16_autocast": args.fp16_autocast,
         }
+
+# Initialize wandb
+    wandb.init(
+        project="nairr",
+        name=experiment_name,
+        config=wandb_config,
     )
 
 # Load pretrained components
@@ -442,6 +452,8 @@ if args.freeze_encoder_decoder:
             if "crossatt" in name or 'ln_cross_attn' in name or 'mlp' in name:
                 param.requires_grad = True
 
+
+##################################################
 # Training loop with validation after each epoch
 if args.do_train:
     for epoch in range(args.num_epochs):
@@ -470,14 +482,16 @@ if args.do_train:
 
         dist.barrier()
         
+        ##################################################
         # Save checkpoint every epoch
         checkpoint_path = os.path.join(experiment_output_dir, "checkpoints")
         if dist.get_rank() == 0:
             os.makedirs(checkpoint_path, exist_ok=True)
         deep_speed_model_engine.save_checkpoint(checkpoint_path, tag=f"epoch_{epoch}")
 
+        ##################################################
+        # Validation every epoch
         if args.do_val:
-            # Validation every epoch
             deep_speed_model_engine.eval()
             val_iter = iter(RepeatingLoader(val_dataloader))
 
@@ -502,7 +516,14 @@ if args.do_train:
                 wandb.log({"Exp/Val Average Loss": val_loss})
 
 
+##################################################
+# Testing Loop and qualitative report generation
+# TODO: Report should include Experiment Parameters, Train/Val/Test Average Loss,
+#       All available NLP metrics and visualization  of num_qualitative with frames,
+#       Predicted, and Ground_Truth - would be nice to display the other details all
+#       in one report as well
 if args.do_test:
+
     # TODO: Reinstantiate the model from the last checkpoint of this experiment
     # currenlty just reusing the alreading instatiated deep_speed_model_engine
     # we need to decouple so inference can be run independently of training
