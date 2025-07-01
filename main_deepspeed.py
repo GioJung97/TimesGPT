@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import socket
+import itertools
 import pathlib
 import numpy as np
 import torch
@@ -19,7 +20,11 @@ from transformers import (
     VisionEncoderDecoderConfig,
     TimesformerConfig,
     GPT2Config,
-    TimesformerModel
+    TimesformerModel,
+    BeamSearchScorer, 
+    LogitsProcessorList, 
+    NoRepeatNGramLogitsProcessor, 
+    MinLengthLogitsProcessor
 )
 import torch.nn.functional as F
 from transformers.integrations import HfDeepSpeedConfig
@@ -69,12 +74,13 @@ parser.add_argument('-frz', '--freeze_encoder_decoder', action='store_true', hel
 parser.add_argument('-ss', '--subsample_size', default=1.0, type=float, help="Data subsample percentage (default: 1.0)")
 parser.add_argument('--num_captions', type=int, default=10, help="Number of captions to use per video (default: 10)")
 parser.add_argument('--num_gpus', type=int, default=2, help="Number of GPUs")
-parser.add_argument('--num_beams', type=int, default=5, help="Number of Beams (default: 5)")
+parser.add_argument('--num_beams', type=int, default=8, help="Number of Beams (default: 8)")
 parser.add_argument('--no_repeat_ngram_size', type=int, default=3, help="No repease ngram size. (default: 3)")
-parser.add_argument('--max_caption_length', type=int, default=500, help="Max size caption to generate. (default: 500)")
+parser.add_argument('--max_caption_length', type=int, default=50, help="Max size caption to generate. (default: 50)")
 parser.add_argument('--min_caption_length', type=int, default=10, help="Min size caption to generate. (default: 10)")
 parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help="Gradient accumulation steps. (default: 1)")
 parser.add_argument('--steps_per_print', type=int, default=50, help="How often to print loss output to console and wandb. (default: 50)")
+parser.add_argument('--temperature', type=float, default=0.7, help="Temperature for sampling. (default: 0.7)")
 parser.add_argument('--zero_stage', type=int, default=1, help="ZeRO stage to use (0 disables, 1, 2 or 3). (default: 1)")
 parser.add_argument('--do_train', action="store_true", help="Run training phase")
 parser.add_argument('--do_val', action="store_true", help="Run validation phase")
@@ -158,7 +164,8 @@ ds_config = {
 
 # Dynamic globals - use as few as possible
 att_type = {'divided_space_time': 'dst', 'space_only': 'so', 'joint_space_time': 'jst'}
-experiment_name = f"{args.experiment_name_prefix}_ws{dist.get_world_size()}_nc{args.num_captions}_ep{args.num_epochs}_ss{args.subsample_size}_nl{args.num_hidden_layers}_hs{args.hidden_size_encoder}_nf{args.num_frames_encoder}_ps{args.patch_size_encoder}_attn_{att_type[args.attention_type_encoder]}_lr{args.learning_rate}_bs{args.batch_size}_rs{args.random_seed}_zs{args.zero_stage}_fp16{args.fp16_enabled}_fp16autocast{args.fp16_autocast} "
+# experiment_name = f"{args.experiment_name_prefix}_ws{dist.get_world_size()}_nc{args.num_captions}_ep{args.num_epochs}_ss{args.subsample_size}_nl{args.num_hidden_layers}_hs{args.hidden_size_encoder}_nf{args.num_frames_encoder}_ps{args.patch_size_encoder}_attn_{att_type[args.attention_type_encoder]}_lr{args.learning_rate}_bs{args.batch_size}_rs{args.random_seed}_zs{args.zero_stage}_fp16{args.fp16_enabled}_fp16autocast{args.fp16_autocast}"
+experiment_name = "placeholder"
 experiment_output_dir = os.path.join(args.output_dir, experiment_name)
 
 if os.path.exists(experiment_output_dir):
@@ -186,6 +193,7 @@ if dist.get_rank() == (dist.get_world_size() - 1):
             "num_hidden_layers": args.num_hidden_layers,
             "min_caption_length": args.min_caption_length,
             "max_caption_length": args.max_caption_length,
+            "temperature": args.temperature,
             "pretrained_model": args.pretrained_model,
             "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "steps_per_print": args.steps_per_print,
@@ -496,7 +504,7 @@ deep_speed_model_engine, optimizer, train_dataloader, scheduler  = deepspeed.ini
 # TODO: needs to be tested
 if args.resume_from_checkpoint is not None:
     checkpoint_path = os.path.join(experiment_output_dir, "checkpoints")
-    deep_speed_model_engine.load_checkpoint(checkpoint_path, tag=f"epoch_{args.resume_from_checkpoint}")
+    deep_speed_model_engine.load_checkpoint(experiment_output_dir, tag=f"epoch_{args.resume_from_checkpoint}")
 
 ##################################################
 # Training loop with validation after each epoch
@@ -564,8 +572,6 @@ if args.do_train:
     # Destroy deepspeed model engine to free up GPU memory
     # deep_speed_model_engine.destroy()
 
-
-
 # The story so far
 # pipeline parallel module 
 # model parallelism across gpus
@@ -577,143 +583,181 @@ if args.do_train:
 # is created a decode_batch() function that does beam search decoding, min_length, max_length, no_repeat_ngram_size, temperature, etc...
 # had chatgpt code that and I've been experiementing 
 
+# our dataloader generates batches of ((pixel_values, labels), labels)
+# for a batch size of three it would be [((pixel_values_1, labels_1), labels_1), ((pixel_values_2, labels_2), labels_2), ((pixel_values_3, labels_3), labels_3)]
 
-# TODO: get_nlp_metrics()
-def get_nlp_metrics():
-    pass
+class SingleSampleIterator:
+    def __init__(self, sample):
+        self.sample = sample
+        self.has_yielded = False
 
-# TODO: get_qualitative()
-def get_qualitative():
-    pass
+    def __iter__(self):
+        return self
 
-# TODO: generate_report()
-def generate_report():
-    pass
+    def __next__(self):
+        return self.sample
 
-from transformers import (
-    BeamSearchScorer,
-    LogitsProcessorList,
-    NoRepeatNGramLogitsProcessor,
-    MinLengthLogitsProcessor,
-)
-import torch
-import torch.nn.functional as F
+# COPILOT NOTE: Put definition of beam_decode_batch() here
+def beam_decode_batch(data_iter, model, tokenizer, num_beams=3, max_length=50, min_length=10, no_repeat_ngram_size=3, temperature=1.0):
+    """
+    Perform beam search decoding for a batch of items using DeepSpeed's eval_batch() function.
 
-def beam_decode_batch(
-    deepspeed_model,
-    tokenizer,
-    batch,
-    num_beams=5,
-    max_length=32,
-    min_length=10,
-    early_stopping=True,
-    temperature=1.0,
-    no_repeat_ngram_size=3,
-):
-    if not deepspeed_model.is_last_stage():
-        raise RuntimeError("beam_decode_batch() should only be called on the last stage of the pipeline.")
-    print(f"DEBUG: beam_decode_batch() called on last stage of the pipeline (rank {dist.get_rank()}).")
+    Args:
+        data_iter: Iterator providing input data batches.
+        model: DeepSpeed model engine.
+        tokenizer: Tokenizer for decoding outputs.
+        num_beams: Number of beams for beam search.
+        max_length: Maximum length of the generated sequences.
+        min_length: Minimum length of the generated sequences.
+        no_repeat_ngram_size: Size of n-grams to avoid repeating.
 
-    # Extract inputs
-    pixel_values = batch[0][0].to(deepspeed_model.device)  # (B, F, 3, 224, 224)
+    Returns:
+        List of decoded sequences for the batch.
+    """
+    model.eval()  # Ensure the model is in evaluation mode
+    batch = next(data_iter)  # Get the next batch from the data iterator
+    pixel_values = batch[0][0]  # Extract pixel values (shape: [batch_size, 8, 3, 224, 224])
+
     batch_size = pixel_values.size(0)
+    decoded_sequences = []
 
-    # Initialize input_ids with BOS token
-    bos_token_id = tokenizer.bos_token_id or tokenizer.cls_token_id or 0
-    eos_token_id = tokenizer.eos_token_id or tokenizer.sep_token_id or 2
-    pad_token_id = tokenizer.pad_token_id or eos_token_id
+    # Process each sample in the batch individually
+    for i in range(batch_size):
+        final_beam_scores = None
+        final_beam_tokens = None
+        final_beam_indices = None
 
-    input_ids = torch.full(
-        (batch_size * num_beams, 1),
-        bos_token_id,
-        dtype=torch.long,
-        device=deepspeed_model.device,
-    )
+        # Extract the pixel values for the current sample
+        # print("DEBUG: pixel_values[i].shape:", pixel_values[i].shape)
 
-    # Expand pixel_values for beam search
-    pixel_values = pixel_values.unsqueeze(1).expand(-1, num_beams, -1, -1, -1, -1).reshape(
-        batch_size * num_beams, *pixel_values.shape[1:]
-    )
+        single_pixel_values = pixel_values[i].unsqueeze(0)  # Shape: [1, 8, 3, 224, 224]
+        single_pixel_values = single_pixel_values.to(device=dist.get_world_size()-1)  # Move to the correct device
+        # print("DEBUG: single_pixel_values.shape:", single_pixel_values.shape)
 
-    # Initialize BeamSearchScorer
-    beam_scorer = BeamSearchScorer(
-        batch_size=batch_size,
-        num_beams=num_beams,
-        device=deepspeed_model.device,
-        length_penalty=1.0,
-        do_early_stopping=early_stopping,
-    )
-
-    # Initialize LogitsProcessorList
-    logits_processor = LogitsProcessorList()
-    if no_repeat_ngram_size > 0:
-        logits_processor.append(NoRepeatNGramLogitsProcessor(no_repeat_ngram_size))
-
-    if min_length > 0:
-        logits_processor.append(MinLengthLogitsProcessor(min_length, eos_token_id))
-
-    # Iterative decoding loop
-    for step in range(max_length):
-        # Prepare model inputs
-        model_inputs = {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-        }
-
-        # batch = (model_inputs, None)  # Wrap inputs in a tuple to match the expected format
-
-        minimal_batch = iter([({'input_ids': torch.zeros((1, 1), device=deepspeed_model.device),
-                        'pixel_values': torch.zeros((1, 8, 3, 224, 224), device=deepspeed_model.device)}, None)])
-
-        # Debug batch structure
-        print(f"DEBUG: batch structure on rank {dist.get_rank()}")
-
-        # Synchronize ranks
-        dist.barrier()
-        print(f"DEBUG: All ranks synchronized before eval_batch() on rank {dist.get_rank()}")
-
-        # Get logits from the model
-        print(f"DEBUG: Preparing to call eval_batch() on rank {dist.get_rank()}")
-        # with torch.no_grad():
-        _, logits = deepspeed_model.eval_batch(data_iter=iter(test_dataloader), return_logits=True)
-        dist.barrier()
-        print(f"DEBUG: Finished eval_batch() on rank {dist.get_rank()}")
-
-        # Process logits for the next token
-        next_token_logits = logits[:, -1, :] / temperature
-        next_token_scores = F.log_softmax(next_token_logits, dim=-1)
-        next_token_scores = logits_processor(input_ids, next_token_scores)
-
-        # Update beam search
-        beam_outputs = beam_scorer.process(
-            input_ids=input_ids,
-            next_token_scores=next_token_scores,
-            next_tokens=None,
-            next_indices=None,
+        # Initialize input_ids with the <bos> token
+        input_ids = torch.full(
+            (1, 1),  # Start with a single token for this sample
+            tokenizer.bos_token_id,
+            dtype=torch.long,
+            device=(dist.get_world_size()-1),
         )
 
-        input_ids = torch.cat([
-            input_ids[beam_outputs["next_beam_indices"]],
-            beam_outputs["next_beam_tokens"].unsqueeze(-1),
-        ], dim=-1)
+        # Prepare beam search scorer
+        beam_scorer = BeamSearchScorer(
+            batch_size=1,
+            num_beams=num_beams,
+            device=(dist.get_world_size()-1),
+            length_penalty=1.0,
+            do_early_stopping=True,
+        )
 
-        # Stop if all beams are done
-        if early_stopping and beam_scorer.is_done:
-            break
+        eos_token_id = tokenizer.eos_token_id
+        if not torch.is_tensor(eos_token_id):
+            eos_token_id = torch.tensor(eos_token_id, device=(dist.get_world_size()-1))
 
-    # Finalize beam search
-    sequences = beam_scorer.finalize(
-        input_ids=input_ids,
-        next_token_scores=next_token_scores,
-        next_tokens=next_token_scores.argmax(dim=-1),
-        next_indices=torch.arange(batch_size * num_beams, device=deepspeed_model.device),
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-    )["sequences"]
+        # Initialize logits processors
+        logits_processor = LogitsProcessorList([
+            MinLengthLogitsProcessor(min_length, eos_token_id=eos_token_id),
+            NoRepeatNGramLogitsProcessor(no_repeat_ngram_size),
+        ])
 
-    # Decode sequences into text
-    return tokenizer.batch_decode(sequences, skip_special_tokens=True)
+        # Expand input_ids for beam search
+        input_ids = input_ids.unsqueeze(1).expand(-1, num_beams, -1).contiguous().view(num_beams, -1)
+        input_ids = input_ids.to(device=(dist.get_world_size() - 1))  # Move to the correct device
+        # print("DEBUG: input_ids.shape:", input_ids.shape)
+        beam_scores = torch.zeros((1, num_beams), device=(dist.get_world_size() -1))
+        beam_scores[:, 1:] = -1e9  # Set initial scores for beams other than the first to a very low value
+        beam_scores = beam_scores.view(-1)
 
+        # Autoregressive decoding loop
+        for step in range(max_length):
+            # Prepare inputs for eval_batch()
+            inputs = ((single_pixel_values, input_ids), None)  # Pass pixel_values and input_ids
+            # print("DEBUG: Before eval_batch.")
+            # single_sample_iter = SingleSampleIterator(inputs)
+            single_sample_iter = itertools.repeat(inputs)
+            outputs = model.eval_batch(data_iter=single_sample_iter, return_logits=True, bcast_loss=False, compute_loss=False)
+            # print("DEBUG: After eval_batch." )
+
+            if model.is_last_stage():
+                logits = outputs[1]  # Extract logits from the outputs
+
+                # Apply temperature scaling
+                next_token_logits = logits[:, -1, :] / temperature  # Scale logits by temperature
+
+                # Reshape logits for beam search
+                next_token_scores = F.log_softmax(next_token_logits, dim=-1)  # Apply log softmax
+                next_token_scores = next_token_scores + beam_scores[:, None]  # Add beam scores
+                next_token_scores = next_token_scores.to(device=(dist.get_world_size()-1))  # Ensure scores are on the correct device
+
+                # Apply logits processors
+                next_token_scores = logits_processor(input_ids, next_token_scores)
+
+                # Flatten to 1D for topk
+                flat_scores = next_token_scores.view(-1)
+                topk_scores, topk_tokens = torch.topk(flat_scores, 2 * num_beams, dim=0, largest=True, sorted=True)
+                topk_indices = topk_tokens // tokenizer.vocab_size
+                topk_next_tokens = topk_tokens % tokenizer.vocab_size
+
+                # Ensure all are 1D tensors
+                assert topk_scores.dim() == 1
+                assert topk_next_tokens.dim() == 1
+                assert topk_indices.dim() == 1
+
+                # print("DEBUG shapes:",
+                #     "next_token_scores:", next_token_scores.shape,
+                #     "topk_next_tokens:", topk_next_tokens.shape,
+                #     "topk_indices:", topk_indices.shape)
+                
+                final_beam_scores = topk_scores
+                final_beam_tokens = topk_next_tokens
+                final_beam_indices = topk_indices
+
+                beam_scorer.process(input_ids, 
+                                    topk_scores[:num_beams].unsqueeze(0), 
+                                    topk_next_tokens[:num_beams].unsqueeze(0), 
+                                    topk_indices[:num_beams].unsqueeze(0))
+
+                # Prepare for the next step
+                input_ids = torch.cat([input_ids[topk_indices[:num_beams]], topk_next_tokens[:num_beams].unsqueeze(-1)], dim=-1)
+
+
+                # Check if all sequences are finished
+                if beam_scorer.is_done:
+                    print("DEBUG: All sequences are done.")
+                    break
+
+        if model.is_last_stage():
+            # truncate inputs if we generate max_length+1
+            if input_ids.shape[1] > max_length:
+                input_ids = input_ids[:, :max_length]
+
+            if input_ids.shape[0] != 1:
+                input_ids = input_ids[:1]
+
+            # Expand input_ids to match the expected shape
+            expanded_input_ids = input_ids.expand(num_beams, -1)
+
+            # print("DEBUG: expanded_input_ids shape:", expanded_input_ids.shape)
+            # print("DEBUG: final_beam_scores shape:", final_beam_scores[:num_beams].shape)
+            # print("DEBUG: final_beam_tokens shape:", final_beam_tokens[:num_beams].unsqueeze(0).shape)
+            # print("DEBUG: final_beam_indices shape:", final_beam_indices[:num_beams].unsqueeze(0).shape)
+            
+            sequences_dict = beam_scorer.finalize(
+                expanded_input_ids,
+                final_beam_scores[:num_beams],
+                final_beam_tokens[:num_beams].unsqueeze(0),
+                final_beam_indices[:num_beams].unsqueeze(0),
+                max_length
+            )
+            sequences = sequences_dict['sequences']
+
+            decoded_sequence = tokenizer.decode(sequences[0], skip_special_tokens=True)
+            decoded_sequences.append(decoded_sequence)
+
+    return decoded_sequences
+
+dist.barrier()
 ##################################################
 # Testing Loop and qualitative report generation
 # TODO: Report should include Experiment Parameters, Train/Val/Test Average Loss,
@@ -723,144 +767,100 @@ def beam_decode_batch(
 # TODO: Also gererate .csv files, one for global (aggregate) results, and one for per instance
 if args.do_test:
 
-    # gen_kwargs = {
-    #     "min_length": args.min_caption_length,
-    #     "max_length": args.max_caption_length,
-    #     "num_beams": args.num_beams,
-    #     "no_repeat_ngram_size": args.no_repeat_ngram_size,
-    #     "early_stopping": True,  
-    #     "use_cache": False,
-    #     "pad_token_id": tokenizer.eos_token_id
-    #     }
+    deep_speed_model_engine.destroy()
 
-    # Resume from checkpoint if specified
-    # TODO: needs to be tested
-    # checkpoint_path = os.path.join(experiment_output_dir, "checkpoints")
-    # deep_speed_model_engine.load_checkpoint(checkpoint_path, tag=f"epoch_{args.resume_from_checkpoint}")
+    ds_config = {
+        "train_micro_batch_size_per_gpu": args.batch_size // args.num_gpus,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "steps_per_print": args.steps_per_print,
+        "zero_optimization": { "stage": 0 },
+        "fp16": { "enabled": args.fp16_enabled, "auto_cast": args.fp16_autocast, },
+        "pipeline_parallel_size": dist.get_world_size()
+    }
 
-    # checkpoint_path = os.path.join(experiment_output_dir, "checkpoints")
-    # checkpoint_dict = {
-    #     "type": "ds_model",
-    #     "version": 0.0,
-    #     "checkpoints": tuple(f"{checkpoint_path}/epoch_{args.num_epochs-1}/mp_rank_{i:02d}_model_states.pt" for i in range(dist.get_world_size()))
-    # }
+    # Initialize DeepSpeed
+    deep_speed_model_engine, _, _, _ = deepspeed.initialize(
+        model=hf_model,
+        training_data=test_dataset,
+        config=ds_config,
+        dist_init_required=False,
+    )
 
-
-    # # [rank2]: AssertionError: Cannot provide deprecated parameter 'mp_size' and replacing parameter 'tensor_parallel.tp_size' together
-    # # "tensor_parallel": {"enabled": True, "tp_size": dist.get_world_size()},
-    # ds_inference_engine = deepspeed.init_inference(
-    #     model=hf_model,
-    #     checkpoint=checkpoint_dict, 
-    #     config={
-    #         "dtype": "fp16",
-    #         "zero": {"stage": args.zero_stage},
-    #         "mp_size": dist.get_world_size(),
-    #     },
-    # )
+    # Resume from last checkpoint
+    checkpoint_path = os.path.join(experiment_output_dir, "checkpoints")
+    deep_speed_model_engine.load_checkpoint(experiment_output_dir, tag=f"epoch_{args.num_epochs-1}")
 
     deep_speed_model_engine.eval()
-
-    check_environment()
-
-    # TODO: Reinstantiate the model from the last checkpoint of this experiment
-    # currenlty just reusing the alreading instatiated deep_speed_model_engine
-    # we need to decouple so inference can be run independently of training
 
     test_iter = iter(RepeatingLoader(test_dataloader))
     num_test_batches = len(test_dataset) // (ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size())
 
-    # TODO: Setup lists and functions for NLP metrics HERE
     total_test_loss = 0.0
-    predicted_captions = []
+    for step in range(num_test_batches):
+        
+        # if deep_speed_model_engine.is_last_stage():
 
-    # for step in range(num_test_batches):
-    for step,batch in enumerate(test_dataloader):
+        # logits here is the output of greedy search decoding
+        # loss, logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True)
+        if args.num_beams > 1:
+            predicted_captions = beam_decode_batch(
+                data_iter=test_iter,
+                model=deep_speed_model_engine,
+                tokenizer=tokenizer,
+                num_beams=args.num_beams,
+                max_length=args.max_caption_length,
+                temperature=args.temperature,
+            )
+        else: 
 
+            # do greedy search decoding
+            loss,logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True, bcast_loss=True, compute_loss=True)
+            total_test_loss += loss.item()
+            # logits = logits[0]  # Extract logits from the outputs
 
+            # print("DEBUG: len(logits) :", len(logits))
+            # print("DEBUG: logits type:", type(logits))
+            # print("DEBUG: Logits[0] type:", type(logits[0]))
+            # print("DEBUG: Logits[1] type:", type(logits[1]))
+            # print("DEBUG: Logits[0] shape:", logits[0].shape)
+            # print("DEBUG: Logits[1] shape:", logits[1].shape)
 
-        # print("DEBUG type(batch):", type(batch))
-        # if isinstance(batch, (list, tuple)):
-        #     print("DEBUG len(batch):", len(batch))
-        #     print("DEBUG type(batch[0]):", type(batch[0]))
-        #     if isinstance(batch[0], (tuple, list)):
-        #         print("DEBUG type(batch[0][0]):", type(batch[0][0]))
-        #         print("DEBUG batch[0][0].shape:", batch[0][0].shape)
-        #     elif isinstance(batch[0], torch.Tensor):
-        #         print("DEBUG batch[0].shape:", batch[0].shape)
-        # import sys
-        # sys.exit()
+            # token_indices = torch.argmax(logits[1], dim=-1)
+            # print("DEBUG: Token shape:", token_indices.shape)
+            # print("DEBUG: Token indices:", token_indices)
 
-        # inputs = {} # {idx1: (pixel_values, labels), idx2: (pixel_values, labels), ...}
-        # print(batch)
-        # for i in batch: 
-        dist.barrier()
-        if dist.get_rank() == (dist.get_world_size() - 1):
-            # inputs = {}
-            # inputs["pixel_values"] = batch[0][0].to(device) # (B, T, C, H, W)
-            # inputs["labels"] = batch[0][1].to(device)
+            if deep_speed_model_engine.is_last_stage():
+                predicted_captions = tokenizer.batch_decode(torch.argmax(logits[1], dim=-1), skip_special_tokens=True)
 
-            # Convert batch to dictionary with idx as key and pixel_values as the values
-            # batch = {idx: (pixel_values, labels) for idex, (pixel_values, labels) in enumerate()}
+                # logits = logits[1]  # Extract logits from the outputs
+                # predicted_captions = tokenizer.batch_decode(torch.argmax(logits, dim=-1), skip_special_tokens=True)
 
-            # if ds_inference_engine.is_last_stage():
-            if True:
-                # logits will be a list of samples: [(1024, 50257), ...]
-                loss, logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True)
-                # tokens = ds_inference_engine.module.generate(**inputs, **gen_kwargs)
-                # total_test_loss += loss.item()
-            
-                # print("DEBUG type(logits):", type(logits))
-                # print("DEBUG len(logits):", len(logits))
-                # print("DEBUG type(logits[0]):", type(logits[0]))
-                # print("DEBUG type(logits[1]):", type(logits[1]))
-                # print("DEBUG logits[0].shape:", logits[0].shape)
-                # print("DEBUG logits[1].shape:", logits[1].shape)
-                # print("DEBUG torch.equal(logits[0], logits[1]):", torch.equal(logits[0], logits[1]))
-                # suppose `logits` is your (B, T, V) tensor of raw scores
+        # Right here, do beam_search, min/max length, no repeat ngram size, etc...
+        # during generation, then convert logits to text, and keep track of loss
+        # predicted_capptions = beam_decode_batch(logits, model, tokenizer....)
 
-                # 1. pick tokens greedily
-                # ids = logits.argmax(dim=-1) # (B, T)
-                # 2. optionally strip after EOS
-                # eos = tokenizer.eos_token_id
-                # captions = []
-                # for seq in ids.tolist():
-                # if eos in seq:
-                # seq = seq[: seq.index(eos)]
-                # captions.append(seq)
+        # greedy or best decoding
+        if deep_speed_model_engine.is_last_stage():
+             print(f"DEBUG: Predicted captions: {predicted_captions}")
 
-                # 3. decode to English
-                # texts = tokenizer.batch_decode(captions, skip_special_tokens=True)
+        # total_test_loss += loss.item()
 
-                # TODO: add loss, logits to lists, and call any functions like perplexity
-                # predicted_captions = tokenizer.batch_decode(tokens, skip_special_tokens=True)
-                # predicted = beam_decode_batch(
-                #     deepspeed_model=deep_speed_model_engine,
-                #     tokenizer=tokenizer,
-                #     batch=batch,
-                #     num_beams=args.num_beams,
-                #     max_length=args.max_caption_length,
-                #     min_length=args.min_caption_length,
-                #     early_stopping=True,
-                #     temperature=1.0,
-                #     no_repeat_ngram_size=args.no_repeat_ngram_size
-                # )
-                # predicted_captions.extend(predicted)
+        # else:
+            # loss = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=False)
 
-                print(f"Test step: {step} predicted: {predicted}")
-            else:
-                loss = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=False)
-
-            # if deep_speed_model_engine.is_last_stage() and i % ds_config['steps_per_print'] == 0:
-                # print(f"Test Batch Loss Step {i+1}/{num_test_batches}, Loss: {loss.item():.4f}" )
-                # wandb.log({"Exp/Test Batch Loss": loss.item()})
+        # if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
+        #     print(f"Test Batch Loss Step {step+1}/{num_test_batches}, Loss: {loss.item():.4f}" )
+        #     wandb.log({"Exp/Test Batch Loss": loss.item()})
 
     # if dist.get_rank() == (dist.get_world_size() - 1):
-        # test_loss = total_test_loss / num_test_batches
-        # print(f"Test Average Epoch {epoch} Loss: {test_loss}")
-        # wandb.log({"Exp/Test Average Loss": test_loss})
-        # TODO: setup qualitative reporting
-        # call generate_report() get qualitative results
-        # be sure to save copy of all results (complete report) to experiment_output_dir
+    #     test_loss = total_test_loss / num_test_batches
+    #     print(f"Test Average Loss: {test_loss}")
+    #     wandb.log({"Exp/Test Average Loss": test_loss})
+    
+    # TODO: setup qualitative reporting
+    # call get_qualitiative_results() to get qualitative results
+
+dist.barrier()
 
 if dist.get_rank() == (dist.get_world_size() - 1):
     wandb.finish()

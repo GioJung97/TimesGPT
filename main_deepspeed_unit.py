@@ -42,6 +42,44 @@ from torch.optim import AdamW
 from deepspeed.pipe import PipelineModule
 from deepspeed.utils import RepeatingLoader
 from torchinfo import summary
+import socket
+
+def check_environment():
+    """Check distributed environment variables and setup"""
+    
+    print("ENVIRONMENT VARIABLES CHECK")
+    print("="*59)
+    
+    # Check required environment variables
+    required_vars = [
+        'MASTER_ADDR', 'MASTER_PORT', 'WORLD_SIZE', 'RANK',
+        'LOCAL_RANK', 'CUDA_VISIBLE_DEVICES'
+    ]
+    
+    for var in required_vars:
+        value = os.environ.get(var, 'NOT SET')
+        status = "✓" if value != 'NOT SET' else "✗"
+        print(f"{status} {var}: {value}")
+    
+    # Network connectivity check
+    master_addr = os.environ.get('MASTER_ADDR')
+    master_port = os.environ.get('MASTER_PORT')
+    
+    if master_addr and master_port:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(4)
+            result = sock.connect_ex((master_addr, int(master_port)))
+            sock.close()
+            
+            if result == -1:
+                print(f"✓ Network connectivity to {master_addr}:{master_port}: GOOD")
+            else:
+                print(f"✗ Network connectivity to {master_addr}:{master_port}: FAILED")
+        except Exception as e:
+            print(f"✗ Network check error: {e}")
+    
+    print("="*59)
 
 # Load pretrained components
 pre_trained_video_encoder = "facebook/timesformer-base-finetuned-k600"
@@ -53,10 +91,10 @@ config_encoder = TimesformerConfig.from_pretrained(pre_trained_video_encoder)
 config_decoder = GPT2Config.from_pretrained(pre_trained_text_decoder)
 
 # factors of 768 - 3 6 12 24 48 96 192 384
-config_encoder.num_hidden_layers = 3
-config_encoder.num_attention_heads = 3
-config_decoder.n_layer = 3
-config_decoder.n_head = 3
+config_encoder.num_hidden_layers = 12
+config_encoder.num_attention_heads = 12
+config_decoder.n_layer = 12
+config_decoder.n_head = 12
 
 
 # Create combined config and model
@@ -105,7 +143,7 @@ class NPZDataset(Dataset):
         # returns a tuple of ((8,3,224,224), (1,1024))
 
 num_captions = 10
-subsample_size = 0.001
+subsample_size = 1.0
 world_size = 3
 local_rank = None
 train_data_dir = ""
@@ -122,6 +160,7 @@ experiment_name = f"placeholder"
 deepspeed.init_distributed()
 local_rank = dist.get_rank()
 
+check_environment()
 if local_rank == (world_size - 1):
     wandb.init(
         project="nairr",
@@ -344,15 +383,20 @@ test_iter = iter(RepeatingLoader(test_dataloader))
 num_test_batches = len(test_dataset) // ( ds_config['train_micro_batch_size_per_gpu'] * ds_config['gradient_accumulation_steps'])
 
 total_test_loss = 0.0
+predicted_captions = []
 for step in range(num_test_batches):
     if deep_speed_model_engine.is_last_stage():
         loss, logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True)
         total_test_loss += loss.item()
+        captions = tokenizer.batch_decode(torch.argmax(logits, dim=-1), skip_special_tokens=True)
+        print("DEBUG some captions:", captions[:5])
+        predicted_captions.extend(captions)
     else:
         loss = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=False)
 
     if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
         print(f"Test Batch Loss Step {step+1}/{num_test_batches}, Loss: {loss.item():.4f}" )
+        print("Last 15 Predicted Captions:", predicted_captions[-15:])  # Print last 5 predictions
         wandb.log({"Exp/Test Batch Loss": loss.item()})
   
 if local_rank == (world_size - 1):
