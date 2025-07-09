@@ -78,14 +78,11 @@ parser.add_argument('-frz', '--freeze_encoder_decoder', action='store_true', hel
 parser.add_argument('-ss', '--subsample_size', default=1.0, type=float, help="Data subsample percentage (default: 1.0)")
 parser.add_argument('--num_captions', type=int, default=10, help="Number of captions to use per video (default: 10)")
 parser.add_argument('--num_gpus', type=int, default=2, help="Number of GPUs")
-parser.add_argument('--num_beams', type=int, default=3, help="Number of Beams (default: 3)")
 parser.add_argument('--no_repeat_ngram_size', type=int, default=3, help="No repease ngram size. (default: 3)")
 parser.add_argument('--max_caption_length', type=int, default=50, help="Max size caption to generate. (default: 50)")
 parser.add_argument('--min_caption_length', type=int, default=10, help="Min size caption to generate. (default: 10)")
 parser.add_argument('--gradient_accumulation_steps', type=int, default=2, help="Gradient accumulation steps. (default: 1)")
 parser.add_argument('--steps_per_print', type=int, default=50, help="How often to print loss output to console and wandb. (default: 50)")
-parser.add_argument('--top_k', type=int, default=20, help="Top K number of samples during top_k decoding. (default: 10)")
-parser.add_argument('--top_p', type=float, default=0.95, help="Top P threshold of sum of top K probabilities for nucleas sampling. (default: 0.9)")
 parser.add_argument('--temperature', type=float, default=0.7, help="Temperature for sampling. (default: 0.7)")
 parser.add_argument('--zero_stage', type=int, default=1, help="ZeRO stage to use (0 disables, 1, 2 or 3). (default: 1)")
 parser.add_argument('--do_train', action="store_true", help="Run training phase")
@@ -96,7 +93,11 @@ parser.add_argument('--disable_tied_weights', action='store_true', help="Disable
 parser.add_argument('--fp16_enabled', action='store_true', help="Enable fp16 everywhere")
 parser.add_argument('--fp16_autocast', action='store_true', help="Enable fp16 autocasting")
 parser.add_argument('--early_stopping', action='store_true', help="Enable early stopping during generation")
-parser.add_argument('--greedy_decoding', action='store_true', help="Whether to enable greedy decoding or not during generation")
+parser.add_argument('--direct_decoding', action='store_true', help="Whether to decode captions directly from logits -- mutually exclusive with other decoding methods")
+parser.add_argument('--greedy_decoding', action='store_true', help="Whether to enable greedy decoding or not during generation -- mutually exclusive with other decoding methods")
+parser.add_argument('--top_k', type=int, default=20, help="Top K number of samples during top_k decoding. (default: 10)")
+parser.add_argument('--top_p', type=float, default=0.95, help="Top P threshold of sum of top K probabilities for nucleas sampling. (default: 0.9)")
+parser.add_argument('--num_beams', type=int, default=3, help="Number of Beams (default: 3)")
 parser.add_argument('-rs', '--random_seed', type=int, default=42, help="Random seed for subset. (default: 42)")
 parser.add_argument('-ql', '--num_qualitative', type=int, default=100, help="Number of qualitative results to run (0 disables) (default: 100)")
 parser.add_argument('-dd', '--data_dir', default=pathlib.Path('./data_dir/'), type=lambda p: pathlib.Path(p).resolve(strict=True),  help="Directory for input data")
@@ -144,10 +145,6 @@ def check_environment():
 # Initialize distributed environment
 # if not dist.is_initialized():
 deepspeed.init_distributed()
-
-# local_rank = dist.get_rank()
-# world_size = dist.get_world_size()
-# device = torch.device("cuda", dist.get_rank())
 
 # Set seeds
 random.seed(args.random_seed)
@@ -253,7 +250,7 @@ config_decoder.add_cross_attention = True
 config_decoder.is_decoder = True
 config_decoder.use_cache = False # set to True to be sliding attention window, set to False to make sure we get an error if we exceed our contenxt length
 
-# # Set some config params on the decoder before using it
+# Set some config params on the decoder before using it
 config_decoder.max_length = args.max_caption_length
 config_decoder.min_length = args.min_caption_length
 config_decoder.num_beams = args.num_beams
@@ -262,15 +259,6 @@ config_decoder.early_stopping = args.early_stopping
 config_decoder.pad_token_id = tokenizer.eos_token_id
 config_decoder.bos_token_id = tokenizer.bos_token_id
 config_decoder.eos_token_id = tokenizer.eos_token_id
-
-# print("DEBUG tokenizer.pad_token:", tokenizer.pad_token)
-# print("DEBUG tokenizer.pad_token_id:", tokenizer.pad_token_id)
-# print("DEBUG tokenizer.eos_token:", tokenizer.eos_token)
-# print("DEBUG tokenizer.eos_token_id:", tokenizer.eos_token_id)
-# print("DEBUG tokenizer.bos_token:", tokenizer.bos_token)
-# print("DEBUG tokenizer.bos_token_id:", tokenizer.bos_token_id)
-# print("DEBUG config_encoder:", config_encoder)
-# print("DEBUG config_decoder:", config_decoder)
 
 # Create combined config and model
 combined_config = VisionEncoderDecoderConfig.from_encoder_decoder_configs(
@@ -286,21 +274,13 @@ elif args.pretrained_model is not None:
     hf_model = VisionEncoderDecoderModel.from_pretrained(args.pretrained_model)
 else:
     hf_model = VisionEncoderDecoderModel(combined_config)
-    # print("ERROR: Must specify either --fresh_weights or --pretrained_model")
-    # sys.exit()
 
 hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
-# hf_model.config.pad_token_id = tokenizer.eos_token_id
 hf_model.config.eos_token_id = tokenizer.eos_token_id
 hf_model.config.max_length = args.max_caption_length
 hf_model.config.num_beams = args.num_beams
 hf_model.config.early_stopping = args.early_stopping
 hf_model.config.tie_word_embeddings = True
-# print("DEBUG hf_model.config:", hf_model.config)
-
-
-# TODO: pretty print the model aritecture before pipeline conversion
-# print(f"INFO: Model architecture:\n{hf_model}\n")
 
 # Dataset class
 class NPZDataset(Dataset):
@@ -373,6 +353,9 @@ val_dataloader = DataLoader(val_dataset, sampler=val_sampler, batch_size=args.ba
 test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), args.num_captions, args.subsample_size)
 test_sampler = DistributedSampler(test_dataset, num_replicas=args.num_gpus, rank=dist.get_rank(), shuffle=False)
 test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size//dist.get_world_size(), collate_fn=default_collate, drop_last=True)
+
+# our dataloader generates batches of ((pixel_values, labels), labels)
+# for a batch size of three it would be [((pixel_values_1, labels_1), labels_1), ((pixel_values_2, labels_2), labels_2), ((pixel_values_3, labels_3), labels_3)]
 
 # SANITY CHECK DATALOADER
 # TODO: Turn into feature
@@ -557,6 +540,7 @@ if args.freeze_encoder_decoder:
 
 # Convert to pipeline 
 blocks = to_pipeline_blocks(hf_model)
+# TODO: use the tied weights version and compare to non-tied weights version
 # blocks = to_pipeline_blocks_with_tied_weights(hf_model)
 
 # loss_fn=torch.nn.CrossEntropyLoss(),
@@ -589,8 +573,6 @@ deep_speed_model_engine, optimizer, train_dataloader, scheduler  = deepspeed.ini
 if args.resume_from_checkpoint is not None:
     checkpoint_path = os.path.join(experiment_output_dir, "checkpoints")
     deep_speed_model_engine.load_checkpoint(checkpoint_path, tag=f"epoch_{args.resume_from_checkpoint}")
-
-   
 
 ##################################################
 # Training loop with validation after each epoch
@@ -667,13 +649,7 @@ if args.do_train:
     # Destroy deepspeed model engine to free up GPU memory
     # deep_speed_model_engine.destroy()
 
-# our dataloader generates batches of ((pixel_values, labels), labels)
-# for a batch size of three it would be [((pixel_values_1, labels_1), labels_1), ((pixel_values_2, labels_2), labels_2), ((pixel_values_3, labels_3), labels_3)]
-
-
-# TODO: Do a shell escape here and convert the last checkpoint to a universal checkpoint
-# Example that worked: (/home/907308160/code/nairr/.conda) 907308160@srv-hh-306-133:/data2/juve/training_artifacts/placeholder_v2/checkpoints$ python /home/907308160/code/nairr/DeepSpeed/deepspeed/checkpoint/ds_to_universal.py --input_folder ./epoch_5/ --output_folder ./universal/ --inject_missing_state
-
+# Convert the last checkpoint to a universal checkpoint
 if args.create_universal:
     # Convert to universal checkpoint
     script_path = "./DeepSpeed/deepspeed/checkpoint/ds_to_universal.py"
@@ -941,71 +917,49 @@ if args.do_test:
     deep_speed_model_engine.eval()
 
     test_iter = iter(RepeatingLoader(test_dataloader))
-    # print("DEBUG: test_iter[0][0].shape:", next(test_iter)[0][0].shape)
-    # print("DEBUG: test_iter[0][1].shape:", next(test_iter)[0][1].shape)
-    # print("DEBUG: test_iter[1][0].shape:", next(test_iter)[1][0].shape)
-
     num_test_batches = len(test_dataset) // (ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size())
-    # print("DEBUG : num test_dataset size:", len(test_dataset))
-    # print("DEBUG : num_test_batches:", num_test_batches)
 
+    #############################################################
+    # Decoding strategies:
+    # direct decoding - means non-autoregressive decoding (argmax(softmax(logits)))
+    # greedy decoding - means autoregressing, but only considering the single best next word
+    # topk top p decoding - is another sampling method that is more diverse than greedy decoding (topk=1 should be equivalent to greedy decoding)
+    # beam search decoding - is a more complex sampling method that considers multiple beams of next words
     total_test_loss = 0.0
     for step in range(num_test_batches):
         if args.num_beams > 1:
-
+            #############################################################
+            # BEAM DECODING
+            #############################################################
             batch = next(test_iter)
             pixel_values = batch[0][0]
             labels = batch[0][1]
             
-            predicted_captions = beam_decode_batch(
-                deep_speed_model_engine, 
-                pixel_values, 
-                labels, 
-                tokenizer, 
-                args
-            )
+            predicted_captions = beam_decode_batch( deep_speed_model_engine, pixel_values, labels, tokenizer, args)
             
             if deep_speed_model_engine.is_last_stage():
                 print(f"DEBUG: beam search predicted_captions: {predicted_captions}")
-
-        elif args.greedy_decoding: 
+        elif args.direct_decoding: 
+            #############################################################
+            # DIRECT DECODING 
+            #############################################################
             loss,logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True, bcast_loss=True, compute_loss=True)
             total_test_loss += loss.item()
 
             if deep_speed_model_engine.is_last_stage():
-                # print("DEBUG: len(loss) :", len(loss))
-                # print("DEBUG: type(loss) :", type(loss))
-                # print("DEBUG: loss.shape :", loss.shape)
-                # print("DEBUG: len(logits) :", len(logits))
-                # print("DEBUG: logits type:", type(logits))
-                # print("DEBUG: logits.shape :", logits.shape)
-                # print("DEBUG: Logits[0] type:", type(logits[0]))
-                # print("DEBUG: Logits[1] type:", type(logits[1]))
-
+                # TODO: make sure subindex 0 still makes sense on next line in more than 1 in batch context
                 probs = F.softmax(logits[0], dim=-1)  # Apply softmax to get probabilities
                 tokens = torch.argmax(probs, dim=-1)  # Get the predicted token indices
 
-                # print("DEBUG: tokens shape:", tokens.shape)
-                # print("DEBUG: Logits[1] shape:", logits[1].shape)
-                # print("DEBUG: tokens:", tokens)
-                # print("DEBUG: Logits[1][0:2,0:20]:", logits[1][0:2,0:20])
-
-                # token_indices = torch.argmax(logits[1], dim=-1)
-                # print("DEBUG: Token shape:", token_indices.shape)
-                # print("DEBUG: Token indices:", token_indices)
-
-            if deep_speed_model_engine.is_last_stage():
                 if tokenizer.eos_token_id in tokens:
                     tokens = list(tokens.cpu().numpy())
                     tokens = tokens[:tokens.index(tokenizer.eos_token_id)]  # Truncate at <eos> token
-                # predicted_captions = tokenizer.batch_decode(torch.argmax(logits[0], dim=-1), skip_special_tokens=False)
                 predicted_captions = tokenizer.decode(tokens, skip_special_tokens=True)
-                # logits = logits[1]  # Extract logits from the outputs
-                # predicted_captions = tokenizer.batch_decode(torch.argmax(logits, dim=-1), skip_special_tokens=True)
 
-        elif not args.greedy_decoding and (args.top_k is not None and args.top_p is not None):
-            # Do the topk_topp_deocding
-
+        elif not args.direct_decoding and (args.top_k is not None and args.top_p is not None):
+            #############################################################
+            # topk_topp_deocding
+            #############################################################
             batch = next(test_iter)
             predicted_captions = []
 
@@ -1014,46 +968,7 @@ if args.do_test:
             labels = batch[0][1]  # (1, 1024)
 
             tokens = torch.tensor([[tokenizer.encode("<|endoftext|>")]]).to(pixel_values.device)  # Start with <eos> token
-            # print("DEBUG: tokens.shape before:", tokens.shape) # (1, 1)
             tokens = F.pad(tokens, (0, 1023), "constant", 0).squeeze(0)  # Pad to max caption length
-            # print("DEBUG: tokens.shape after:", tokens.shape) # (1, 1024)
-            # tokens = torch.tensor(torch.ones_like(labels) * tokenizer.eos_token_id).to(pixel_values.device)  # Initialize with <bos> token
-            # (1, 1024), padded with eos
-
-
-            # outputs = []
-
-            # #     if tokenizer.eos_token_id in tokens:
-            # #         tokens = list(tokens.cpu().numpy())
-            # #         tokens = tokens[:tokens.index(tokenizer.eos_token_id)]  # Truncate at <eos> token
-
-            # for _ in range(args.max_caption_length):
-            #     inputs = iter(RepeatingLoader([((pixel_values, tokens), labels)]))
-                
-            #     # debug_sample = next(inputs)
-            #     # print("DEBUG: debug_sample[0][0].shape:", debug_sample[0][0].shape)
-            #     # print("DEBUG: debug_sample[0][1].shape:", debug_sample[0][1].shape)
-            #     # print("DEBUG: debug_sample[1][0].shape:", debug_sample[1][0].shape)
-
-            #     loss, logits = deep_speed_model_engine.eval_batch(data_iter=inputs, return_logits=True, bcast_loss=False, compute_loss=False)  # shape: (batch, seq_len, vocab)
-
-            #     if deep_speed_model_engine.is_last_stage():
-
-            #         decoded_tokens = tokenizer.decode(torch.argmax(torch.softmax(logits[0], dim=-1), dim=-1), skip_special_tokens=False)  # Get the predicted token indices
-            #         first_eos_token_index = decoded_tokens.index("<|endoftext|>")
-
-            #         next_token_logits = logits[:, -1]  # take the last step
-            #         next_token = topk_top_p_sampling( next_token_logits, top_k=args.top_k, top_p=args.top_p, temperature=args.temperature).to(pixel_values.device)
-            #         # print("DEBUG: next_token:", next_token)
-            #         # print("DEBUG: next_token.shape:", next_token.shape)
-            #         # print("DEBUG: tokens.shape:", tokens.shape)
-
-            #         tokens = torch.cat(([tokens[:, :first_eos_token_index], next_token.unsqueeze(0)]), dim=-1)
-            #         tokens = F.pad(tokens, (first_eos_token_index, 1023 - first_eos_token_index), "constant", tokenizer.eos_token_id)  # Pad to max caption length
-
-            #         next_token = next_token.item()
-            #         outputs.append(next_token)
-            #         print("DEBUG: outputs:", outputs)
 
             # Instead of modifying the input tokens, build the output sequence separately
             outputs = [tokenizer.encode("<|endoftext|>")[0]]  # Start with EOS token ID
@@ -1061,70 +976,31 @@ if args.do_test:
             for _ in range(args.max_caption_length):
                 # Create current input sequence - pad the growing output to 1024
                 current_tokens = torch.tensor(outputs + [0] * (1024 - len(outputs))).unsqueeze(0).to(pixel_values.device)
-                
                 inputs = iter(RepeatingLoader([((pixel_values, current_tokens), labels)]))
-                
                 loss, logits = deep_speed_model_engine.eval_batch(data_iter=inputs, return_logits=True, bcast_loss=False, compute_loss=False)
 
                 if deep_speed_model_engine.is_last_stage():
+                    # TODO: Not that logits[0, .......] two lines below may not be batch aware
                     # Get logits for the last actual token position (not padding)
                     next_token_logits = logits[0, len(outputs)-1, :]  # Position of last real token
-                    next_token = topk_top_p_sampling(
-                        next_token_logits.unsqueeze(0), 
-                        top_k=args.top_k, 
-                        top_p=args.top_p, 
-                        temperature=args.temperature
-                    ).item()
-                    
+                    next_token = topk_top_p_sampling( next_token_logits.unsqueeze(0), top_k=args.top_k, top_p=args.top_p, temperature=args.temperature).item()
                     outputs.append(next_token)
                     
                     # Stop if we generate EOS token
                     if next_token == tokenizer.eos_token_id:
                         break
-                        
                     print("DEBUG: outputs:", outputs)
 
             predicted_caption = tokenizer.decode(outputs[1:], skip_special_tokens=True)
-            # outputs_joined = "".join([str(token.item()) for token in outputs])
-            # predicted_caption = tokenizer.decode(outputs, skip_special_tokens=True)
             print("DEBUG: predicted_caption:", predicted_caption)
             predicted_captions.append(predicted_caption)
         else:
-            print("ERROR: Please specify a sampling strategy for decoding (e.g. --top_k, --top_p, --greedy_decoding)")
+            print("ERROR: Please specify a sampling strategy for decoding (e.g. --top_k, --top_p, --direct_decoding, --greedy_decoding, --num_beams > 1)")
             sys.exit(1)
 
-        # Right here, do beam_search, min/max length, no repeat ngram size, etc...
-        # during generation, then convert logits to text, and keep track of loss
-        # predicted_capptions = beam_decode_batch(logits, model, tokenizer....)
-
-        # Perform all_gather to collect predictions across all ranks
-        # gathered_predictions = [None] * dist.get_world_size()
-        # dist.all_gather_object(gathered_predictions, predicted_captions if deep_speed_model_engine.is_last_stage() else [])
-
-        # # Flatten the gathered predictions into a single list
-        # all_predictions = [pred for rank_preds in gathered_predictions for pred in rank_preds]
-
-        # greedy or best decoding
         if deep_speed_model_engine.is_last_stage():
              print(f"DEBUG: predicted_captions: {predicted_captions}")
-
-        # total_test_loss += loss.item()
-
-        # else:
-            # loss = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=False)
-
-        # if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
-        #     print(f"Test Batch Loss Step {step+1}/{num_test_batches}, Loss: {loss.item():.4f}" )
-        #     wandb.log({"Exp/Test Batch Loss": loss.item()})
-
-    # if dist.get_rank() == (dist.get_world_size() - 1):
-    #     test_loss = total_test_loss / num_test_batches
-    #     print(f"Test Average Loss: {test_loss}")
-    #     wandb.log({"Exp/Test Average Loss": test_loss})
     
-    # TODO: setup qualitative reporting
-    # call get_qualitiative_results() to get qualitative results
-
 dist.barrier()
 
 if dist.get_rank() == (dist.get_world_size() - 1):

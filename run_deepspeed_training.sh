@@ -49,7 +49,9 @@ deepspeed --master_addr $MASTER_ADDR --master_port $MASTER_PORT main_deepspeed.p
     --zero_stage $ZERO_STAGE \
     --fp16_enabled --early_stopping --no_repeat_ngram_size 3 \
     --do_test \
+    --resume_from_checkpoint 9 \
     --num_beams 1 \
-    --do_train --do_val \
-    --greedy_decoding \
-    # --resume_from_checkpoint 5 \
+    --direct_decoding \
+    # --top_k 1 --top_p 1.0 \
+    # --temperature 1.0 \
+    # --do_train --do_val \
