@@ -9,21 +9,21 @@ export MASTER_PORT=29500
 export NCCL_SOCKET_IFNAME=eno1
 
 ZERO_STAGE=1
-NUM_EPOCHS=3
+NUM_EPOCHS=10
 NUM_CAPTIONS=10
-SUBSET_SIZE=0.001
+SUBSET_SIZE=1.0
 
 NUM_HIDDEN_LAYERS=12
 HIDDEN_SIZE_ENCODER=768
 GRADIENT_ACCUMULATION_STEPS=4
 
-EXPERIMENT_NAME="placeholder"
+EXPERIMENT_NAME="VATEX"
 DATA_DIR="/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames"
 OUTPUT_DIR="/data2/juve/training_artifacts/"
 
 NUM_NODES=1   # Number of nodes
 NUM_GPU=3     # Number of GPUs per node
-MICRO_BATCH=4 # PER GPU
+MICRO_BATCH=1 # PER GPU
 
 WORLD_SIZE=$((NUM_NODES * NUM_GPU))
 BATCH_SIZE=$((WORLD_SIZE * MICRO_BATCH)) # Total batch size acrross all GPUs and nodes
@@ -47,8 +47,9 @@ deepspeed --master_addr $MASTER_ADDR --master_port $MASTER_PORT main_deepspeed.p
     --tokenizer $TOKENIZER --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
     --num_hidden_layers $NUM_HIDDEN_LAYERS --hidden_size_encoder $HIDDEN_SIZE_ENCODER \
     --zero_stage $ZERO_STAGE \
-    --fp16_enabled \
+    --fp16_enabled --early_stopping --no_repeat_ngram_size 3 \
     --do_test \
-    --num_beams 3 \
-    --resume_from_checkpoint 4 \
-    # --do_train --do_val \
+    --num_beams 1 \
+    --do_train --do_val \
+    --greedy_decoding \
+    # --resume_from_checkpoint 5 \
