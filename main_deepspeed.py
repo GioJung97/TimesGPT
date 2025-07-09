@@ -36,7 +36,7 @@ import torch.distributed as dist
 import deepspeed
 from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from torch.optim import AdamW
-from deepspeed.pipe import PipelineModule
+from deepspeed.pipe import PipelineModule, TiedLayerSpec
 from deepspeed.utils import RepeatingLoader
 
 # TODO: fix this import when adding the sanity check features
@@ -503,6 +503,38 @@ def to_pipeline_blocks(hf_model):
     blocks.append(FinalWrapper( hf_model.decoder.transformer.ln_f, hf_model.decoder.lm_head, tokenizer.eos_token_id))
     return blocks
 
+def to_pipeline_blocks_with_tied_weights(hf_model):
+    blocks = []
+    
+    # Encoder blocks (unchanged)
+    blocks.append(InputWrapper(hf_model.encoder.embeddings))
+    for enc_block in hf_model.encoder.encoder.layer:
+        blocks.append(EncBlockWrapper(enc_block))
+    
+    # Tied embedding layer
+    blocks.append(TiedLayerSpec(
+        'embeddings',
+        DecTokenEmbedWrapper,
+        hf_model.decoder.transformer.wte,
+        hf_model.decoder.transformer.wpe,
+        hf_model.decoder.transformer.drop,
+    ))
+    
+    # Decoder blocks
+    for dec_block in hf_model.decoder.transformer.h:
+        blocks.append(DecBlockWrapper(dec_block))
+    
+    # Tied output layer
+    blocks.append(TiedLayerSpec(
+        'embeddings',  # Same key as embedding layer
+        FinalWrapper,
+        hf_model.decoder.transformer.ln_f,
+        hf_model.decoder.lm_head,
+        tokenizer.eos_token_id,
+    ))
+    
+    return blocks
+
 def compute_loss(logits, labels):
     return F.cross_entropy(
         logits.view(-1, logits.size(-1)),
@@ -525,6 +557,7 @@ if args.freeze_encoder_decoder:
 
 # Convert to pipeline 
 blocks = to_pipeline_blocks(hf_model)
+# blocks = to_pipeline_blocks_with_tied_weights(hf_model)
 
 # loss_fn=torch.nn.CrossEntropyLoss(),
 hf_model = PipelineModule(
@@ -609,10 +642,13 @@ if args.do_train:
             total_val_loss = 0.0
             for step in range(num_val_batches):
                 loss, logits = deep_speed_model_engine.eval_batch(data_iter=val_iter,return_logits=True)
-               
+                # print(f"DEBUG: logits type: {type(logits)}, loss: {loss.item()}")
 
                 if deep_speed_model_engine.is_last_stage():
+                    # print(f"DEBUG: logits[0] type: {type(logits[0])}")
+                    # print(f"DEBUG: logits[0] shape: {logits[0].shape}")
                     probs = F.softmax(logits[0], dim=-1) 
+                    # print("DEBUG: probs shape:", probs.shape)
 
                     tokens = torch.argmax(probs, dim=-1)
                     sentence = tokenizer.decode(tokens, skip_special_tokens=True)
@@ -904,7 +940,7 @@ if args.do_test:
 
     deep_speed_model_engine.eval()
 
-    test_iter = iter(test_dataloader)
+    test_iter = iter(RepeatingLoader(test_dataloader))
     # print("DEBUG: test_iter[0][0].shape:", next(test_iter)[0][0].shape)
     # print("DEBUG: test_iter[0][1].shape:", next(test_iter)[0][1].shape)
     # print("DEBUG: test_iter[1][0].shape:", next(test_iter)[1][0].shape)
@@ -978,9 +1014,9 @@ if args.do_test:
             labels = batch[0][1]  # (1, 1024)
 
             tokens = torch.tensor([[tokenizer.encode("<|endoftext|>")]]).to(pixel_values.device)  # Start with <eos> token
-            print("DEBUG: tokens.shape before:", tokens.shape) # (1, 1)
+            # print("DEBUG: tokens.shape before:", tokens.shape) # (1, 1)
             tokens = F.pad(tokens, (0, 1023), "constant", 0).squeeze(0)  # Pad to max caption length
-            print("DEBUG: tokens.shape after:", tokens.shape) # (1, 1024)
+            # print("DEBUG: tokens.shape after:", tokens.shape) # (1, 1024)
             # tokens = torch.tensor(torch.ones_like(labels) * tokenizer.eos_token_id).to(pixel_values.device)  # Initialize with <bos> token
             # (1, 1024), padded with eos
 
