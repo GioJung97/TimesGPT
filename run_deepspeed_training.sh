@@ -52,6 +52,7 @@ deepspeed --master_addr $MASTER_ADDR --master_port $MASTER_PORT main_deepspeed.p
     --resume_from_checkpoint 9 \
     --num_beams 1 \
     --direct_decoding \
+    --calculate_nlp_metrics \
     # --top_k 1 --top_p 1.0 \
     # --temperature 1.0 \
     # --do_train --do_val \

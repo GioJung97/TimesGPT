@@ -38,6 +38,11 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from torch.optim import AdamW
 from deepspeed.pipe import PipelineModule, TiedLayerSpec
 from deepspeed.utils import RepeatingLoader
+from torcheval.metrics.text import BLEUScore, Perplexity, WordErrorRate, WordInformationLost, WordInformationPreserved
+from pycocoevalcap.meteor.meteor import Meteor
+from pycocoevalcap.rouge.rouge import Rouge
+from pycocoevalcap.cider.cider import Cider
+from pycocoevalcap.spice.spice import Spice
 
 # TODO: fix this import when adding the sanity check features
 # import main_deepspeed_utils as main_deepspeed_utils
@@ -88,6 +93,8 @@ parser.add_argument('--zero_stage', type=int, default=1, help="ZeRO stage to use
 parser.add_argument('--do_train', action="store_true", help="Run training phase")
 parser.add_argument('--do_val', action="store_true", help="Run validation phase")
 parser.add_argument('--do_test', action="store_true", help="Run test phase")
+parser.add_argument('--generate_qualitative_report', action="store_true", help="Generate qualitative report with sample captions and images")
+parser.add_argument('--calculate_nlp_metrics', action="store_true", help="Calculate NLP metrics for generated captions")
 parser.add_argument('--create_universal', action="store_true", help="Create a universal checkpoint? (Requires doing a shell escape.)")
 parser.add_argument('--disable_tied_weights', action='store_true', help="Disable weight tying between embeddings and LM head for pipeline compatibility")
 parser.add_argument('--fp16_enabled', action='store_true', help="Enable fp16 everywhere")
@@ -294,15 +301,15 @@ class NPZDataset(Dataset):
     def __len__(self):
         return int(self.total_captions * self.subsample_size)
     
-    def __get_filename_for_idx(self, idx):
+    def get_filename(self, idx):
         # Calculate the index of the file based on the number of captions
         filename_index = idx // self.num_caption
         return self.file_names[filename_index]
-
+    
     def __getitem__(self, idx):
         filename_index = idx // self.num_caption
         labels_offset = idx % self.num_caption  
-    
+
         file_path = os.path.join(self.data_dir, self.file_names[filename_index])
         data = np.load(file_path)
 
@@ -326,6 +333,10 @@ class NPZDataset(Dataset):
                 # If the tensor is already at max length, replace the last token with <eos>
                 label_tensor[-1] = eos_token_id
 
+        # Convert metadata to tensor - DeepSpeed requires all inputs to be tensors!
+        # Create a simple tensor with: [filename_index, caption_idx, sample_idx]
+        metadata_tensor = torch.tensor([filename_index, labels_offset, idx], dtype=torch.long)
+
         # TODO: Discover why we need a nested tuple with two sets of label_tensor
         # It appears that deepspeed engine is stripping off labels when passing samples
         # to our PipelineModule. But our model needs labels in the middle to calculate 
@@ -337,9 +348,37 @@ class NPZDataset(Dataset):
         # print(f"DEBUG: label_tensor: {label_tensor}")
         # print(f"DEBUG: tokenizer.decode(): {tokenizer.decode(label_tensor, skip_special_tokens=False)}")
         # sys.exit()
-        return ((pixel_values, label_tensor), label_tensor)
+        return ((pixel_values, label_tensor, metadata_tensor), label_tensor)
         # return pixel_values, label_tensor
         # returns a tuple of ((8,3,224,224), (1,1024))
+
+    def __repr__(self):
+        return f"NPZDataset(data_dir='{self.data_dir}', num_files={len(self.file_names)}, num_captions={self.num_caption}, total_samples={len(self)})"
+    
+    def get_sample_info(self, idx):
+        """Get filename and caption info for a specific sample index"""
+        filename_index = idx // self.num_caption
+        caption_num = idx % self.num_caption
+        return f"NPZ Filename: {self.file_names[filename_index]}, Caption Num: {caption_num}"
+
+    def get_gt_caption(self, idx):
+        """Get caption for a specific sample index"""
+        filename_index = idx // self.num_caption
+        caption_num = idx % self.num_caption
+        file_path = os.path.join(self.data_dir, self.file_names[filename_index])
+        data = np.load(file_path)
+        return tokenizer.decode(data['arr_1'][caption_num], skip_special_tokens=True)
+
+    def decode_metadata_tensor(self, metadata_tensor):
+        """Convert metadata tensor back to filename and info"""
+        filename_index = metadata_tensor[0].item()
+        caption_idx = metadata_tensor[1].item() 
+        sample_idx = metadata_tensor[2].item()
+        return {
+            'filename': self.file_names[filename_index],
+            'caption_idx': caption_idx,
+            'sample_idx': sample_idx
+        }
 
 # Create datasets and loaders
 train_dataset = NPZDataset(os.path.join(args.data_dir, 'train'), args.num_captions, args.subsample_size)
@@ -350,7 +389,8 @@ val_dataset = NPZDataset(os.path.join(args.data_dir, 'val'), args.num_captions, 
 val_sampler = DistributedSampler(val_dataset, num_replicas=args.num_gpus, rank=dist.get_rank(), shuffle=False)
 val_dataloader = DataLoader(val_dataset, sampler=val_sampler, batch_size=args.batch_size//dist.get_world_size(), collate_fn=default_collate, drop_last=True)
 
-test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), args.num_captions, args.subsample_size)
+# test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), args.num_captions, args.subsample_size)
+test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), args.num_captions, 0.01) # TODO: Change this back to args.subsample_size
 test_sampler = DistributedSampler(test_dataset, num_replicas=args.num_gpus, rank=dist.get_rank(), shuffle=False)
 test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size//dist.get_world_size(), collate_fn=default_collate, drop_last=True)
 
@@ -397,9 +437,9 @@ class InputWrapper(nn.Module):
         self.block = block
 
     def forward(self, inputs):
-        pixel_values, labels = inputs 
+        pixel_values, labels, metadata = inputs 
         hidden = self.block(pixel_values)
-        return hidden, labels 
+        return hidden, labels, metadata 
 
 class EncBlockWrapper(nn.Module):
     def __init__(self, block):
@@ -407,15 +447,15 @@ class EncBlockWrapper(nn.Module):
         self.block = block
 
     def forward(self, inputs):
-        hidden, labels = inputs
+        hidden, labels, metadata = inputs
         hidden = self.block(hidden)
-        return hidden[0], labels
+        return hidden[0], labels, metadata
 
 # Adapter between encoder and decoder
 class Adapter(nn.Module):
     def forward(self, inputs):
-        hidden, labels = inputs
-        return hidden, labels
+        hidden, labels, metadata = inputs
+        return hidden, labels, metadata
 
 # Token embedding wrapper
 class DecTokenEmbedWrapper(nn.Module):
@@ -427,14 +467,14 @@ class DecTokenEmbedWrapper(nn.Module):
         self.vocab_size = wte.num_embeddings
 
     def forward(self, inputs):
-        hidden, labels = inputs
+        hidden, labels, metadata = inputs
         batch_size = hidden.shape[0]
         seq_len = labels.shape[-1]
         pos_ids = torch.arange(seq_len, device=labels.device).unsqueeze(0).expand(batch_size, -1)
         token_embeddings = self.wte(labels)
         pos_embeddings = self.wpe(pos_ids)
         emb = self.drop(token_embeddings + pos_embeddings)
-        return hidden, emb, labels
+        return hidden, emb, labels, metadata
 
 class DecBlockWrapper(nn.Module):
     def __init__(self, block):
@@ -442,9 +482,9 @@ class DecBlockWrapper(nn.Module):
         self.block = block
         
     def forward(self, inputs):
-        hidden_in, token_emb, labels = inputs
+        hidden_in, token_emb, labels, metadata = inputs
         hidden_out = self.block(token_emb, encoder_hidden_states=hidden_in, use_cache=False,)
-        return hidden_in, hidden_out[0], labels
+        return hidden_in, hidden_out[0], labels, metadata
 
 # Final output layer
 class FinalWrapper(nn.Module):
@@ -455,7 +495,7 @@ class FinalWrapper(nn.Module):
         self.eos_token_id = eos_token_id
 
     def forward(self, inputs):
-        _, hidden, labels = inputs[0], inputs[1], inputs[2]
+        _, hidden, labels, metadata = inputs[0], inputs[1], inputs[2], inputs[3]
         hidden = self.ln(hidden)
         logits = self.head(hidden)
 
@@ -705,7 +745,6 @@ def beam_decode_batch(deep_speed_model_engine, pixel_values, labels, tokenizer, 
     Returns:
         List of predicted captions (strings)
     """
-    from transformers import BeamSearchScorer, LogitsProcessorList, NoRepeatNGramLogitsProcessor, MinLengthLogitsProcessor
     
     batch_size = pixel_values.shape[0]
     num_beams = args.num_beams
@@ -915,9 +954,12 @@ if args.do_test:
     # deep_speed_model_engine.load_checkpoint(checkpoint_path, tag=f"epoch_{args.num_epochs-1}")
 
     deep_speed_model_engine.eval()
-
     test_iter = iter(RepeatingLoader(test_dataloader))
     num_test_batches = len(test_dataset) // (ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size())
+
+    all_predicted_captions = []
+    all_ground_truth_captions = []
+    all_filenames = []
 
     #############################################################
     # Decoding strategies:
@@ -926,16 +968,33 @@ if args.do_test:
     # topk top p decoding - is another sampling method that is more diverse than greedy decoding (topk=1 should be equivalent to greedy decoding)
     # beam search decoding - is a more complex sampling method that considers multiple beams of next words
     total_test_loss = 0.0
+    ground_truth_captions = []
     for step in range(num_test_batches):
+
+
+
         if args.num_beams > 1:
             #############################################################
             # BEAM DECODING
             #############################################################
             batch = next(test_iter)
+
             pixel_values = batch[0][0]
             labels = batch[0][1]
+            metadata_tensor = batch[0][2]  # Extract metadata tensor
             
+            # Extract filenames from metadata tensor for this batch
+            batch_filenames = []
+            batch_idxs = []
+            for meta_tensor in metadata_tensor:
+                metadata = test_dataset.decode_metadata_tensor(meta_tensor)
+                batch_filenames.append(metadata['filename'])
+                batch_idxs.append(metadata['sample_idx'])
+            all_filenames.extend(batch_filenames)
+            ground_truth_captions = [test_dataset.get_gt_caption(sample_idx) for sample_idx in batch_idxs]
             predicted_captions = beam_decode_batch( deep_speed_model_engine, pixel_values, labels, tokenizer, args)
+            all_predicted_captions.extend(predicted_captions)
+            all_ground_truth_captions.extend(ground_truth_captions)
             
             if deep_speed_model_engine.is_last_stage():
                 print(f"DEBUG: beam search predicted_captions: {predicted_captions}")
@@ -943,19 +1002,54 @@ if args.do_test:
             #############################################################
             # DIRECT DECODING 
             #############################################################
-            loss,logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True, bcast_loss=True, compute_loss=True)
+    
+            batch = next(test_iter)
+            pixel_values = batch[0][0]
+            labels = batch[0][1]
+            metadata_tensor = batch[0][2]  # Extract metadata tensor
+
+            # Create a single-batch iterator with the current batch
+            batch_iter = iter(RepeatingLoader([batch]))
+            
+            loss, logits = deep_speed_model_engine.eval_batch(data_iter=batch_iter, return_logits=True, bcast_loss=True, compute_loss=True)
             total_test_loss += loss.item()
 
             if deep_speed_model_engine.is_last_stage():
-                # TODO: make sure subindex 0 still makes sense on next line in more than 1 in batch context
-                probs = F.softmax(logits[0], dim=-1)  # Apply softmax to get probabilities
-                tokens = torch.argmax(probs, dim=-1)  # Get the predicted token indices
+                batch_size = logits.shape[0]  # Use actual batch size from logits
+                
+                # Extract filenames from metadata tensor for this batch
+                batch_filenames = []
+                batch_idxs = []
+                batch_predicted_captions = []
+                batch_ground_truth_captions = []
+                
+                for i in range(batch_size):
+                    # Get metadata for this sample
+                    metadata = test_dataset.decode_metadata_tensor(metadata_tensor[i])
+                    batch_filenames.append(metadata['filename'])
+                    batch_idxs.append(metadata['sample_idx'])
+                    
+                    # Get ground truth caption
+                    ground_truth_caption = test_dataset.get_gt_caption(metadata['sample_idx'])
+                    batch_ground_truth_captions.append(ground_truth_caption)
 
-                if tokenizer.eos_token_id in tokens:
-                    tokens = list(tokens.cpu().numpy())
-                    tokens = tokens[:tokens.index(tokenizer.eos_token_id)]  # Truncate at <eos> token
-                predicted_captions = tokenizer.decode(tokens, skip_special_tokens=True)
+                    # Process logits for this specific sample in the batch
+                    probs = F.softmax(logits[i], dim=-1)  # Apply softmax to get probabilities for sample i
+                    tokens = torch.argmax(probs, dim=-1)  # Get the predicted token indices
 
+                    if tokenizer.eos_token_id in tokens:
+                        tokens = list(tokens.cpu().numpy())
+                        tokens = tokens[:tokens.index(tokenizer.eos_token_id)]  # Truncate at <eos> token
+
+                    predicted_caption = tokenizer.decode(tokens, skip_special_tokens=True)
+                    batch_predicted_captions.append(predicted_caption)
+                    
+                    print(f"DEBUG: Sample {i}, Predicted: '{predicted_caption}', GT: '{ground_truth_caption}'")
+                
+                # Add batch results to global lists
+                all_filenames.extend(batch_filenames)
+                all_predicted_captions.extend(batch_predicted_captions)
+                all_ground_truth_captions.extend(batch_ground_truth_captions)
         elif not args.direct_decoding and (args.top_k is not None and args.top_p is not None):
             #############################################################
             # topk_topp_deocding
@@ -966,6 +1060,18 @@ if args.do_test:
             # for sample in batch:
             pixel_values = batch[0][0] # (1, 8, 3, 224, 244)
             labels = batch[0][1]  # (1, 1024)
+            metadata_tensor = batch[0][2]  # Extract metadata tensor
+            
+            # Extract filenames from metadata tensor for this batch
+            batch_filenames = []
+            batch_idxs = []
+            for meta_tensor in metadata_tensor:
+                metadata = test_dataset.decode_metadata_tensor(meta_tensor)
+                batch_filenames.append(metadata['filename'])
+                batch_idxs.append(metadata['sample_idx'])
+            all_filenames.extend(batch_filenames)
+            ground_truth_captions = [test_dataset.get_gt_caption(sample_idx) for sample_idx in batch_idxs]
+            all_ground_truth_captions.extend(ground_truth_captions)
 
             tokens = torch.tensor([[tokenizer.encode("<|endoftext|>")]]).to(pixel_values.device)  # Start with <eos> token
             tokens = F.pad(tokens, (0, 1023), "constant", 0).squeeze(0)  # Pad to max caption length
@@ -993,15 +1099,106 @@ if args.do_test:
 
             predicted_caption = tokenizer.decode(outputs[1:], skip_special_tokens=True)
             print("DEBUG: predicted_caption:", predicted_caption)
-            predicted_captions.append(predicted_caption)
+            # predicted_captions.append(predicted_caption)
+            all_predicted_captions.append(predicted_caption)
         else:
             print("ERROR: Please specify a sampling strategy for decoding (e.g. --top_k, --top_p, --direct_decoding, --greedy_decoding, --num_beams > 1)")
             sys.exit(1)
 
-        if deep_speed_model_engine.is_last_stage():
-             print(f"DEBUG: predicted_captions: {predicted_captions}")
+    # # After processing on last stage, gather results across all ranks
+    # if dist.get_world_size() > 1:
+    #     # Gather results from all ranks
+    #     all_predicted_captions_gathered = [None] * dist.get_world_size()
+    #     all_ground_truth_captions_gathered = [None] * dist.get_world_size()
+    #     all_filenames_gathered = [None] * dist.get_world_size()
+        
+    #     dist.all_gather_object(all_predicted_captions_gathered, all_predicted_captions)
+    #     dist.all_gather_object(all_ground_truth_captions_gathered, all_ground_truth_captions)
+    #     dist.all_gather_object(all_filenames_gathered, all_filenames)
+        
+    #     # Flatten the gathered results
+    #     all_predicted_captions = [item for sublist in all_predicted_captions_gathered for item in sublist]
+    #     all_ground_truth_captions = [item for sublist in all_ground_truth_captions_gathered for item in sublist]
+    #     all_filenames = [item for sublist in all_filenames_gathered for item in sublist]
+        
+    #     # if deep_speed_model_engine.is_last_stage():
+    #     #      print(f"DEBUG: predicted_captions: {predicted_captions}")
+    #     #      all_predicted_captions.extend(predicted_captions)
+    #     #      all_ground_truth_captions.extend(ground_truth_captions)
+    
+    print("DEBUG MICRO REPORT:")
+    print(list(zip(all_filenames, all_predicted_captions, all_ground_truth_captions))[:20])
+    # Test Decoding has finished...
+    # 1 finalize NLP metrics 
+    #   - save item-wise metrics to CSV
+    #   - log metrics to wandb
+    # 2 generate qualtiative report with 
+    #   - experiment details (parameters)
+    #   - train/val/test average loss
+    #   - all available NLP metrics (aggregate)
+    #   - qualitative report with frames, predicted captions, and ground truth captions
+    #       - save as .html with embedded base64 images
+
+    # 1. NLP Metrics
+
+    # These need predicted_captions and ground_truth_captions
+if args.calculate_nlp_metrics:
+    if deep_speed_model_engine.is_last_stage():
+        bleu1_metric = BLEUScore(n_gram=1)
+        bleu2_metric = BLEUScore(n_gram=2)
+        bleu3_metric = BLEUScore(n_gram=3)
+        bleu4_metric = BLEUScore(n_gram=4)
+        word_error_rate_metric = WordErrorRate()
+        word_info_lost_metric = WordInformationLost()
+        word_info_preserved_metric = WordInformationPreserved()
+
+        # These need dicts of predicted_captions and ground_truth_captions
+        cider_metric = Cider()
+        meteor_metric = Meteor()
+        rouge_metric = Rouge()
+        spice_metric = Spice()
+
+        metrics_dict = {}       
+        metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
+
+        all_ground_truth_captions_flattened = [[x.replace('\n', ' ').strip()] for x in all_ground_truth_captions]
+        all_predicted_captions_flattened = [[x.replace('\n', ' ').strip()] for x in all_predicted_captions]
+        all_ground_truth_captions_dict = dict(zip(all_filenames, all_ground_truth_captions_flattened))
+        all_predicted_captions_dict = dict((zip(all_filenames, all_predicted_captions_flattened)))
+
+        # all_ground_truth_captions = [[x] for x in all_ground_truth_captions]
+        # all_predicted_captions = [[x] for x in all_predicted_captions]
+
+        print(f"DEBUG: ground_truth_captions: {all_ground_truth_captions[:20]}")
+        print(f"DEBUG: predicted_captions: {all_predicted_captions[:20]}")
+        
+        metrics_dict["blue1_score"] = bleu1_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+        metrics_dict["blue2_score"] = bleu2_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+        metrics_dict["blue3_score"] = bleu3_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+        metrics_dict["blue4_score"] = bleu4_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+        # metrics_dict["perplexity_score"] = perplexity_metric.compute().item()
+        metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+        metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+        metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+
+        # print(f"\n\nDEBUG ground_truth_captions_dict: {ground_truth_captions_dict}\n\n")
+        # print(f"\n\nDEBUG predicted_captions_dict: {predicted_captions_dict}\n\n")
+        metrics_dict["cider_score"], _ = Cider().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
+        metrics_dict["meteor_score"], _ = Meteor().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
+        metrics_dict["rouge_score"], _ = Rouge().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
+        metrics_dict["spice_score"], spice_scores = Spice().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
+
+        # print(f"Average test loss: {metrics_dict['avg_test_loss']}")
+        print(metrics_dict)
+
+        wandb.log(metrics_dict)
+
+   
+if args.generate_qualitative_report:
+    pass
     
 dist.barrier()
 
 if dist.get_rank() == (dist.get_world_size() - 1):
     wandb.finish()
+
