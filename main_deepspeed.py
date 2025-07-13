@@ -11,6 +11,7 @@ import torch.nn as nn
 import argparse
 import random
 import wandb
+import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.distributed import DistributedSampler
@@ -681,7 +682,7 @@ if args.do_train:
                     print(f"Val Batch Loss Step {step+1}/{num_val_batches}, Loss: {loss.item():.4f}" )
                     wandb.log({"Exp/Val Batch Loss": loss.item()})
 
-            if dist.get_rank() == (dist.get_world_size() - 1):
+            if deep_speed_model_engine.is_last_stage():
                 val_loss = total_val_loss / num_val_batches
                 print(f"Val Average Epoch {epoch} Loss: {val_loss}")
                 wandb.log({"Exp/Val Average Loss": val_loss})
@@ -971,8 +972,6 @@ if args.do_test:
     ground_truth_captions = []
     for step in range(num_test_batches):
 
-
-
         if args.num_beams > 1:
             #############################################################
             # BEAM DECODING
@@ -1002,7 +1001,6 @@ if args.do_test:
             #############################################################
             # DIRECT DECODING 
             #############################################################
-    
             batch = next(test_iter)
             pixel_values = batch[0][0]
             labels = batch[0][1]
@@ -1139,11 +1137,48 @@ if args.do_test:
     #   - qualitative report with frames, predicted captions, and ground truth captions
     #       - save as .html with embedded base64 images
 
-    # 1. NLP Metrics
 
-    # These need predicted_captions and ground_truth_captions
-if args.calculate_nlp_metrics:
-    if deep_speed_model_engine.is_last_stage():
+def calculate_classic_nlp_metrics_and_total_loss(filenames, predicted_captions, ground_truth_captions, exp_subset="Test", total_loss=0.0, dataset_length=0):
+    wandb_name = "Exp/" + exp_subset 
+    metrics_dict = {}
+    bleu1_metric = BLEUScore(n_gram=1)
+    bleu2_metric = BLEUScore(n_gram=2)
+    bleu3_metric = BLEUScore(n_gram=3)
+    bleu4_metric = BLEUScore(n_gram=4)
+    word_error_rate_metric = WordErrorRate()
+    word_info_lost_metric = WordInformationLost()
+    word_info_preserved_metric = WordInformationPreserved()
+
+    metrics_dict[wandb_name + " avg_test_loss"] = total_test_loss / len(test_dataloader)
+
+    metrics_dict[wandb_name + " bleu1_score"] = bleu1_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+    metrics_dict[wandb_name + " bleu2_score"] = bleu2_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+    metrics_dict[wandb_name + " bleu3_score"] = bleu3_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+    metrics_dict[wandb_name + " bleu4_score"] = bleu4_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+    # metrics_dict["perplexity_score"] = perplexity_metric.compute().item()
+    metrics_dict[wandb_name + " word_error_rate_score"] = word_error_rate_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+    metrics_dict[wandb_name + " word_info_lost_score"] = word_info_lost_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+    metrics_dict[wandb_name + " word_info_preserved_score"] = word_info_preserved_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+
+    return metrics_dict
+
+def calculate_classic_nlp_metrics_per_instance(filenames, predicted_captions, ground_truth_captions):
+    instance_metrics = {}
+    instance_metrics['filenames'] = filenames
+    instance_metrics['predicted_captions'] = predicted_captions
+    instance_metrics['ground_truth_captions'] = ground_truth_captions
+    instance_metrics['bleu1_scores'] = []
+    instance_metrics['bleu2_scores'] = []
+    instance_metrics['bleu3_scores'] = []
+    instance_metrics['bleu4_scores'] = []
+    instance_metrics['word_error_rate_scores'] = []
+    instance_metrics['word_info_lost_scores'] = []
+    instance_metrics['word_info_preserved_scores'] = []
+
+    for i, filename in enumerate(filenames):
+        predicted_caption = predicted_captions[i]
+        ground_truth_caption = ground_truth_captions[i] 
+
         bleu1_metric = BLEUScore(n_gram=1)
         bleu2_metric = BLEUScore(n_gram=2)
         bleu3_metric = BLEUScore(n_gram=3)
@@ -1152,49 +1187,64 @@ if args.calculate_nlp_metrics:
         word_info_lost_metric = WordInformationLost()
         word_info_preserved_metric = WordInformationPreserved()
 
-        # These need dicts of predicted_captions and ground_truth_captions
-        cider_metric = Cider()
-        meteor_metric = Meteor()
-        rouge_metric = Rouge()
-        spice_metric = Spice()
+        instance_metrics['bleu1_scores'].append(bleu1_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
+        instance_metrics['bleu2_scores'].append(bleu2_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
+        instance_metrics['bleu3_scores'].append(bleu3_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
+        instance_metrics['bleu4_scores'].append(bleu4_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
+        # metrics_list.append(perplexity_metric.compute().item()
+        instance_metrics['word_error_rate_scores'].append(word_error_rate_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
+        instance_metrics['word_info_lost_scores'].append(word_info_lost_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
+        instance_metrics['word_info_preserved_scores'].append(word_info_preserved_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
 
-        metrics_dict = {}       
-        metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
+    return instance_metrics
 
-        all_ground_truth_captions_flattened = [[x.replace('\n', ' ').strip()] for x in all_ground_truth_captions]
-        all_predicted_captions_flattened = [[x.replace('\n', ' ').strip()] for x in all_predicted_captions]
-        all_ground_truth_captions_dict = dict(zip(all_filenames, all_ground_truth_captions_flattened))
-        all_predicted_captions_dict = dict((zip(all_filenames, all_predicted_captions_flattened)))
+def compute_advanced_nlp_metrics_with_instances(filenames, predicted_captions, ground_truth_captions, exp_subset="Test"):
+    wandb_name = "Exp/" + exp_subset
+    metrics_dict = {}
+    instance_metrics = {}
 
-        # all_ground_truth_captions = [[x] for x in all_ground_truth_captions]
-        # all_predicted_captions = [[x] for x in all_predicted_captions]
+    all_ground_truth_captions_flattened = [[x.replace('\n', ' ').strip()] for x in all_ground_truth_captions]
+    all_predicted_captions_flattened = [[x.replace('\n', ' ').strip()] for x in all_predicted_captions]
+    all_ground_truth_captions_dict = dict(zip(all_filenames, all_ground_truth_captions_flattened))
+    all_predicted_captions_dict = dict((zip(all_filenames, all_predicted_captions_flattened)))
 
-        print(f"DEBUG: ground_truth_captions: {all_ground_truth_captions[:20]}")
-        print(f"DEBUG: predicted_captions: {all_predicted_captions[:20]}")
-        
-        metrics_dict["blue1_score"] = bleu1_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-        metrics_dict["blue2_score"] = bleu2_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-        metrics_dict["blue3_score"] = bleu3_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-        metrics_dict["blue4_score"] = bleu4_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-        # metrics_dict["perplexity_score"] = perplexity_metric.compute().item()
-        metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-        metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-        metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
+    metrics_dict[wandb_name + " cider_score"], instance_metrics['cider_scores'] = Cider().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
+    metrics_dict[wandb_name + " meteor_score"], instance_metrics['meteor_scores'] = Meteor().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
+    metrics_dict[wandb_name + " rouge_score"], instance_metrics['rouge_scores'] = Rouge().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
+    metrics_dict[wandb_name + " spice_score"], instance_metrics['spice_scores']= Spice().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
+    return metrics_dict, instance_metrics
 
-        # print(f"\n\nDEBUG ground_truth_captions_dict: {ground_truth_captions_dict}\n\n")
-        # print(f"\n\nDEBUG predicted_captions_dict: {predicted_captions_dict}\n\n")
-        metrics_dict["cider_score"], _ = Cider().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
-        metrics_dict["meteor_score"], _ = Meteor().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
-        metrics_dict["rouge_score"], _ = Rouge().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
-        metrics_dict["spice_score"], spice_scores = Spice().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
+if args.calculate_nlp_metrics:
+    if deep_speed_model_engine.is_last_stage():
+        classic_metrics_dict = calculate_classic_nlp_metrics_and_total_loss(all_filenames, all_predicted_captions, all_ground_truth_captions, "Test", total_test_loss, len(test_dataset))
+        advanced_metrics_dict, advanced_instance_metrics = compute_advanced_nlp_metrics_with_instances(all_filenames, all_predicted_captions, all_ground_truth_captions, "Test")
+        classic_instance_metrics = calculate_classic_nlp_metrics_per_instance(all_filenames, all_predicted_captions, all_ground_truth_captions)
+        wandb_metrics_dict = {**classic_metrics_dict, **advanced_metrics_dict}
+        wandb.log(wandb_metrics_dict)
 
-        # print(f"Average test loss: {metrics_dict['avg_test_loss']}")
-        print(metrics_dict)
-
-        wandb.log(metrics_dict)
-
+        # Save instance metrics to CSV
+        instance_metrics_df = pd.DataFrame({
+            'filename': all_filenames,
+            'predicted_caption': all_predicted_captions,
+            'ground_truth_caption': all_ground_truth_captions,
+            'bleu1_score': classic_instance_metrics['bleu1_scores'],
+            'bleu2_score': classic_instance_metrics['bleu2_scores'],
+            'bleu3_score': classic_instance_metrics['bleu3_scores'],
+            'bleu4_score': classic_instance_metrics['bleu4_scores'],
+            'word_error_rate_score': classic_instance_metrics['word_error_rate_scores'],
+            'word_info_lost_score': classic_instance_metrics['word_info_lost_scores'],
+            'word_info_preserved_score': classic_instance_metrics['word_info_preserved_scores'],
+            'cider_score': advanced_instance_metrics['cider_scores'],
+            'meteor_score': advanced_instance_metrics['meteor_scores'],
+            'rouge_score': advanced_instance_metrics['rouge_scores'],
+            'spice_score': advanced_instance_metrics['spice_scores']
+        })
+        instance_metrics_csv_path = os.path.join(experiment_output_dir, "instance_metrics.csv")
+        instance_metrics_df.to_csv(instance_metrics_csv_path, index=False)  
    
 if args.generate_qualitative_report:
+
+
     pass
     
 dist.barrier()
