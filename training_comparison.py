@@ -46,7 +46,7 @@ from collections import defaultdict
 from torch.nn import CrossEntropyLoss
 from torch.optim.lr_scheduler import CosineAnnealingLR
 # import tensorboard_plugin_profile
-from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, CausalLMOutputWithCrossAttentions, Seq2SeqLMOutput
+from transformers.modeling_outputs import BaseModelOutputWithPastAndCrossAttentions, CausalLMOutputWithCrossAttentions, Seq2SeqLMOutput, BaseModelOutput
 from torch.utils.data.dataloader import default_collate
 import numpy as np
 
@@ -136,8 +136,8 @@ class EncEmbedWrapper(nn.Module):
         self.emb = embeddings                       # original module
     def forward(self, inputs):
         pixel_values, labels, metadata = inputs
-        hidden = self.emb(pixel_values)             # includes pos_drop & time_drop
-        return hidden, labels, metadata
+        frames_embedding = self.emb(pixel_values)             # includes pos_drop & time_drop
+        return frames_embedding, labels, metadata
 
 # ——— one TimeSformer block ——————————————————————————————
 class EncBlockWrapper(nn.Module):
@@ -145,9 +145,9 @@ class EncBlockWrapper(nn.Module):
         super().__init__()
         self.layer = layer
     def forward(self, inputs):
-        hidden, labels, metadata = inputs
-        hidden = self.layer(hidden)[0]              # drop attn output
-        return hidden, labels, metadata
+        layer_outputs, labels, metadata = inputs
+        layer_outputs = self.layer(layer_outputs)[0]              # drop attn output
+        return layer_outputs, labels, metadata
 
 # ——— final encoder LayerNorm ————————————————————————
 class EncLayerNormWrapper(nn.Module):
@@ -156,8 +156,9 @@ class EncLayerNormWrapper(nn.Module):
         self.ln = ln
     def forward(self, inputs):
         encoder_hidden_states, labels, metadata = inputs
+        encoder_hidden_states = BaseModelOutput(last_hidden_state=encoder_hidden_states)[0]
         encoder_hidden_states = self.ln(encoder_hidden_states)
-
+        encoder_hidden_states = BaseModelOutput(last_hidden_state=encoder_hidden_states)[0]
         return encoder_hidden_states, labels, metadata
 
 # Token embedding wrapper
@@ -295,7 +296,6 @@ class DecBlockWrapper(nn.Module):
         self.block = block
         self.block_num = block_num
         
-        
     def forward(self, inputs):
         encoder_hidden_states, token_emb, head_mask, encoder_attention_mask, presents, metadata, output_shape, decoder_input_ids, labels = inputs
         
@@ -363,6 +363,8 @@ class FinalWrapper(nn.Module):
 
         loss = None
         logits = final_outputs.logits
+        
+        # return logits
         # print(f"logits.shape: {logits.shape}")
         # loss = self.loss_function(
         #     logits=logits,
@@ -373,36 +375,23 @@ class FinalWrapper(nn.Module):
         # shift_logits = logits[..., :-1, :].contiguous()
         # shift_labels = decoder_input_ids[..., 1:].contiguous()
         
-        loss_fct = CrossEntropyLoss()
+        # loss_fct = CrossEntropyLoss()
         # loss = loss_fct(logits.reshape(-1, self.decoder.config.vocab_size), decoder_input_ids.reshape(-1))
-        loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-
-        return Seq2SeqLMOutput(
-            loss=loss,
-            logits=logits,
-            past_key_values=final_outputs.past_key_values,
-            decoder_hidden_states=final_outputs.hidden_states,
-            decoder_attentions=final_outputs.attentions,
-            cross_attentions=final_outputs.cross_attentions,
-            encoder_last_hidden_state=None,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attentions=None,
-        )
-
-        # BaseModelOutputWithPastAndCrossAttentions(
-
+        # loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+        
+        # bruh= Seq2SeqLMOutput(
+        #     loss=loss,
+        #     logits=logits,
+        #     past_key_values=final_outputs.past_key_values,
+        #     decoder_hidden_states=final_outputs.hidden_states,
+        #     decoder_attentions=final_outputs.attentions,
+        #     cross_attentions=final_outputs.cross_attentions,
+        #     encoder_last_hidden_state=None,
+        #     encoder_hidden_states=encoder_hidden_states,
+        #     encoder_attentions=None,
         # )
         
-        # Compute loss independent from decoder (as some shift the logits inside them)
-        # loss = None
-        # # if labels is not None:
-        # # Shift so that tokens < n predict n
-        # shift_logits = lm_logits[..., :-1, :].contiguous()
-        # shift_labels = labels[..., 1:].contiguous()
-        # # Flatten the tokens
-        # loss_fct = CrossEntropyLoss()
-        # loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        # return logits
+        return logits
     
 
 # class DecoderWrapper(nn.Module):
@@ -447,7 +436,7 @@ def to_plain_blocks(hf_model):
         blocks.append(EncBlockWrapper(layer))
     blocks.append(EncLayerNormWrapper(enc.layernorm))
 
-    # ----- Decoder (your code, unchanged) ----------------------------------
+    # ----- Decoder ----------------------------------
     blocks.append(DecTokenEmbedWrapper(
         hf_model.decoder.transformer.wte,
         hf_model.decoder.transformer.wpe,
@@ -455,8 +444,6 @@ def to_plain_blocks(hf_model):
         len(hf_model.decoder.transformer.h),
         dtype=torch.float16
     ))
-
-    print(f"There are {len(hf_model.decoder.transformer.h)} number of blocks in the decoder..")
 
     for block_num, dec in enumerate(hf_model.decoder.transformer.h):
         blocks.append(DecBlockWrapper(dec, block_num))
@@ -479,17 +466,7 @@ class SpaceTimeGPTPlain(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         
-        # print(f"OUTPUTS: {x}")
-        # logits = x
         return x
-
-    # def encoder_only(self, pixel_values):
-    #     x = (pixel_values, None, None)
-    #     # run through encoder blocks (first N)
-    #     num_enc = 1 + len(self.hf_model.encoder.encoder.layer) + 1
-    #     for blk in self.blocks[:num_enc]:
-    #         x = blk(x)
-    #     return x[0]
 
 class VisualLinguisticDataset(Dataset):
     def __init__(self, dataset, num_captions):
@@ -548,8 +525,8 @@ kwargs = {
 
 gen_kwargs = {
     "min_length": 15,
-    "max_length": 100,
-    "num_beams": 5,
+    "max_length": 128,
+    "num_beams": 1,
     "no_repeat_ngram_size": 3,
 }
 
@@ -606,7 +583,7 @@ ref_model  = base_model.to(device)
 
 model = SpaceTimeGPTPlain(base_model).to(device)   # wrap *after* .eval()
 # model     = SpaceTimeGPTPlain(base_model).to("cpu").double()
-model.generate = base_model.generate       # 1‑liner delegation
+# model.generate = base_model.generate       # 1‑liner delegation
 # model.config   = base_model.config         # GenerationMixin needs this
 optimizer_blk = torch.optim.AdamW(
     model.parameters(),
@@ -628,106 +605,336 @@ training_steps = EPOCHS * (len(train_dataloader) // kwargs["batch_size"])
 scaler_ref = torch.amp.GradScaler()
 scaler_blk = torch.amp.GradScaler()
 
-# def compute_loss(logits, labels):
-#     # print(f"logits.dype {logits.dtype}, labels.dtype {labels.dtype}")
-#     return F.cross_entropy(
-#         logits.view(-1, logits.size(-1)),
-#         labels.view(-1)
-#     )
+def compute_loss(logits, labels):
+    loss_fct = CrossEntropyLoss()
+    loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+    return loss
+
+def grads_are_equal(m_ref, m_blk, atol=1e-6):
+    for (n1, p1), (n2, p2) in zip(m_ref.named_parameters(), m_blk.named_parameters()):
+        if p1.grad is None or p2.grad is None:
+            print(f"{n1}: missing grad")
+            return False
+        if not torch.allclose(p1.grad, p2.grad, atol=atol):
+            print(f"{n1}: max |Δgrad| = {(p1.grad - p2.grad).abs().max():.2e}")
+            return False
+    return True
+
 torch.autograd.set_detect_anomaly(True)
-for _ in range(5):
-    # breakpoint()
-    with torch.no_grad():
-        batch = next(iter(train_dataloader))
-        # print("pixel_values:", batch["pixel_values"].shape, batch["pixel_values"].dtype)
-        # print("labels:", batch["labels"].shape)
-        # print("first gt caption:", tokenizer.decode(batch["labels"][0], skip_special_tokens=True))
+# for _ in range(5):
+#     # breakpoint()
+#     with torch.no_grad():
+#         batch = next(iter(train_dataloader))
+#         # print("pixel_values:", batch["pixel_values"].shape, batch["pixel_values"].dtype)
+#         # print("labels:", batch["labels"].shape)
+#         # print("first gt caption:", tokenizer.decode(batch["labels"][0], skip_special_tokens=True))
 
-        px  = batch["pixel_values"].to(device).float()
-        lbl = batch["labels"].to(device).long()
-        # breakpoint()
-        out_ref = ref_model(pixel_values=px, labels=lbl)
-        out_blk = model(px, lbl)
+#         px  = batch["pixel_values"].to(device).float()
+#         lbl = batch["labels"].to(device).long()
+#         breakpoint()
+#         # out_ref = ref_model(pixel_values=px, labels=lbl)
+#         # print("blk model now..")
+#         out_blk = model(px, lbl)
 
-        loss_ref = out_ref.loss
-        loss_blk = out_blk.loss
-        print("ref loss =", loss_ref.item(), "  blk loss =", loss_blk.item())
+#         # loss_ref = out_ref.loss
+#         loss_blk = compute_loss(out_blk, lbl)
+#         # print("ref loss =", loss_ref.item(), "  blk loss =", loss_blk.item())
 
 
 # sys.exit()
+if ref_model.config.decoder_start_token_id is None:
+    ref_model.config.decoder_start_token_id = tokenizer.bos_token_id
+
+if ref_model.config.eos_token_id is None:
+    ref_model.config.eos_token_id = tokenizer.eos_token_id
+# -------------------------------------------------------------
+# (2) helper – greedy decoder, robust to missing EOS
+# -------------------------------------------------------------
+@torch.no_grad()
+def greedy_generate(model, pixel_values, max_length=30):
+    """
+    Manual greedy decoding that exactly mirrors
+    model.generate(..., num_beams=1, do_sample=False).
+
+    Works for VisionEncoderDecoderModel and keeps encoder_outputs
+    so we don't have to resend pixel_values every step.
+    """
+    model.eval()
+    pixel_values = pixel_values.to(model.device)
+
+    # ------------------------------------------------------------------
+    # 1) run encoder once, cache its outputs
+    # ------------------------------------------------------------------
+    encoder_outputs = model.get_encoder()(pixel_values, return_dict=True)
+
+    # ------------------------------------------------------------------
+    # 2) init decoder with <bos>
+    # ------------------------------------------------------------------
+    dec_ids = torch.full(
+        (pixel_values.size(0), 1),
+        model.config.decoder_start_token_id,
+        dtype=torch.long,
+        device=model.device,
+    )
+
+    eos_id  = model.config.eos_token_id
+    past_kv = None
+
+    # ------------------------------------------------------------------
+    # 3) autoregressive loop
+    # ------------------------------------------------------------------
+    for _ in range(max_length - 1):
+        out = model(
+            encoder_outputs=encoder_outputs,
+            decoder_input_ids=dec_ids[:, -1:],   # feed only the last token
+            past_key_values=past_kv,
+            use_cache=True,
+            return_dict=True,
+        )
+
+        next_tok = out.logits[:, -1].argmax(-1, keepdim=True)
+        dec_ids  = torch.cat([dec_ids, next_tok], dim=-1)
+
+        # stop if every sequence produced <eos>
+        if eos_id is not None and (next_tok == eos_id).all():
+            break
+
+        past_kv = out.past_key_values        # reuse cached keys/values
+
+    return dec_ids
+
+# -------------------------------------------------------------
+# helper – greedy decode for the *block* model
+# -------------------------------------------------------------
+@torch.no_grad()
+def greedy_generate_blk(model,
+                        pixel_values: torch.Tensor,
+                        tokenizer,
+                        max_length: int = 30):
+    """
+    Greedy, autoregressive decoding for SpaceTimeGPTPlain.
+    Works by appending a PAD placeholder, so the last logit
+    corresponds to the *next* token, not the one we just fed in.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    pixel_values = pixel_values.to(device)
+
+    bos = tokenizer.bos_token_id
+    eos = tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id
+
+    seq = torch.full((pixel_values.size(0), 1), bos,
+                     dtype=torch.long, device=device)
+
+    for _ in range(max_length - 1):
+        # add a dummy token the model must predict
+        labels = torch.cat([seq,
+                            torch.full_like(seq[:, :1], pad)], dim=1)
+
+        logits = model(pixel_values, labels)          # (B, T, V)
+        next_tok = logits[:, -1].argmax(-1, keepdim=True)
+
+        seq = torch.cat([seq, next_tok], dim=1)
+
+        if eos is not None and (next_tok == eos).all():
+            break
+
+    return seq
 
 torch.cuda.empty_cache()
-# iterating over n epochs
 for epoch in range(EPOCHS):
+    ref_model.train()
     model.train()
-    # ref_model.train()
-    
-    train_progress = tqdm(train_dataloader, desc=f"Training - Epoch {epoch+1}/{EPOCHS}")
-    optimizer_blk.zero_grad()
-    # optimizer_ref.zero_grad()
-    # iterating over batches
-    for i, train_batch in enumerate(train_progress):
-        inputs = {k: v.to(device) for k, v in train_batch.items() if k in ["pixel_values", "labels"]}
-        # casting inputs to appropriate data type
-        with torch.autocast(device_type=device, enabled=True, dtype=torch.float16):
-            out_blk = model(pixel_values=inputs["pixel_values"], labels=inputs["labels"])
-            # out_ref = ref_model(pixel_values=inputs["pixel_values"], labels=inputs["labels"])
 
-            loss_blk = out_blk.loss
-            # loss_ref = out_ref.loss
-        # print("ref loss =", loss_ref.item(), "  blk loss =", loss_blk.item())
-        # breakpoint()
-        # scaler_ref.scale(loss_ref).backward()
-        # scaler_ref.step(optimizer_ref)
-        # scaler_ref.update()
-        # optimizer_ref.zero_grad()
+    train_bar = tqdm(train_dataloader,
+                     desc=f"Epoch {epoch+1}/{EPOCHS}",
+                     dynamic_ncols=True)
 
-        # scaler_blk.scale(loss_blk).backward()
-        # scaler_blk.step(optimizer_blk)
-        # scaler_blk.update()
-        # optimizer_blk.zero_grad()
+    for step, batch in enumerate(train_bar):
+        # ----- move to device ------------------------------------------------
+        batch = {k: v.to(device) for k, v in batch.items()
+                 if k in ["pixel_values", "labels"]}
+
+        # ----- forward passes (mixed-precision) ------------------------------
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            out_ref = ref_model(pixel_values=batch["pixel_values"],
+                                labels=batch["labels"])
+            logits_blk = model(pixel_values=batch["pixel_values"],
+                                   labels=batch["labels"])
+
+            loss_ref = out_ref.loss
+            loss_blk = compute_loss(logits_blk, batch["labels"])
+
+        # ----- zero-grad -----------------------------------------------------
+        optimizer_ref.zero_grad(set_to_none=True)
+        optimizer_blk.zero_grad(set_to_none=True)
+
+        # ----- backward passes ----------------------------------------------
+        loss_ref.backward(retain_graph=True)   # keep tape for comparison
         loss_blk.backward()
+
+        # ----- DEBUG: compare gradients -------------------------------------
+        if not grads_are_equal(ref_model, model):
+            print(f"\nGradient mismatch  epoch={epoch}  step={step}")
+            import pdb; pdb.set_trace()
+
+        # ----- optimiser steps ----------------------------------------------
+        torch.nn.utils.clip_grad_norm_(ref_model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer_ref.step()
         optimizer_blk.step()
+        # print(f"loss_ref.item(): {loss_ref.item()}\nloss_blk.item(): {loss_blk.item()}")
+        train_bar.set_postfix({'loss_ref': f"{loss_ref.item():.4f}",
+                               'loss_blk': f"{loss_blk.item():.4f}"})
 
-        # train_progress.set_postfix({"ref_loss": loss_ref.item(), "blk_loss": loss_blk.item()})
-        train_progress.set_postfix({"Training Loss": loss_blk.item()})
-        torch.cuda.empty_cache()
+    # -------------------------------------------------------------
+    # VALIDATION  (run after each training epoch)
+    # -------------------------------------------------------------
+    ref_model.eval()
+    model.eval()             # <- keep if you still want blk loss
 
-    # evaluating the model after each epoch
-    model.eval()
-    # ref_model.eval()
+    with torch.no_grad(), torch.autocast("cuda", torch.float16):
+        for i, batch in enumerate(tqdm(val_dataloader,
+                                    desc=f"Validation epoch {epoch+1}")):
 
-    predicted_captions = []
-    ground_truth_captions = []
+            batch = {k: v.to(device) for k, v in batch.items()
+                    if k in ["pixel_values", "labels"]}
 
-    val_progress = tqdm(val_dataloader, desc=f"Validation - Epoch {epoch+1}/{EPOCHS}")
+            # ---------- 1) loss for monitoring ---------------------------------
+            logits_blk = model(pixel_values=batch["pixel_values"],
+                                labels=batch["labels"])
+            loss_blk   = compute_loss(logits_blk, batch["labels"])
+
+            # ---------- 2) greedy generation ----------------------------------
+            # HF built-in (greedy == num_beams=1 & do_sample=False)
+            ids_hf = ref_model.generate(
+                batch["pixel_values"],
+                max_length=30,
+                num_beams=1,
+                do_sample=False)
+
+            # manual loop
+            ids_manual_ref = greedy_generate(ref_model, batch["pixel_values"],
+                                         max_length=30)
+            
+            # ----- c) manual greedy on blk_model ----------------------------
+            ids_manual_blk = greedy_generate_blk(model, batch["pixel_values"],
+                                                tokenizer,
+                                                max_length=30)
+
+            # ---------- 3) decode & print -------------------------------------
+            txt_hf   = tokenizer.batch_decode(ids_hf,         skip_special_tokens=True)
+            txt_ref  = tokenizer.batch_decode(ids_manual_ref, skip_special_tokens=True)
+            txt_blk  = tokenizer.batch_decode(ids_manual_blk, skip_special_tokens=True)
+            txt_gt   = tokenizer.batch_decode(batch["labels"], skip_special_tokens=True)
+
+            for gt, hf, ref, blk in zip(txt_gt, txt_hf, txt_ref, txt_blk):
+                print("GT       :", gt)
+                print("HF.gen   :", hf)
+                print("Ref(man) :", ref)
+                print("Blk(man) :", blk)
+                print("-" * 60)
+
+            # optional: break early to avoid huge stdout
+            if i == 5:            # show first 4 mini-batches then stop
+                break
+# iterating over n epochs
+# for epoch in range(EPOCHS):
+#     # model.train()
+#     ref_model.train()
     
-    with torch.no_grad():
-        for val_batch in val_progress:
-            video_ids = val_batch["videoID"]
+#     train_progress = tqdm(train_dataloader, desc=f"Training - Epoch {epoch+1}/{EPOCHS}")
+#     # optimizer_blk.zero_grad()
+#     optimizer_ref.zero_grad()
+#     # iterating over batches
+#     for i, train_batch in enumerate(train_progress):
+#         inputs = {k: v.to(device) for k, v in train_batch.items() if k in ["pixel_values", "labels"]}
+#         # casting inputs to appropriate data type
+#         with torch.autocast(device_type=device, enabled=True, dtype=torch.float16):
+#             # out_blk_logits = model(pixel_values=inputs["pixel_values"], labels=inputs["labels"])
+#             out_ref = ref_model(pixel_values=inputs["pixel_values"], labels=inputs["labels"])
         
-            inputs = {
-                key: value.to(device)
-                for key, value in val_batch.items()
-                if key in ["pixel_values", "labels"]
-            }
+#             # loss_blk = compute_loss(out_blk_logits, inputs["labels"])
+#             # loss_blk = out_blk.loss
+#             loss_ref = out_ref.loss
+#         # print("ref loss =", loss_ref.item(), "  blk loss =", loss_blk.item())
+#         # breakpoint()
+#         # scaler_ref.scale(loss_ref).backward()
+#         # scaler_ref.step(optimizer_ref)
+#         # scaler_ref.update()
+#         # optimizer_ref.zero_grad()
 
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                out_blk = model(pixel_values=inputs["pixel_values"], labels=inputs["labels"])
-                loss_blk = out_blk.loss
+#         # scaler_blk.scale(loss_blk).backward()
+#         # scaler_blk.step(optimizer_blk)
+#         # scaler_blk.update()
+#         # loss_ref.backward()
+#         # optimizer_ref.step()
+#         # optimizer_ref.zero_grad()
+#         # 2. backward without optimiser steps
+#         # ref_model.zero_grad(); blk_model.zero_grad()
+#         # loss_blk.backward(retain_graph=True)
+#         # loss_blk.backward()
 
-                tokens_blk = model.generate(pixel_values=inputs["pixel_values"], **gen_kwargs)
-                # tokens_ref = ref_model.generate(pixel_values=inputs["pixel_values"], **gen_kwargs)
+#         # 3. compare
+#         # print("gradients identical? ->", grads_are_equal(ref_model, blk_model))
+#         breakpoint()
+#         loss_ref.backward()
+#         optimizer_ref.step()
+#         optimizer_ref.zero_grad()
+#         # print("ref loss =", loss_ref.item(), "  blk loss =", loss_blk.item())
+#         # train_progress.set_postfix({"ref_loss": loss_ref.item(), "blk_loss": loss_blk.item()})
+#         train_progress.set_postfix({"Training Loss": loss_ref.item()})
+#         # torch.cuda.empty_cache()
 
-                predicted_caption_blk = tokenizer.batch_decode(tokens_blk, skip_special_tokens=True)
-                # predicted_caption_ref = tokenizer.batch_decode(tokens_ref, skip_special_tokens=True)
+#     # evaluating the model after each epoch
+#     # model.eval()
+#     ref_model.eval()
 
-                ground_truth_caption = val_batch["labels"]
-                decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=False)
-                print(f"gts: {decoded_ground_truth_caption}\nblk_pred: {predicted_caption_blk}")
-                # print(f"gts: {decoded_ground_truth_caption}\nref_pred: {predicted_caption_ref}\nblk_pred: {predicted_caption_blk}")
-                # train_progress.set_postfix({"ref_loss": loss_ref.item(), "blk_loss": loss_blk.item()})
-                train_progress.set_postfix({"blk_loss": loss_blk.item()})
+#     predicted_captions = []
+#     ground_truth_captions = []
+
+#     val_progress = tqdm(val_dataloader, desc=f"Validation - Epoch {epoch+1}/{EPOCHS}")
+    
+#     with torch.no_grad():
+#         for i, val_batch in enumerate(val_progress):
+#             video_ids = val_batch["videoID"]
+        
+#             inputs = {
+#                 key: value.to(device)
+#                 for key, value in val_batch.items()
+#                 if key in ["pixel_values", "labels"]
+#             }
+
+#             with torch.autocast(device_type='cuda', dtype=torch.float16):
+#                 out_blk = model(pixel_values=inputs["pixel_values"], labels=inputs["labels"])
+#                 # loss_blk = out_blk.loss
+#                 loss_blk = compute_loss(out_blk, inputs["labels"])
+                
+#                 # tokens_blk = model.generate(pixel_values=inputs["pixel_values"], **gen_kwargs)
+#                 # tokens_ref = ref_model.generate(pixel_values=inputs["pixel_values"], **gen_kwargs)
+
+#                 # predicted_caption_blk_gen = tokenizer.batch_decode(tokens_blk, skip_special_tokens=True)
+#                 # predicted_caption_ref = tokenizer.batch_decode(tokens_ref, skip_special_tokens=True)
+#                 # print(f"tokenizer.bos_token_id: {tokenizer.bos_token_id}\ntokenizer.eos_token_id: {tokenizer.eos_token_id}")
+#                 generated_tokens = autoregressive_generate_block_model(
+#                     model,
+#                     pixel_values=inputs["pixel_values"],
+#                     max_length=128,
+#                     bos_token_id=tokenizer.bos_token_id,
+#                     eos_token_id=tokenizer.eos_token_id
+#                 )
+
+#                 predicted_caption_ref_manual_gen = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
+
+#                 ground_truth_caption = val_batch["labels"]
+#                 decoded_ground_truth_caption = tokenizer.batch_decode(ground_truth_caption, skip_special_tokens=True)
+#                 print(f"gts: {decoded_ground_truth_caption}\nblk_pred_gen: {predicted_caption_ref_manual_gen}")
+#                 # print(f"gts: {decoded_ground_truth_caption}\nblk_pred_gen: {predicted_caption_blk_gen}\nblk_pred_manual_gen: {predicted_caption_ref_manual_gen}")
+#                 # print(f"gts: {decoded_ground_truth_caption}\nref_pred: {predicted_caption_ref}\nblk_pred: {predicted_caption_blk}")
+#                 # train_progress.set_postfix({"ref_loss": loss_ref.item(), "blk_loss": loss_blk.item()})
+#                 # train_progress.set_postfix({"blk_loss": loss_blk.item()})
+#                 train_progress.set_postfix({"iter": i})
 
             
                 
