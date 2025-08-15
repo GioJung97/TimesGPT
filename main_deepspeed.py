@@ -11,7 +11,6 @@ import torch.nn as nn
 import argparse
 import random
 import wandb
-import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 from torch.utils.data.distributed import DistributedSampler
@@ -39,11 +38,6 @@ from transformers.models.gpt2.modeling_gpt2 import GPT2LMHeadModel
 from torch.optim import AdamW
 from deepspeed.pipe import PipelineModule, TiedLayerSpec
 from deepspeed.utils import RepeatingLoader
-from torcheval.metrics.text import BLEUScore, Perplexity, WordErrorRate, WordInformationLost, WordInformationPreserved
-from pycocoevalcap.meteor.meteor import Meteor
-from pycocoevalcap.rouge.rouge import Rouge
-from pycocoevalcap.cider.cider import Cider
-from pycocoevalcap.spice.spice import Spice
 
 # TODO: fix this import when adding the sanity check features
 # import main_deepspeed_utils as main_deepspeed_utils
@@ -94,8 +88,6 @@ parser.add_argument('--zero_stage', type=int, default=1, help="ZeRO stage to use
 parser.add_argument('--do_train', action="store_true", help="Run training phase")
 parser.add_argument('--do_val', action="store_true", help="Run validation phase")
 parser.add_argument('--do_test', action="store_true", help="Run test phase")
-parser.add_argument('--generate_qualitative_report', action="store_true", help="Generate qualitative report with sample captions and images")
-parser.add_argument('--calculate_nlp_metrics', action="store_true", help="Calculate NLP metrics for generated captions")
 parser.add_argument('--create_universal', action="store_true", help="Create a universal checkpoint? (Requires doing a shell escape.)")
 parser.add_argument('--disable_tied_weights', action='store_true', help="Disable weight tying between embeddings and LM head for pipeline compatibility")
 parser.add_argument('--fp16_enabled', action='store_true', help="Enable fp16 everywhere")
@@ -113,46 +105,8 @@ parser.add_argument('-od', '--output_dir', default=pathlib.Path('./output_artifa
 
 args = parser.parse_args()
 
-def check_environment():
-    """Check distributed environment variables and setup"""
-    
-    print("ENVIRONMENT VARIABLES CHECK")
-    print("="*59)
-    
-    # Check required environment variables
-    required_vars = [
-        'MASTER_ADDR', 'MASTER_PORT', 'WORLD_SIZE', 'RANK',
-        'LOCAL_RANK', 'CUDA_VISIBLE_DEVICES'
-    ]
-    
-    for var in required_vars:
-        value = os.environ.get(var, 'NOT SET')
-        status = "✓" if value != 'NOT SET' else "✗"
-        print(f"{status} {var}: {value}")
-    
-    # Network connectivity check
-    master_addr = os.environ.get('MASTER_ADDR')
-    master_port = os.environ.get('MASTER_PORT')
-    
-    if master_addr and master_port:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(4)
-            result = sock.connect_ex((master_addr, int(master_port)))
-            sock.close()
-            
-            if result == -1:
-                print(f"✓ Network connectivity to {master_addr}:{master_port}: GOOD")
-            else:
-                print(f"✗ Network connectivity to {master_addr}:{master_port}: FAILED")
-        except Exception as e:
-            print(f"✗ Network check error: {e}")
-    
-    print("="*59)
-
 # Initialize distributed environment
-# if not dist.is_initialized():
-deepspeed.init_distributed()
+deepspeed.init_distributed("nccl")
 
 # Set seeds
 random.seed(args.random_seed)
@@ -237,6 +191,13 @@ tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 tokenizer.eos_token = tokenizer.eos_token or "<|endoftext|>"
 tokenizer.pad_token = tokenizer.eos_token 
 
+# For generation, we need a proper BOS token that's different from EOS
+# GPT-2 doesn't have a BOS token by default, so we'll use the EOS token ID as BOS
+# but handle this properly in the generation logic
+if tokenizer.bos_token is None:
+    tokenizer.bos_token = tokenizer.eos_token
+    # But we'll use a different strategy in generation to avoid immediate termination 
+
 # https://huggingface.co/docs/transformers/en/model_doc/timesformer
 config_encoder = TimesformerConfig.from_pretrained(pre_trained_video_encoder)
 config_encoder.image_size = args.image_size_encoder
@@ -302,15 +263,15 @@ class NPZDataset(Dataset):
     def __len__(self):
         return int(self.total_captions * self.subsample_size)
     
-    def get_filename(self, idx):
+    def __get_filename_for_idx(self, idx):
         # Calculate the index of the file based on the number of captions
         filename_index = idx // self.num_caption
         return self.file_names[filename_index]
-    
+
     def __getitem__(self, idx):
         filename_index = idx // self.num_caption
         labels_offset = idx % self.num_caption  
-
+    
         file_path = os.path.join(self.data_dir, self.file_names[filename_index])
         data = np.load(file_path)
 
@@ -334,52 +295,10 @@ class NPZDataset(Dataset):
                 # If the tensor is already at max length, replace the last token with <eos>
                 label_tensor[-1] = eos_token_id
 
-        # Convert metadata to tensor - DeepSpeed requires all inputs to be tensors!
-        # Create a simple tensor with: [filename_index, caption_idx, sample_idx]
-        metadata_tensor = torch.tensor([filename_index, labels_offset, idx], dtype=torch.long)
 
-        # TODO: Discover why we need a nested tuple with two sets of label_tensor
-        # It appears that deepspeed engine is stripping off labels when passing samples
-        # to our PipelineModule. But our model needs labels in the middle to calculate 
-        # TokenEmbeddings for GPT2 -- using the nested tuple makes the labels available 
-        # to our PiplineModule inputs and so we can pass them from layer to layer until
-        # the DecTokenEmbedWrapper later. After that, it appears we don't need to preserve
-        # labels anymore because the PipelineModule will take care of that interally
-        # with its daata loader while calculating loss with the lsos_fn that was provided.
-        # print(f"DEBUG: label_tensor: {label_tensor}")
-        # print(f"DEBUG: tokenizer.decode(): {tokenizer.decode(label_tensor, skip_special_tokens=False)}")
-        # sys.exit()
-        return ((pixel_values, label_tensor, metadata_tensor), label_tensor)
+        return ((pixel_values, label_tensor), label_tensor)
         # return pixel_values, label_tensor
         # returns a tuple of ((8,3,224,224), (1,1024))
-
-    def __repr__(self):
-        return f"NPZDataset(data_dir='{self.data_dir}', num_files={len(self.file_names)}, num_captions={self.num_caption}, total_samples={len(self)})"
-    
-    def get_sample_info(self, idx):
-        """Get filename and caption info for a specific sample index"""
-        filename_index = idx // self.num_caption
-        caption_num = idx % self.num_caption
-        return f"NPZ Filename: {self.file_names[filename_index]}, Caption Num: {caption_num}"
-
-    def get_gt_caption(self, idx):
-        """Get caption for a specific sample index"""
-        filename_index = idx // self.num_caption
-        caption_num = idx % self.num_caption
-        file_path = os.path.join(self.data_dir, self.file_names[filename_index])
-        data = np.load(file_path)
-        return tokenizer.decode(data['arr_1'][caption_num], skip_special_tokens=True)
-
-    def decode_metadata_tensor(self, metadata_tensor):
-        """Convert metadata tensor back to filename and info"""
-        filename_index = metadata_tensor[0].item()
-        caption_idx = metadata_tensor[1].item() 
-        sample_idx = metadata_tensor[2].item()
-        return {
-            'filename': self.file_names[filename_index],
-            'caption_idx': caption_idx,
-            'sample_idx': sample_idx
-        }
 
 # Create datasets and loaders
 train_dataset = NPZDataset(os.path.join(args.data_dir, 'train'), args.num_captions, args.subsample_size)
@@ -390,28 +309,16 @@ val_dataset = NPZDataset(os.path.join(args.data_dir, 'val'), args.num_captions, 
 val_sampler = DistributedSampler(val_dataset, num_replicas=args.num_gpus, rank=dist.get_rank(), shuffle=False)
 val_dataloader = DataLoader(val_dataset, sampler=val_sampler, batch_size=args.batch_size//dist.get_world_size(), collate_fn=default_collate, drop_last=True)
 
-# test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), args.num_captions, args.subsample_size)
-test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), args.num_captions, 0.01) # TODO: Change this back to args.subsample_size
+test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), args.num_captions, args.subsample_size)
 test_sampler = DistributedSampler(test_dataset, num_replicas=args.num_gpus, rank=dist.get_rank(), shuffle=False)
 test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size//dist.get_world_size(), collate_fn=default_collate, drop_last=True)
 
 # our dataloader generates batches of ((pixel_values, labels), labels)
 # for a batch size of three it would be [((pixel_values_1, labels_1), labels_1), ((pixel_values_2, labels_2), labels_2), ((pixel_values_3, labels_3), labels_3)]
 
-# SANITY CHECK DATALOADER
-# TODO: Turn into feature
-# Temporarily disable dataloader verification (can hang across ranks)
-# samples = verify_dataloader_samples(my_train_loader, tokenizer, num_samples=25, shuffle=False)
-# print(samples)
+# Dataloader verification disabled for now
 
-# SANITY CHECK WEIGHT TIEING 
-# TODO: Turn into feature
-# Add this call after model creation
-# verify_weight_tying(hf_model, local_rank)
-# sys.exit()
-
-# Add this after creating the model but before pipeline conversion
-# TODO: needs to be tested
+# Weight tying configuration
 if args.disable_tied_weights:
     # Break the tie by creating separate weights for lm_head
     if hasattr(hf_model.decoder.transformer.wte, 'weight') and hasattr(hf_model.decoder, 'lm_head'):
@@ -438,9 +345,9 @@ class InputWrapper(nn.Module):
         self.block = block
 
     def forward(self, inputs):
-        pixel_values, labels, metadata = inputs 
+        pixel_values, labels = inputs 
         hidden = self.block(pixel_values)
-        return hidden, labels, metadata 
+        return hidden, labels 
 
 class EncBlockWrapper(nn.Module):
     def __init__(self, block):
@@ -448,15 +355,25 @@ class EncBlockWrapper(nn.Module):
         self.block = block
 
     def forward(self, inputs):
-        hidden, labels, metadata = inputs
+        hidden, labels = inputs
         hidden = self.block(hidden)
-        return hidden[0], labels, metadata
+        return hidden[0], labels
+
+class EncFinalNormWrapper(nn.Module):
+    def __init__(self, layernorm):
+        super().__init__()
+        self.layernorm = layernorm
+
+    def forward(self, inputs):
+        hidden, labels = inputs
+        hidden = self.layernorm(hidden)
+        return hidden, labels
 
 # Adapter between encoder and decoder
 class Adapter(nn.Module):
     def forward(self, inputs):
-        hidden, labels, metadata = inputs
-        return hidden, labels, metadata
+        hidden, labels = inputs
+        return hidden, labels
 
 # Token embedding wrapper
 class DecTokenEmbedWrapper(nn.Module):
@@ -468,14 +385,25 @@ class DecTokenEmbedWrapper(nn.Module):
         self.vocab_size = wte.num_embeddings
 
     def forward(self, inputs):
-        hidden, labels, metadata = inputs
+        # Accept attention_mask optionally
+        hidden, labels = inputs
+        batch_size = hidden.shape[0]
+        seq_len = labels.shape[-1]
+        eos_token_id = tokenizer.eos_token_id
+        # attention_mask = torch.ones((batch_size, seq_len), dtype=torch.half, device=labels.device)
+        attention_mask = (labels != tokenizer.pad_token_id).bool()
         batch_size = hidden.shape[0]
         seq_len = labels.shape[-1]
         pos_ids = torch.arange(seq_len, device=labels.device).unsqueeze(0).expand(batch_size, -1)
         token_embeddings = self.wte(labels)
         pos_embeddings = self.wpe(pos_ids)
         emb = self.drop(token_embeddings + pos_embeddings)
-        return hidden, emb, labels, metadata
+        return hidden, emb, labels, attention_mask
+
+    @property
+    def weight(self):
+        """Return the embedding weights for tied weight support"""
+        return self.wte.weight
 
 class DecBlockWrapper(nn.Module):
     def __init__(self, block):
@@ -483,9 +411,16 @@ class DecBlockWrapper(nn.Module):
         self.block = block
         
     def forward(self, inputs):
-        hidden_in, token_emb, labels, metadata = inputs
-        hidden_out = self.block(token_emb, encoder_hidden_states=hidden_in, use_cache=False,)
-        return hidden_in, hidden_out[0], labels, metadata
+        # Accept attention_mask optionally
+        hidden_in, token_emb, labels, attention_mask = inputs
+        # Pass through decoder block with cross-attention and attention mask
+        hidden_out = self.block(
+            token_emb,
+            encoder_hidden_states=hidden_in,
+            attention_mask=attention_mask,
+            use_cache=False
+        )
+        return hidden_in, hidden_out[0], labels, attention_mask
 
 # Final output layer
 class FinalWrapper(nn.Module):
@@ -496,11 +431,15 @@ class FinalWrapper(nn.Module):
         self.eos_token_id = eos_token_id
 
     def forward(self, inputs):
-        _, hidden, labels, metadata = inputs[0], inputs[1], inputs[2], inputs[3]
+        _, hidden, labels = inputs[0], inputs[1], inputs[2]
         hidden = self.ln(hidden)
         logits = self.head(hidden)
 
         return logits
+
+    @property
+    def weight(self):
+        return self.head.weight
 
 # Pipeline block creation
 def to_pipeline_blocks(hf_model):
@@ -513,6 +452,7 @@ def to_pipeline_blocks(hf_model):
    
     # Maybe not needed
     # blocks.append(Adapter())
+    blocks.append(EncFinalNormWrapper(hf_model.encoder.layernorm))
 
     blocks.append(DecTokenEmbedWrapper(
         hf_model.decoder.transformer.wte,
@@ -527,7 +467,7 @@ def to_pipeline_blocks(hf_model):
     blocks.append(FinalWrapper( hf_model.decoder.transformer.ln_f, hf_model.decoder.lm_head, tokenizer.eos_token_id))
     return blocks
 
-def to_pipeline_blocks_with_tied_weights(hf_model):
+def to_pipeline_blocks_with_tied_weights(hf_model, eos_token_id):
     blocks = []
     
     # Encoder blocks (unchanged)
@@ -535,6 +475,8 @@ def to_pipeline_blocks_with_tied_weights(hf_model):
     for enc_block in hf_model.encoder.encoder.layer:
         blocks.append(EncBlockWrapper(enc_block))
     
+    blocks.append(EncFinalNormWrapper(hf_model.encoder.layernorm))
+
     # Tied embedding layer
     blocks.append(TiedLayerSpec(
         'embeddings',
@@ -554,16 +496,159 @@ def to_pipeline_blocks_with_tied_weights(hf_model):
         FinalWrapper,
         hf_model.decoder.transformer.ln_f,
         hf_model.decoder.lm_head,
-        tokenizer.eos_token_id,
+        eos_token_id,
     ))
     
     return blocks
 
+# def compute_loss(logits, labels):
+#     shift_logits = logits[..., :-1, :].contiguous()
+#     shift_labels = labels[..., 1:].contiguous()
+    
+#     # Flatten for cross entropy
+#     flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+#     flat_labels = shift_labels.view(-1)
+    
+#     # Standard cross entropy loss
+#     loss = F.cross_entropy(
+#         flat_logits, 
+#         flat_labels, 
+#         reduction='mean', 
+#         ignore_index=tokenizer.eos_token_id
+#     )
+    
+#     return loss
+
+# -------------------------------------------------------------
+# helper – greedy decode for the *block* model
+# -------------------------------------------------------------
+@torch.no_grad()
+def greedy_generate_blk(model,
+                        pixel_values: torch.Tensor,
+                        tokenizer,
+                        max_length: int = 30):
+    """
+    Greedy, autoregressive decoding for SpaceTimeGPTPlain.
+    Works by appending a PAD placeholder, so the last logit
+    corresponds to the *next* token, not the one we just fed in.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    pixel_values = pixel_values.to(device)
+
+    bos = tokenizer.bos_token_id
+    eos = tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id
+
+    seq = torch.full((pixel_values.size(0), 1), bos,
+                     dtype=torch.long, device=device)
+
+    for _ in range(max_length - 1):
+        # add a dummy token the model must predict
+        labels = torch.cat([seq,
+                            torch.full_like(seq[:, :1], pad)], dim=1)
+
+        logits = model.eval_batch(pixel_values, labels)          # (B, T, V)
+        next_tok = logits[:, -1].argmax(-1, keepdim=True)
+
+        seq = torch.cat([seq, next_tok], dim=1)
+
+        if eos is not None and (next_tok == eos).all():
+            break
+
+    return seq
+
+# ------------------------------------------------------------------
+# Greedy decoder for Pipeline-Module SpaceTimeGPT
+# ------------------------------------------------------------------
+@torch.no_grad()
+def greedy_decode_pipeline(engine,
+                           pixel_values: torch.Tensor,
+                           labels: torch.Tensor,
+                           tokenizer,
+                           max_len: int = 50,
+                           ctx_len: int = 1024):
+    """
+    Args
+    ----
+    engine        : DeepSpeed engine wrapping the PipelineModule
+    pixel_values  : (B, F, C, H, W)  – already on the right device
+    labels        : dummy tensor just to satisfy the pipeline’s loss_fn
+    tokenizer     : HF tokenizer (pad/eos configured)
+    max_len       : maximum generated caption length **excluding** BOS
+    ctx_len       : decoder context length (same as args.context_length)
+
+    Returns
+    -------
+    List[str]  – greedy captions for each element in the batch
+    """
+    device      = pixel_values.device
+    bos_id      = tokenizer.bos_token_id or tokenizer.eos_token_id
+    eos_id      = tokenizer.eos_token_id
+    pad_id      = tokenizer.pad_token_id
+
+    B = pixel_values.size(0)
+    seq = torch.full((B, 1), bos_id, dtype=torch.long, device=device)   # start <bos>
+
+    finished = torch.zeros(B, dtype=torch.bool, device=device)
+
+    for _ in range(max_len):
+        # ----------------------------------------------------------
+        # 1. prepare decoder input: current seq + PAD placeholder
+        # ----------------------------------------------------------
+        dec_in = torch.cat([seq, seq.new_full((B, 1), pad_id)], dim=1)
+
+        # truncate / pad to ctx_len
+        if dec_in.size(1) < ctx_len:
+            dec_in = F.pad(dec_in, (0, ctx_len - dec_in.size(1)), value=pad_id)
+        else:
+            dec_in = dec_in[:, -ctx_len:]
+
+        # ----------------------------------------------------------
+        # 2. run one forward pass through the pipeline
+        #    engine.eval_batch expects an iterator that yields
+        #    ((pixel_values, decoder_input), labels)
+        # ----------------------------------------------------------
+        batch_iter = iter(
+            RepeatingLoader([((pixel_values, dec_in), labels)])
+        )
+        _, logits = engine.eval_batch(batch_iter,
+                                      return_logits=True,
+                                      compute_loss=False,
+                                      bcast_loss=False)
+
+        if engine.is_last_stage():
+            # logits: (B, ctx_len, V). We want the *placeholder* position.
+            next_logits = logits[:, seq.size(1), :]            #   ^ last real+PAD idx
+            next_tokens = next_logits.argmax(dim=-1).to(device)                       # (B,)
+
+            # ----------------------------------------------------------
+            # 3. update sequence & finished mask
+            # ----------------------------------------------------------
+            seq = torch.cat([seq, next_tokens.unsqueeze(1)], dim=1)
+            finished |= next_tokens.eq(eos_id)
+
+            if finished.all():
+                break
+
+    if engine.is_last_stage():
+        # ------------------------------------------------------------------
+        # decode *without* BOS, truncate everything after first EOS
+        # ------------------------------------------------------------------
+        captions = []
+        for s in seq[:, 1:].tolist():          # strip first token
+            if eos_id in s:
+                s = s[: s.index(eos_id)]
+            captions.append(tokenizer.decode(s, skip_special_tokens=True))
+
+        return captions
+
+
 def compute_loss(logits, labels):
-    return F.cross_entropy(
-        logits.view(-1, logits.size(-1)),
-        labels.view(-1)
-    )
+    loss_fct = CrossEntropyLoss()
+    loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
+    return loss
+
 
 if args.fp16_enabled:
     hf_model = hf_model.half()
@@ -580,17 +665,26 @@ if args.freeze_encoder_decoder:
                 param.requires_grad = True
 
 # Convert to pipeline 
-blocks = to_pipeline_blocks(hf_model)
+# blocks = to_pipeline_blocks(hf_model)
 # TODO: use the tied weights version and compare to non-tied weights version
-# blocks = to_pipeline_blocks_with_tied_weights(hf_model)
+blocks = to_pipeline_blocks_with_tied_weights(hf_model, tokenizer.eos_token_id)
 
-# loss_fn=torch.nn.CrossEntropyLoss(),
 hf_model = PipelineModule(
     layers=blocks,
     loss_fn=compute_loss,
     num_stages=dist.get_world_size(),
     partition_method=args.partition_method
 )
+
+
+# Print Pipeline Model Architecture
+# for rank in range(dist.get_world_size()):
+#     dist.barrier()
+#     if dist.get_rank() == rank:
+#         print(f"\n--- Model architecture for rank {rank} ---\n{hf_model}\n")
+#     dist.barrier()
+
+# sys.exit(0)
 
 # Initialize optimizer
 optimizer = AdamW([p for p in hf_model.parameters() if p.requires_grad], 
@@ -633,15 +727,15 @@ if args.do_train:
             loss = deep_speed_model_engine.train_batch()
 
             if dist.get_rank() == (dist.get_world_size() - 1):
-                wandb.log({"Exp/Train Batch Loss️": loss.item()})
+                wandb.log({"Exp/Train Batch Loss️": loss.item(), "epoch": epoch})
                 total_train_loss += loss.item()
 
             if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
-                print(f"Train Batch Loss Step {step+1}/{steps_per_epoch}, Loss: {loss.item():.4f}" )
+                print(f"Train Epoch {epoch} Batch Loss Step {step+1}/{steps_per_epoch}, Loss: {loss.item():.4f}" )
         
         if dist.get_rank() == (dist.get_world_size() - 1):
             print(f"Train Average Epoch {epoch} Loss: {(total_train_loss/steps_per_epoch)}")
-            wandb.log({f"Exp/Train Average Loss": (total_train_loss/steps_per_epoch) })
+            wandb.log({f"Exp/Train Average Loss": (total_train_loss/steps_per_epoch), "epoch": epoch })
 
         dist.barrier()
         
@@ -658,34 +752,33 @@ if args.do_train:
             deep_speed_model_engine.eval()
             val_iter = iter(RepeatingLoader(val_dataloader))
 
-            num_val_batches = len(val_dataset) // (
-                ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size()
+            # num_val_batches = len(val_dataset) // (
+            #     ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size()
+            # )
+
+            steps_per_epoch = len(train_dataset) // (
+                args.batch_size * dist.get_world_size() * ds_config['gradient_accumulation_steps']
             )
 
             total_val_loss = 0.0
-            for step in range(num_val_batches):
+            for step in range(steps_per_epoch):
                 loss, logits = deep_speed_model_engine.eval_batch(data_iter=val_iter,return_logits=True)
-                # print(f"DEBUG: logits type: {type(logits)}, loss: {loss.item()}")
 
                 if deep_speed_model_engine.is_last_stage():
-                    # print(f"DEBUG: logits[0] type: {type(logits[0])}")
-                    # print(f"DEBUG: logits[0] shape: {logits[0].shape}")
                     probs = F.softmax(logits[0], dim=-1) 
-                    # print("DEBUG: probs shape:", probs.shape)
 
                     tokens = torch.argmax(probs, dim=-1)
                     sentence = tokenizer.decode(tokens, skip_special_tokens=True)
-                    print(f"DEBUG: sentence: {sentence}")
                     total_val_loss += loss.item()
 
                 if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
-                    print(f"Val Batch Loss Step {step+1}/{num_val_batches}, Loss: {loss.item():.4f}" )
-                    wandb.log({"Exp/Val Batch Loss": loss.item()})
+                    print(f"  Val Epoch {epoch} Batch Loss Step {step+1}/{steps_per_epoch}, Loss: {loss.item():.4f}" )
+                    wandb.log({"Exp/Val Batch Loss": loss.item(), "epoch": epoch})
 
-            if deep_speed_model_engine.is_last_stage():
-                val_loss = total_val_loss / num_val_batches
-                print(f"Val Average Epoch {epoch} Loss: {val_loss}")
-                wandb.log({"Exp/Val Average Loss": val_loss})
+            if dist.get_rank() == (dist.get_world_size() - 1):
+                val_loss = total_val_loss / steps_per_epoch
+                print(f"   Val Average Epoch {epoch} Loss: {val_loss}")
+                wandb.log({"Exp/Val Average Loss": val_loss, "epoch": epoch})
 
     # Destroy deepspeed model engine to free up GPU memory
     # deep_speed_model_engine.destroy()
@@ -731,15 +824,14 @@ if args.create_universal:
 
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
-
-def beam_decode_batch(deep_speed_model_engine, pixel_values, labels, tokenizer, args):
+    
+def beam_decode_batch(deep_speed_model_engine, pixel_values, tokenizer, args):
     """
     Perform beam search decoding for a batch using DeepSpeed pipeline.
     
     Args:
         deep_speed_model_engine: The DeepSpeed model engine
         pixel_values: Input video frames tensor
-        labels: Labels tensor (used for input format consistency)
         tokenizer: The tokenizer
         args: Arguments containing beam parameters
     
@@ -782,7 +874,6 @@ def beam_decode_batch(deep_speed_model_engine, pixel_values, labels, tokenizer, 
     # Expand pixel_values for beam search
     # Shape: (batch_size * num_beams, ...)
     expanded_pixel_values = pixel_values.unsqueeze(1).expand(batch_size, num_beams, *pixel_values.shape[1:]).reshape(batch_size * num_beams, *pixel_values.shape[1:])
-    expanded_labels = labels.unsqueeze(1).expand(batch_size, num_beams, *labels.shape[1:]).reshape(batch_size * num_beams, *labels.shape[1:])
     
     # Beam search scores
     beam_scores = torch.zeros((batch_size, num_beams), dtype=torch.float, device=device)
@@ -797,15 +888,16 @@ def beam_decode_batch(deep_speed_model_engine, pixel_values, labels, tokenizer, 
             padded_input_ids = F.pad(input_ids, (0, 1024 - current_length), "constant", 0)
         else:
             padded_input_ids = input_ids[:, :1024]
-        
+        # Create attention mask: 1 for generated tokens, 0 for padding
+        attention_mask = torch.zeros_like(padded_input_ids)
+        attention_mask[:, :current_length] = 1
         # Create inputs for the model
-        inputs = iter(RepeatingLoader([((expanded_pixel_values, padded_input_ids), expanded_labels)]))
-        
+        inputs = iter(RepeatingLoader([((expanded_pixel_values, padded_input_ids, attention_mask), padded_input_ids, attention_mask)]))
         # Get model outputs
         loss, logits = deep_speed_model_engine.eval_batch(
-            data_iter=inputs, 
-            return_logits=True, 
-            bcast_loss=False, 
+            data_iter=inputs,
+            return_logits=True,
+            bcast_loss=False,
             compute_loss=False
         )
         
@@ -918,6 +1010,115 @@ def topk_top_p_sampling(logits, top_k=10, top_p=0.9, temperature=0.7):
     probs = probs / probs.sum(dim=-1, keepdim=True)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
+def greedy_decode_batch(deep_speed_model_engine, pixel_values, tokenizer, args, max_length=None):
+    """
+    Perform greedy auto-regressive decoding for a batch using DeepSpeed pipeline.
+    
+    Args:
+        deep_speed_model_engine: The DeepSpeed model engine
+        pixel_values: Input video frames tensor (batch_size, ...)
+        tokenizer: The tokenizer
+        args: Arguments containing decoding parameters
+        max_length: Maximum length of the generated caption
+    
+    Returns:
+        List of predicted captions (strings)
+    """
+    if max_length is None:
+        max_length = args.max_caption_length
+
+    device = pixel_values.device
+    batch_size = pixel_values.shape[0]
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id
+    
+    # Initialize sequence buffer to match training format (full context length)
+    input_sequences = torch.full((batch_size, args.context_length), pad_token_id, dtype=torch.long, device=device)
+    finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=device)
+    
+    # Track actual generation length separately
+    generated_length = 0
+    
+    # Auto-regressive generation loop
+    for step in range(max_length):
+        # Create attention mask: 1 for generated tokens, 0 for padding
+        attention_mask = torch.zeros_like(input_sequences)
+        attention_mask[:, :generated_length] = 1
+        # Prepare input in the format expected by the pipeline: ((pixel_values, labels, attention_mask), labels, attention_mask)
+        model_inputs = iter(RepeatingLoader([((pixel_values, input_sequences, attention_mask), input_sequences, attention_mask)]))
+        # Forward pass through the model
+        with torch.no_grad():
+            loss, logits = deep_speed_model_engine.eval_batch(
+                data_iter=model_inputs,
+                return_logits=True,
+                bcast_loss=False,
+                compute_loss=False
+            )
+        
+        # Only the last pipeline stage will have logits
+        if deep_speed_model_engine.is_last_stage():
+            # Get logits for the current generation position
+            next_token_logits = logits[:, generated_length, :]  # Shape: (batch_size, vocab_size)
+            
+            # Suppress EOS token for the first few positions to force generation
+            if generated_length < args.min_caption_length:
+                next_token_logits[:, eos_token_id] = -float('inf')
+            
+            # Also suppress padding token to avoid generating padding
+            next_token_logits[:, pad_token_id] = -float('inf')
+            
+            # Greedy decoding: select the token with highest probability
+            next_tokens = torch.argmax(next_token_logits, dim=-1)  # Shape: (batch_size,)
+            
+            # Update finished status for sequences that generated EOS (only after min length)
+            if generated_length >= args.min_caption_length:
+                newly_finished = (next_tokens == eos_token_id)
+                finished_sequences = finished_sequences | newly_finished
+            
+            # Ensure all tensors are on the same device before torch.where
+            finished_sequences = finished_sequences.to(next_tokens.device)
+            pad_token_tensor = torch.tensor(pad_token_id, device=next_tokens.device, dtype=next_tokens.dtype)
+            
+            # Only update sequences that haven't finished
+            next_tokens = torch.where(finished_sequences, pad_token_tensor, next_tokens)
+            
+            # Update the input sequence at the current position
+            input_sequences[:, generated_length] = next_tokens
+            
+            generated_length += 1
+            
+            # Stop if all sequences are finished
+            if finished_sequences.all():
+                break
+                
+        else:
+            # For non-last stages, we need to synchronize and continue
+            generated_length += 1
+    
+    # Convert generated sequences to text (only on last stage)
+    predicted_captions = []
+    if deep_speed_model_engine.is_last_stage():
+        for i in range(batch_size):
+            # Extract only the generated part (first generated_length tokens)
+            sequence = input_sequences[i, :generated_length].cpu().tolist()
+            
+            # Find EOS token and truncate if present
+            if eos_token_id in sequence:
+                eos_idx = sequence.index(eos_token_id)
+                sequence = sequence[:eos_idx]
+            
+            # Remove any remaining padding tokens
+            sequence = [token for token in sequence if token != pad_token_id]
+            
+            # Decode to text
+            if sequence:  # Only decode if sequence is not empty
+                caption = tokenizer.decode(sequence, skip_special_tokens=True)
+            else:
+                caption = ""
+            predicted_captions.append(caption)
+    
+    return predicted_captions
+
 dist.barrier()
 ##################################################
 # Testing Loop and qualitative report generation
@@ -955,12 +1156,9 @@ if args.do_test:
     # deep_speed_model_engine.load_checkpoint(checkpoint_path, tag=f"epoch_{args.num_epochs-1}")
 
     deep_speed_model_engine.eval()
+
     test_iter = iter(RepeatingLoader(test_dataloader))
     num_test_batches = len(test_dataset) // (ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size())
-
-    all_predicted_captions = []
-    all_ground_truth_captions = []
-    all_filenames = []
 
     #############################################################
     # Decoding strategies:
@@ -969,86 +1167,38 @@ if args.do_test:
     # topk top p decoding - is another sampling method that is more diverse than greedy decoding (topk=1 should be equivalent to greedy decoding)
     # beam search decoding - is a more complex sampling method that considers multiple beams of next words
     total_test_loss = 0.0
-    ground_truth_captions = []
     for step in range(num_test_batches):
-
         if args.num_beams > 1:
             #############################################################
             # BEAM DECODING
             #############################################################
             batch = next(test_iter)
-
             pixel_values = batch[0][0]
             labels = batch[0][1]
-            metadata_tensor = batch[0][2]  # Extract metadata tensor
             
-            # Extract filenames from metadata tensor for this batch
-            batch_filenames = []
-            batch_idxs = []
-            for meta_tensor in metadata_tensor:
-                metadata = test_dataset.decode_metadata_tensor(meta_tensor)
-                batch_filenames.append(metadata['filename'])
-                batch_idxs.append(metadata['sample_idx'])
-            all_filenames.extend(batch_filenames)
-            ground_truth_captions = [test_dataset.get_gt_caption(sample_idx) for sample_idx in batch_idxs]
-            predicted_captions = beam_decode_batch( deep_speed_model_engine, pixel_values, labels, tokenizer, args)
-            all_predicted_captions.extend(predicted_captions)
-            all_ground_truth_captions.extend(ground_truth_captions)
+            predicted_captions = beam_decode_batch( deep_speed_model_engine, pixel_values, tokenizer, args)
             
-            if deep_speed_model_engine.is_last_stage():
-                print(f"DEBUG: beam search predicted_captions: {predicted_captions}")
+            # Synchronize all pipeline stages before moving to next batch
+            dist.barrier()
+            
         elif args.direct_decoding: 
             #############################################################
             # DIRECT DECODING 
             #############################################################
-            batch = next(test_iter)
-            pixel_values = batch[0][0]
-            labels = batch[0][1]
-            metadata_tensor = batch[0][2]  # Extract metadata tensor
-
-            # Create a single-batch iterator with the current batch
-            batch_iter = iter(RepeatingLoader([batch]))
-            
-            loss, logits = deep_speed_model_engine.eval_batch(data_iter=batch_iter, return_logits=True, bcast_loss=True, compute_loss=True)
+            loss,logits = deep_speed_model_engine.eval_batch(data_iter=test_iter, return_logits=True, bcast_loss=True, compute_loss=True)
             total_test_loss += loss.item()
 
             if deep_speed_model_engine.is_last_stage():
-                batch_size = logits.shape[0]  # Use actual batch size from logits
-                
-                # Extract filenames from metadata tensor for this batch
-                batch_filenames = []
-                batch_idxs = []
-                batch_predicted_captions = []
-                batch_ground_truth_captions = []
-                
-                for i in range(batch_size):
-                    # Get metadata for this sample
-                    metadata = test_dataset.decode_metadata_tensor(metadata_tensor[i])
-                    batch_filenames.append(metadata['filename'])
-                    batch_idxs.append(metadata['sample_idx'])
-                    
-                    # Get ground truth caption
-                    ground_truth_caption = test_dataset.get_gt_caption(metadata['sample_idx'])
-                    batch_ground_truth_captions.append(ground_truth_caption)
+                # TODO: make sure subindex 0 still makes sense on next line in more than 1 in batch context
+                probs = F.softmax(logits[0], dim=-1)  # Apply softmax to get probabilities
+                tokens = torch.argmax(probs, dim=-1)  # Get the predicted token indices
 
-                    # Process logits for this specific sample in the batch
-                    probs = F.softmax(logits[i], dim=-1)  # Apply softmax to get probabilities for sample i
-                    tokens = torch.argmax(probs, dim=-1)  # Get the predicted token indices
+                if tokenizer.eos_token_id in tokens:
+                    tokens = list(tokens.cpu().numpy())
+                    tokens = tokens[:tokens.index(tokenizer.eos_token_id)]  # Truncate at <eos> token
+                predicted_captions = tokenizer.decode(tokens, skip_special_tokens=True)
 
-                    if tokenizer.eos_token_id in tokens:
-                        tokens = list(tokens.cpu().numpy())
-                        tokens = tokens[:tokens.index(tokenizer.eos_token_id)]  # Truncate at <eos> token
-
-                    predicted_caption = tokenizer.decode(tokens, skip_special_tokens=True)
-                    batch_predicted_captions.append(predicted_caption)
-                    
-                    print(f"DEBUG: Sample {i}, Predicted: '{predicted_caption}', GT: '{ground_truth_caption}'")
-                
-                # Add batch results to global lists
-                all_filenames.extend(batch_filenames)
-                all_predicted_captions.extend(batch_predicted_captions)
-                all_ground_truth_captions.extend(batch_ground_truth_captions)
-        elif not args.direct_decoding and (args.top_k is not None and args.top_p is not None):
+        elif not (args.direct_decoding or args.greedy_decoding) and (args.top_k is not None and args.top_p is not None):
             #############################################################
             # topk_topp_deocding
             #############################################################
@@ -1058,18 +1208,6 @@ if args.do_test:
             # for sample in batch:
             pixel_values = batch[0][0] # (1, 8, 3, 224, 244)
             labels = batch[0][1]  # (1, 1024)
-            metadata_tensor = batch[0][2]  # Extract metadata tensor
-            
-            # Extract filenames from metadata tensor for this batch
-            batch_filenames = []
-            batch_idxs = []
-            for meta_tensor in metadata_tensor:
-                metadata = test_dataset.decode_metadata_tensor(meta_tensor)
-                batch_filenames.append(metadata['filename'])
-                batch_idxs.append(metadata['sample_idx'])
-            all_filenames.extend(batch_filenames)
-            ground_truth_captions = [test_dataset.get_gt_caption(sample_idx) for sample_idx in batch_idxs]
-            all_ground_truth_captions.extend(ground_truth_captions)
 
             tokens = torch.tensor([[tokenizer.encode("<|endoftext|>")]]).to(pixel_values.device)  # Start with <eos> token
             tokens = F.pad(tokens, (0, 1023), "constant", 0).squeeze(0)  # Pad to max caption length
@@ -1080,175 +1218,50 @@ if args.do_test:
             for _ in range(args.max_caption_length):
                 # Create current input sequence - pad the growing output to 1024
                 current_tokens = torch.tensor(outputs + [0] * (1024 - len(outputs))).unsqueeze(0).to(pixel_values.device)
-                inputs = iter(RepeatingLoader([((pixel_values, current_tokens), labels)]))
+                # Create attention mask: 1 for generated tokens, 0 for padding
+                attention_mask = torch.zeros_like(current_tokens)
+                attention_mask[:, :len(outputs)] = 1
+                inputs = iter(RepeatingLoader([((pixel_values, current_tokens, attention_mask), current_tokens, attention_mask)]))
                 loss, logits = deep_speed_model_engine.eval_batch(data_iter=inputs, return_logits=True, bcast_loss=False, compute_loss=False)
 
                 if deep_speed_model_engine.is_last_stage():
-                    # TODO: Not that logits[0, .......] two lines below may not be batch aware
                     # Get logits for the last actual token position (not padding)
                     next_token_logits = logits[0, len(outputs)-1, :]  # Position of last real token
                     next_token = topk_top_p_sampling( next_token_logits.unsqueeze(0), top_k=args.top_k, top_p=args.top_p, temperature=args.temperature).item()
                     outputs.append(next_token)
-                    
                     # Stop if we generate EOS token
                     if next_token == tokenizer.eos_token_id:
                         break
-                    print("DEBUG: outputs:", outputs)
 
             predicted_caption = tokenizer.decode(outputs[1:], skip_special_tokens=True)
-            print("DEBUG: predicted_caption:", predicted_caption)
-            # predicted_captions.append(predicted_caption)
-            all_predicted_captions.append(predicted_caption)
+            predicted_captions.append(predicted_caption)
+        elif args.greedy_decoding:
+            #############################################################
+            # GREEDY DECODING
+            #############################################################
+            batch = next(test_iter)
+            pixel_values = batch[0][0]
+            labels = batch[0][1]
+
+            # predicted_captions = greedy_decode_batch(deep_speed_model_engine, pixel_values, tokenizer, args)
+            # predicted_captions = greedy_generate_pipeline(deep_speed_model_engine, pixel_values, tokenizer, max_length=args.max_caption_length)
+            predicted_captions = greedy_decode_pipeline(
+                deep_speed_model_engine,
+                pixel_values,
+                labels,
+                tokenizer,
+                max_len=args.max_caption_length,
+                ctx_len=args.context_length,
+            )
+
+
         else:
             print("ERROR: Please specify a sampling strategy for decoding (e.g. --top_k, --top_p, --direct_decoding, --greedy_decoding, --num_beams > 1)")
             sys.exit(1)
 
-    # # After processing on last stage, gather results across all ranks
-    # if dist.get_world_size() > 1:
-    #     # Gather results from all ranks
-    #     all_predicted_captions_gathered = [None] * dist.get_world_size()
-    #     all_ground_truth_captions_gathered = [None] * dist.get_world_size()
-    #     all_filenames_gathered = [None] * dist.get_world_size()
-        
-    #     dist.all_gather_object(all_predicted_captions_gathered, all_predicted_captions)
-    #     dist.all_gather_object(all_ground_truth_captions_gathered, all_ground_truth_captions)
-    #     dist.all_gather_object(all_filenames_gathered, all_filenames)
-        
-    #     # Flatten the gathered results
-    #     all_predicted_captions = [item for sublist in all_predicted_captions_gathered for item in sublist]
-    #     all_ground_truth_captions = [item for sublist in all_ground_truth_captions_gathered for item in sublist]
-    #     all_filenames = [item for sublist in all_filenames_gathered for item in sublist]
-        
-    #     # if deep_speed_model_engine.is_last_stage():
-    #     #      print(f"DEBUG: predicted_captions: {predicted_captions}")
-    #     #      all_predicted_captions.extend(predicted_captions)
-    #     #      all_ground_truth_captions.extend(ground_truth_captions)
-    
-    print("DEBUG MICRO REPORT:")
-    print(list(zip(all_filenames, all_predicted_captions, all_ground_truth_captions))[:20])
-    # Test Decoding has finished...
-    # 1 finalize NLP metrics 
-    #   - save item-wise metrics to CSV
-    #   - log metrics to wandb
-    # 2 generate qualtiative report with 
-    #   - experiment details (parameters)
-    #   - train/val/test average loss
-    #   - all available NLP metrics (aggregate)
-    #   - qualitative report with frames, predicted captions, and ground truth captions
-    #       - save as .html with embedded base64 images
-
-
-def calculate_classic_nlp_metrics_and_total_loss(filenames, predicted_captions, ground_truth_captions, exp_subset="Test", total_loss=0.0, dataset_length=0):
-    wandb_name = "Exp/" + exp_subset 
-    metrics_dict = {}
-    bleu1_metric = BLEUScore(n_gram=1)
-    bleu2_metric = BLEUScore(n_gram=2)
-    bleu3_metric = BLEUScore(n_gram=3)
-    bleu4_metric = BLEUScore(n_gram=4)
-    word_error_rate_metric = WordErrorRate()
-    word_info_lost_metric = WordInformationLost()
-    word_info_preserved_metric = WordInformationPreserved()
-
-    metrics_dict[wandb_name + " avg_test_loss"] = total_test_loss / len(test_dataloader)
-
-    metrics_dict[wandb_name + " bleu1_score"] = bleu1_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-    metrics_dict[wandb_name + " bleu2_score"] = bleu2_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-    metrics_dict[wandb_name + " bleu3_score"] = bleu3_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-    metrics_dict[wandb_name + " bleu4_score"] = bleu4_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-    # metrics_dict["perplexity_score"] = perplexity_metric.compute().item()
-    metrics_dict[wandb_name + " word_error_rate_score"] = word_error_rate_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-    metrics_dict[wandb_name + " word_info_lost_score"] = word_info_lost_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-    metrics_dict[wandb_name + " word_info_preserved_score"] = word_info_preserved_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item()
-
-    return metrics_dict
-
-def calculate_classic_nlp_metrics_per_instance(filenames, predicted_captions, ground_truth_captions):
-    instance_metrics = {}
-    instance_metrics['filenames'] = filenames
-    instance_metrics['predicted_captions'] = predicted_captions
-    instance_metrics['ground_truth_captions'] = ground_truth_captions
-    instance_metrics['bleu1_scores'] = []
-    instance_metrics['bleu2_scores'] = []
-    instance_metrics['bleu3_scores'] = []
-    instance_metrics['bleu4_scores'] = []
-    instance_metrics['word_error_rate_scores'] = []
-    instance_metrics['word_info_lost_scores'] = []
-    instance_metrics['word_info_preserved_scores'] = []
-
-    for i, filename in enumerate(filenames):
-        predicted_caption = predicted_captions[i]
-        ground_truth_caption = ground_truth_captions[i] 
-
-        bleu1_metric = BLEUScore(n_gram=1)
-        bleu2_metric = BLEUScore(n_gram=2)
-        bleu3_metric = BLEUScore(n_gram=3)
-        bleu4_metric = BLEUScore(n_gram=4)
-        word_error_rate_metric = WordErrorRate()
-        word_info_lost_metric = WordInformationLost()
-        word_info_preserved_metric = WordInformationPreserved()
-
-        instance_metrics['bleu1_scores'].append(bleu1_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
-        instance_metrics['bleu2_scores'].append(bleu2_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
-        instance_metrics['bleu3_scores'].append(bleu3_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
-        instance_metrics['bleu4_scores'].append(bleu4_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
-        # metrics_list.append(perplexity_metric.compute().item()
-        instance_metrics['word_error_rate_scores'].append(word_error_rate_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
-        instance_metrics['word_info_lost_scores'].append(word_info_lost_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
-        instance_metrics['word_info_preserved_scores'].append(word_info_preserved_metric.update(all_predicted_captions, all_ground_truth_captions).compute().item())
-
-    return instance_metrics
-
-def compute_advanced_nlp_metrics_with_instances(filenames, predicted_captions, ground_truth_captions, exp_subset="Test"):
-    wandb_name = "Exp/" + exp_subset
-    metrics_dict = {}
-    instance_metrics = {}
-
-    all_ground_truth_captions_flattened = [[x.replace('\n', ' ').strip()] for x in all_ground_truth_captions]
-    all_predicted_captions_flattened = [[x.replace('\n', ' ').strip()] for x in all_predicted_captions]
-    all_ground_truth_captions_dict = dict(zip(all_filenames, all_ground_truth_captions_flattened))
-    all_predicted_captions_dict = dict((zip(all_filenames, all_predicted_captions_flattened)))
-
-    metrics_dict[wandb_name + " cider_score"], instance_metrics['cider_scores'] = Cider().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
-    metrics_dict[wandb_name + " meteor_score"], instance_metrics['meteor_scores'] = Meteor().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
-    metrics_dict[wandb_name + " rouge_score"], instance_metrics['rouge_scores'] = Rouge().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
-    metrics_dict[wandb_name + " spice_score"], instance_metrics['spice_scores']= Spice().compute_score(all_ground_truth_captions_dict, all_predicted_captions_dict)
-    return metrics_dict, instance_metrics
-
-if args.calculate_nlp_metrics:
-    if deep_speed_model_engine.is_last_stage():
-        classic_metrics_dict = calculate_classic_nlp_metrics_and_total_loss(all_filenames, all_predicted_captions, all_ground_truth_captions, "Test", total_test_loss, len(test_dataset))
-        advanced_metrics_dict, advanced_instance_metrics = compute_advanced_nlp_metrics_with_instances(all_filenames, all_predicted_captions, all_ground_truth_captions, "Test")
-        classic_instance_metrics = calculate_classic_nlp_metrics_per_instance(all_filenames, all_predicted_captions, all_ground_truth_captions)
-        wandb_metrics_dict = {**classic_metrics_dict, **advanced_metrics_dict}
-        wandb.log(wandb_metrics_dict)
-
-        # Save instance metrics to CSV
-        instance_metrics_df = pd.DataFrame({
-            'filename': all_filenames,
-            'predicted_caption': all_predicted_captions,
-            'ground_truth_caption': all_ground_truth_captions,
-            'bleu1_score': classic_instance_metrics['bleu1_scores'],
-            'bleu2_score': classic_instance_metrics['bleu2_scores'],
-            'bleu3_score': classic_instance_metrics['bleu3_scores'],
-            'bleu4_score': classic_instance_metrics['bleu4_scores'],
-            'word_error_rate_score': classic_instance_metrics['word_error_rate_scores'],
-            'word_info_lost_score': classic_instance_metrics['word_info_lost_scores'],
-            'word_info_preserved_score': classic_instance_metrics['word_info_preserved_scores'],
-            'cider_score': advanced_instance_metrics['cider_scores'],
-            'meteor_score': advanced_instance_metrics['meteor_scores'],
-            'rouge_score': advanced_instance_metrics['rouge_scores'],
-            'spice_score': advanced_instance_metrics['spice_scores']
-        })
-        instance_metrics_csv_path = os.path.join(experiment_output_dir, "instance_metrics.csv")
-        instance_metrics_df.to_csv(instance_metrics_csv_path, index=False)  
-   
-if args.generate_qualitative_report:
-
-
-    pass
+        print(f"Predicted captions: {predicted_captions}")
     
 dist.barrier()
 
 if dist.get_rank() == (dist.get_world_size() - 1):
     wandb.finish()
-
