@@ -9,15 +9,15 @@ export MASTER_PORT=29500
 export NCCL_SOCKET_IFNAME=eno1
 
 ZERO_STAGE=1
-NUM_EPOCHS=10
+NUM_EPOCHS=2
 NUM_CAPTIONS=10
-SUBSET_SIZE=1.0
+SUBSET_SIZE=0.1
 
 NUM_HIDDEN_LAYERS=12
 HIDDEN_SIZE_ENCODER=768
 GRADIENT_ACCUMULATION_STEPS=4
 
-EXPERIMENT_NAME="VATEX"
+EXPERIMENT_NAME="VATEX-single-loaders"
 DATA_DIR="/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames"
 OUTPUT_DIR="/data2/juve/training_artifacts/"
 
@@ -36,8 +36,7 @@ TOKENIZER="gpt2"
 
 # torchrun --nproc_per_node=3 --nnodes=1 --node_rank=0 main_deepspeed.py  --num_gpus $NUM_GPU \
     # --pretrained_model $PRETRAINED_MODEL \
-deepspeed --master_addr $MASTER_ADDR --master_port $MASTER_PORT main_deepspeed.py --num_gpus $NUM_GPU \
-    --fresh_weights \
+deepspeed --master_addr $MASTER_ADDR --master_port $MASTER_PORT main_deepspeed_gpt5_refactor.py --num_gpus $NUM_GPU \
     --world_size $WORLD_SIZE -ep $NUM_EPOCHS -ss $SUBSET_SIZE --num_captions $NUM_CAPTIONS \
     --experiment_name $EXPERIMENT_NAME --batch_size $BATCH_SIZE \
     --data_dir $DATA_DIR --output_dir $OUTPUT_DIR \
@@ -47,12 +46,22 @@ deepspeed --master_addr $MASTER_ADDR --master_port $MASTER_PORT main_deepspeed.p
     --tokenizer $TOKENIZER --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
     --num_hidden_layers $NUM_HIDDEN_LAYERS --hidden_size_encoder $HIDDEN_SIZE_ENCODER \
     --zero_stage $ZERO_STAGE \
-    --fp16_enabled --early_stopping --no_repeat_ngram_size 3 \
-    --do_test \
-    --resume_from_checkpoint 9 \
-    --num_beams 1 \
-    --direct_decoding \
-    --calculate_nlp_metrics \
-    # --top_k 1 --top_p 1.0 \
-    # --temperature 1.0 \
-    # --do_train --do_val \
+    --fp16_enabled --early_stopping \
+    --fresh_weights \
+    --do_test --num_qualitative 100 \
+    --greedy_decoding \
+    --do_train --do_val \
+    # --resume_from_checkpoint 0 \
+    # --decode_strategy sample --top_k 50 --top_p 0.9 --temperature 1.0 --no_repeat_ngram_size 3 \
+    # --decode_strategy beam --num_beams 5 --length_penalty 1.0 --no_repeat_ngram_size 3 --temperature 1.0 \
+    # --no_repeat_ngram_size 3 \
+    # --temperature 1.5 \
+    # --num_beams 1 \
+    # --create_universal \
+    # --disable_tied_weights \
+    # --calculate_nlp_metrics \
+    # --direct_decoding \
+    # --top_k 10 --top_p 0.9 \
+    # --generate_qualitative_report \
+    # --num_qualitative 100 \
+    # --decoding_strategy direct \
