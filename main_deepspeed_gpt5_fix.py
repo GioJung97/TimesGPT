@@ -567,27 +567,32 @@ def main():
             # head_mask has shape n_layer x batch x n_heads x N x N
             self.head_mask = [None] * num_blocks
         
-        def invert_attention_mask(self, mask_2d):
-            # 2D -> additive (B,1,1,S)
-            m = mask_2d[:, None, None, :].to(self.dtype)
-            neg = -1e4 if self.dtype == torch.float16 else -1e9
-            return (1.0 - m) * neg
-        
-        def _causal_pad_mask(self, keep_2d, T, device):
-            neg = -1e4 if self.dtype == torch.float16 else -1e9
-            causal = (1.0 - torch.tril(torch.ones(T, T, device=device)))[None, None, ...] * neg
-            key_pad = (1.0 - keep_2d[:, None, None, :].to(self.dtype)) * neg
+        def _neg(self, dtype):
+            # big negative compatible with dtype
+            return -1e4 if dtype == torch.float16 else -1e9
+
+        def invert_attention_mask(self, mask_2d, dtype):
+            m = mask_2d[:, None, None, :].to(dtype)
+            one = torch.ones_like(m)
+            return (one - m) * torch.tensor(self._neg(dtype), device=m.device, dtype=dtype)
+
+        def _causal_pad_mask(self, keep_2d, T, dtype, device):
+            neg = torch.tensor(self._neg(dtype), device=device, dtype=dtype)
+            ones = torch.ones(T, T, device=device, dtype=dtype)       # <<< important
+            causal = (1 - torch.tril(ones))[None, None, ...] * neg
+            key_pad = (1 - keep_2d[:, None, None, :].to(dtype)) * neg
             return causal + key_pad
 
         def forward(self, inputs):
             (enc_hid, dec_emb, enc_mask_2d, keep_inputs,
             metadata, dec_in, keep_labels) = inputs
 
-            T = dec_emb.size(1)
+            dtype = dec_emb.dtype
             device = dec_emb.device
+            B, T, _ = dec_emb.shape
 
-            enc_attn_mask = self.invert_attention_mask(enc_mask_2d)
-            dec_attn_mask = self._causal_pad_mask(keep_inputs, T, device)
+            enc_attn_mask = self.invert_attention_mask(enc_mask_2d, dtype)
+            dec_attn_mask = self._causal_pad_mask(keep_inputs, T, dtype, device)
 
             out = self.block(
                 dec_emb,
