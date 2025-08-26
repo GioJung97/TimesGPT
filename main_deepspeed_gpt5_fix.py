@@ -237,11 +237,23 @@ def main():
     else:
         hf_model = VisionEncoderDecoderModel(combined_config)
     # print(f"tokenizer.bos_token_id: {tokenizer.bos_token_id}")
+
+    # tokenizer config
+    tokenizer.bos_token = tokenizer.eos_token
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # decoder config ids
+    config_decoder.pad_token_id = tokenizer.eos_token_id
+    config_decoder.bos_token_id = tokenizer.bos_token_id
+    config_decoder.eos_token_id = tokenizer.eos_token_id
+
+    # visionencoderdecoder config
     hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
     hf_model.config.eos_token_id = tokenizer.eos_token_id
-    hf_model.config.max_length = args.max_caption_length
-    hf_model.config.num_beams = args.num_beams
-    hf_model.config.early_stopping = args.early_stopping
+    
+    # hf_model.config.max_length = args.max_caption_length
+    # hf_model.config.num_beams = args.num_beams
+    # hf_model.config.early_stopping = args.early_stopping
     hf_model.config.tie_word_embeddings = True
 
     local_rank = int(os.getenv("LOCAL_RANK", 0))
@@ -287,10 +299,9 @@ def main():
                 dec_in = dec_in[:, -ctx_len:]
 
             batch_iter = iter(RepeatingLoader([((pixel_values, dec_in, metadata), labels)]))
-            _, out = engine.eval_batch(batch_iter, return_logits=True, compute_loss=True, bcast_loss=True)
+            _, logits = engine.eval_batch(batch_iter, return_logits=True, compute_loss=True, bcast_loss=True)
 
             if is_last:
-                logits = out[0]                 # (logits, keep_labels)
                 cur_len = seq.size(1)                     # real length BEFORE padding
                 next_tok = logits[:, cur_len-1, :].argmax(-1)
             else:
@@ -384,7 +395,7 @@ def main():
             return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
         for nm in range(max_len):
-            print(f"top-k/top-p step: {nm}")
+            # print(f"top-k/top-p step: {nm}")
             dec_in = seq
             if dec_in.size(1) < ctx_len:
                 dec_in = F.pad(dec_in, (0, ctx_len - dec_in.size(1)), value=-100)
@@ -393,10 +404,9 @@ def main():
 
             batch_iter = iter(RepeatingLoader([((pixel_values, dec_in, metadata), labels)]))
             # no need to compute loss during decoding
-            _, out = engine.eval_batch(batch_iter, return_logits=True, compute_loss=True, bcast_loss=True)
+            _, logits = engine.eval_batch(batch_iter, return_logits=True, compute_loss=True, bcast_loss=True)
 
             if is_last:
-                logits = out[0]                # (B,T,V)
                 cur_len = seq.size(1)
                 next_tok = []
                 for b in range(B):
@@ -481,7 +491,7 @@ def main():
             self.ln = ln
         def forward(self, inputs):
             enc, dec_or_lab, metadata = inputs
-            enc = self.ln(BaseModelOutput(last_hidden_state=enc)[0])
+            enc = self.ln(enc)
             return enc, dec_or_lab, metadata
 
     # Handles decoder input preparation, mask creation, & embedding construction
@@ -502,44 +512,47 @@ def main():
         def weight(self):
             return self.wte.weight
         
-        def _valid_mask_from_labels(self, labels):
-            B, T = labels.shape
-            device = labels.device
-            is_pad = labels.eq(self.pad_id)
-            has_pad = is_pad.any(dim=1)
-            first_pad = torch.where(
-                has_pad,
-                is_pad.float().argmax(dim=1),
-                torch.full((B,), T, device=device, dtype=torch.long)
-            )
-            valid_len_after_shift = torch.clamp(first_pad + 1, max=T)
-            rng = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
-            keep = rng < valid_len_after_shift.unsqueeze(1)   # (B, T) bool
-            return keep
+        # def _valid_mask_from_labels(self, labels):
+        #     B, T = labels.shape
+        #     device = labels.device
+        #     is_pad = labels.eq(self.pad_id)
+        #     has_pad = is_pad.any(dim=1)
+        #     first_pad = torch.where(
+        #         has_pad,
+        #         is_pad.float().argmax(dim=1),
+        #         torch.full((B,), T, device=device, dtype=torch.long)
+        #     )
+        #     valid_len_after_shift = torch.clamp(first_pad + 1, max=T)
+        #     rng = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
+        #     keep = rng < valid_len_after_shift.unsqueeze(1)   # (B, T) bool
+        #     return keep
 
         def forward(self, inputs):
             enc_hid, dec_or_lab, metadata = inputs
             device = dec_or_lab.device
             B, T = dec_or_lab.shape
 
-            # Decide mode by examining dec_or_lab, not only self.training.
-            # If we see -100, we assume "generation step" (inference path).
-            is_auto_regressive_gen = (dec_or_lab == -100).any()
-
-            if not is_auto_regressive_gen:
-                # labels_or_seq are the GROUND-TRUTH labels
-                # Teacher forcing: build decoder_input_ids by shifting right with BOS
+            # GENERATION if we see any -100 (sentinel for "not yet generated")
+            is_generation = (dec_or_lab == -100).any()
+            # print(f"is_generation: {is_generation}")
+            if not is_generation:
+                # ===== TRAINING (teacher forcing) =====
+                # dec_in = shift-right(labels) with BOS(=PAD) in front
                 dec_in = shift_tokens_right(dec_or_lab,
                                             pad_token_id=self.pad_id,
                                             decoder_start_token_id=self.pad_id)
-                # Valid positions for attention (after shift)
-                keep_inputs = self._valid_mask_from_labels(dec_or_lab)
+                # For training (your reference): do NOT mask positions; loss covers all tokens
+                keep_inputs = torch.ones((B, T), dtype=torch.bool, device=device)
             else:
-                # Inference path: dec_or_lab is the running sequence (padded with -100)
-                keep_inputs = dec_or_lab.ne(-100)
-                # Replace -100 with pad for embedding lookup
-                dec_in = dec_or_lab.masked_fill(~keep_inputs, self.pad_id)
-
+                # ===== GENERATION (with padding) =====
+                # We expect dec_or_lab padded to ctx_len with -100 on the right
+                keep_inputs = dec_or_lab.ne(-100)                # True where tokens are "real"
+                dec_in = dec_or_lab.masked_fill(~keep_inputs, self.pad_id)  # replace -100 for embedding
+                # # Inference path: dec_or_lab is the running sequence (padded with -100)
+                # keep_inputs = dec_or_lab.ne(-100)
+                # # Replace -100 with pad for embedding lookup
+                # dec_in = dec_or_lab.masked_fill(~keep_inputs, self.pad_id)
+            
             # Token + position embeddings
             pos_ids = torch.arange(T, device=device).unsqueeze(0)
             token_emb = self.wte(dec_in) + self.wpe(pos_ids)
@@ -550,9 +563,9 @@ def main():
                                     device=device, dtype=torch.bool)
 
             # For your loss, you don't actually need a keep_labels separate from keep_inputs.
-            keep_labels = keep_inputs
+            # keep_labels = keep_inputs
 
-            return (enc_hid, token_emb, enc_mask_2d, keep_inputs, metadata, dec_in, keep_labels)
+            return (enc_hid, token_emb, enc_mask_2d, metadata, dec_in, keep_inputs)
          
     class DecBlockWrapper(nn.Module):
         def __init__(self, block, block_num, num_blocks, dtype):
@@ -565,46 +578,44 @@ def main():
             # 1.0 in head_mask indicate we keep the head
             # attention_probs has shape bsz x n_heads x N x N
             # head_mask has shape n_layer x batch x n_heads x N x N
-            self.head_mask = [None] * num_blocks
+            # self.head_mask = [None] * num_blocks
         
-        def _neg(self, dtype):
-            # big negative compatible with dtype
-            return -1e4 if dtype == torch.float16 else -1e9
-
-        def invert_attention_mask(self, mask_2d, dtype):
-            m = mask_2d[:, None, None, :].to(dtype)
-            one = torch.ones_like(m)
-            return (one - m) * torch.tensor(self._neg(dtype), device=m.device, dtype=dtype)
-
-        def _causal_pad_mask(self, keep_2d, T, dtype, device):
-            neg = torch.tensor(self._neg(dtype), device=device, dtype=dtype)
-            ones = torch.ones(T, T, device=device, dtype=dtype)       # <<< important
-            causal = (1 - torch.tril(ones))[None, None, ...] * neg
-            key_pad = (1 - keep_2d[:, None, None, :].to(dtype)) * neg
-            return causal + key_pad
+        def invert_attention_mask(self, mask_2d):
+            # 2D -> additive (B,1,1,S)
+            m = mask_2d[:, None, None, :].to(self.dtype)
+            neg = -1e4 if self.dtype == torch.float16 else -1e9
+            return (1.0 - m) * neg
+        
+        # def _causal_pad_mask(self, keep_2d, T, device):
+        #     neg = -1e4 if self.dtype == torch.float16 else -1e9
+        #     causal = (1.0 - torch.tril(torch.ones(T, T, device=device)))[None, None, ...] * neg
+        #     key_pad = (1.0 - keep_2d[:, None, None, :].to(self.dtype)) * neg
+        #     return causal + key_pad
 
         def forward(self, inputs):
-            (enc_hid, dec_emb, enc_mask_2d, keep_inputs,
-            metadata, dec_in, keep_labels) = inputs
+            (enc_hid, dec_emb, enc_mask_2d,
+            metadata, dec_in, keep_inputs) = inputs
 
-            dtype = dec_emb.dtype
+            T = dec_emb.size(1)
             device = dec_emb.device
-            B, T, _ = dec_emb.shape
 
-            enc_attn_mask = self.invert_attention_mask(enc_mask_2d, dtype)
-            dec_attn_mask = self._causal_pad_mask(keep_inputs, T, dtype, device)
+            enc_attn_mask = self.invert_attention_mask(enc_mask_2d)
+            # decoder attention mask: 1.0 where valid tokens exist, 0.0 for padded (-100→pad_id) slots
+            # GPT-2 will combine this with the causal mask internally
+            dec_attn_mask = keep_inputs.to(dtype=dec_emb.dtype)  # (B, T) float16/float32
+            # dec_attn_mask = self._causal_pad_mask(keep_inputs, T, device)
 
             out = self.block(
                 dec_emb,
                 layer_past=None,
                 attention_mask=dec_attn_mask,
-                head_mask=self.head_mask[self.block_num],
+                head_mask=None,
                 encoder_hidden_states=enc_hid,
                 encoder_attention_mask=enc_attn_mask,
                 use_cache=False
             )
             hidden = out[0]
-            return (enc_hid, hidden, enc_mask_2d, keep_inputs, metadata, dec_in, keep_labels)
+            return (enc_hid, hidden, enc_mask_2d, metadata, dec_in, keep_inputs)
         
     class FinalWrapper(nn.Module):
         def __init__(self, ln_f, lm_head):
@@ -616,10 +627,10 @@ def main():
         def weight(self): return self.head.weight
 
         def forward(self, inputs):
-            (enc_hid, dec_hidden, enc_mask_2d, keep_inputs,
-            metadata, dec_in, keep_labels) = inputs
+            (enc_hid, dec_hidden, enc_mask_2d,
+            metadata, dec_in, keep_inputs) = inputs
             logits = self.head(self.ln(dec_hidden))   # (B,T,V)
-            return (logits, keep_labels)
+            return logits
 
     def to_pipeline_blocks_with_tied_weights(hf_model):
         blocks = []
@@ -663,19 +674,18 @@ def main():
     #                               labels = [24, 554, 50256, 50256, 50256]
 
     # labels = [24, 554, 50256, 50256, 50256] => [24, 554, 50256, -100, -100]
-    def compute_loss(output, labels):
+    def compute_loss(logits, labels):
         # output is (logits, keep_labels) from FinalWrapper
-        logits, keep_labels = output  # (B,T,V), (B,T) bool
-        labels = labels.to(logits.device).long()
+        # labels = labels.to(logits.device).long()
         # mask AFTER first EOS
-        masked_labels = labels.masked_fill(~keep_labels.bool(), -100)
-        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-        return loss_fct(logits.view(-1, logits.size(-1)),
-                        masked_labels.view(-1))
-
-        # loss_fct = torch.nn.CrossEntropyLoss()
+        # masked_labels = labels.masked_fill(~keep_labels.bool(), -100)
+        # loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
         # return loss_fct(logits.view(-1, logits.size(-1)),
-        #                 labels.view(-1))
+        #                 masked_labels.view(-1))
+
+        loss_fct = torch.nn.CrossEntropyLoss()
+        return loss_fct(logits.view(-1, logits.size(-1)),
+                        labels.view(-1))
     
     # if args.fp16_enabled:
     #     hf_model = hf_model.half()
