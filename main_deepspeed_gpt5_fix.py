@@ -29,6 +29,7 @@ from deepspeed.pipe import PipelineModule, TiedLayerSpec
 from deepspeed.utils import RepeatingLoader
 from transformers.modeling_outputs import BaseModelOutput
 from transformers import get_scheduler
+from pycocoevalcap.cider.cider import Cider
 import math
 
 # Argument parser
@@ -268,7 +269,7 @@ def main():
 
     train_dataset = NPZDataset(os.path.join(args.data_dir, 'train'), args.num_captions, args.subsample_size, tokenizer)
     val_dataset = NPZDataset(os.path.join(args.data_dir, 'val'), args.num_captions, args.subsample_size, tokenizer)
-    test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), 1, 0.01, tokenizer) # TODO: Change this back to args.subsample_size
+    test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), 1, 1.0, tokenizer) # TODO: Change this back to args.subsample_size
     # val_sampler = DistributedSampler(val_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
     
     # -------------------------------------------------------------
@@ -870,6 +871,16 @@ def main():
     dist.barrier()
    
     if args.do_test:
+        total_test_loss = 0
+        predicted_captions = []
+        predicted_tokens = []
+        ground_truth_captions = []
+        ground_truth_tokens = []
+        all_filenames = []
+        
+        # metric libs
+        cider_metric = Cider()
+
         deep_speed_model_engine.eval()
         test_iter = iter(RepeatingLoader(test_dataloader))
         # num_test_batches = len(test_dataset) // (ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size())
@@ -888,13 +899,44 @@ def main():
                                         max_len=args.max_caption_length,
                                         ctx_len=args.context_length)
             
-            top_kp_preds = top_kp_decode_pipeline(deep_speed_model_engine, pixel_values, labels, metadata, tokenizer,
-                                           max_len=args.max_caption_length, ctx_len=args.context_length,
-                                           top_k=args.top_k, top_p=args.top_p, temperature=args.temperature)
+            # top_kp_preds = top_kp_decode_pipeline(deep_speed_model_engine, pixel_values, labels, metadata, tokenizer,
+            #                                max_len=args.max_caption_length, ctx_len=args.context_length,
+            #                                top_k=args.top_k, top_p=args.top_p, temperature=args.temperature)
 
             gts = [ test_dataset.get_gt_caption(m[2].item()) for m in metadata ]
-            for g_pred, top_kp_pred, g in zip(greedy_preds, top_kp_preds, gts):
-                print(f"greedy: {g_pred}\ntop_kp: {top_kp_pred}\ngts: {g}")
+            # for g_pred, top_kp_pred, g in zip(greedy_preds, top_kp_preds, gts):
+            #     print(f"greedy: {g_pred}\ntop_kp: {top_kp_pred}\ngts: {g}")
+            
+            predicted_captions.extend(greedy_preds)
+            ground_truth_tokens.extend(gts)
+            # filename = decode_metadata_tensor
+            # all_filenames.extend(batch['filenames'])
+
+        if deep_speed_model_engine.is_last_stage():
+            metrics_dict = {}       
+            # metrics_dict["avg_test_loss"] = total_test_loss / len(test_dataloader)
+
+            ground_truth_captions_flattened = [[x.replace('\n', ' ').strip()] for x in ground_truth_captions]
+            predicted_captions_flattened = [[x.replace('\n', ' ').strip()] for x in predicted_captions]
+            ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions_flattened))
+            predicted_captions_dict = dict((zip(all_filenames, predicted_captions_flattened)))
+            
+            # metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
+            # metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
+            # metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
+            # metrics_dict["blue4_score"] = bleu4_metric.update(predicted_captions, ground_truth_captions).compute().item()
+            # metrics_dict["perplexity_score"] = perplexity_metric.compute().item()
+            # metrics_dict["word_error_rate_score"] = word_error_rate_metric.update(predicted_captions, ground_truth_captions).compute().item()
+            # metrics_dict["word_info_lost_score"] = word_info_lost_metric.update(predicted_captions, ground_truth_captions).compute().item()
+            # metrics_dict["word_info_preserved_score"] = word_info_preserved_metric.update(predicted_captions, ground_truth_captions).compute().item()
+
+            # print(f"\n\nDEBUG ground_truth_captions_dict: {ground_truth_captions_dict}\n\n")
+            # print(f"\n\nDEBUG predicted_captions_dict: {predicted_captions_dict}\n\n")
+            metrics_dict["cider_score"], _ = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+            # metrics_dict["meteor_score"], _ = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+            # metrics_dict["rouge_score"], _ = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+            # metrics_dict["spice_score"], spice_scores = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+            wandb.log(metrics_dict)
         
     dist.barrier()
 
