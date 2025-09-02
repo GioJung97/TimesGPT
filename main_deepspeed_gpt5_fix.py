@@ -276,7 +276,7 @@ def main():
 
     train_dataset = NPZDataset(os.path.join(args.data_dir, 'train'), args.num_captions, args.subsample_size, tokenizer)
     val_dataset = NPZDataset(os.path.join(args.data_dir, 'val'), args.num_captions, args.subsample_size, tokenizer)
-    test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), 1, 0.001, tokenizer) # TODO: Change this back to args.subsample_size
+    test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), 1, 1.0, tokenizer) # TODO: Change this back to args.subsample_size
     # val_sampler = DistributedSampler(val_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
     
     # -------------------------------------------------------------
@@ -610,9 +610,11 @@ def main():
             enc_attn_mask = self.invert_attention_mask(enc_mask_2d)
             # decoder attention mask: 1.0 where valid tokens exist, 0.0 for padded (-100→pad_id) slots
             # GPT-2 will combine this with the causal mask internally
-            dec_attn_mask = keep_inputs.to(dtype=dec_emb.dtype)  # (B, T) float16/float32
+            # dec_attn_mask = keep_inputs.to(dtype=dec_emb.dtype)  # (B, T) float16/float32
+            neg = -1e4 if dec_emb.dtype == torch.float16 else -1e9
+            dec_attn_mask = (1.0 - keep_inputs.to(dec_emb.dtype))[:, None, None, :] * neg  # (B,1,1,T)
             # dec_attn_mask = self._causal_pad_mask(keep_inputs, T, device)
-
+            
             out = self.block(
                 dec_emb,
                 layer_past=None,
