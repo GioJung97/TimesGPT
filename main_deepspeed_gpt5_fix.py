@@ -169,7 +169,7 @@ def main():
     torch.manual_seed(args.random_seed)
     torch.cuda.manual_seed_all(args.random_seed)
     deepspeed.runtime.utils.set_random_seed(args.random_seed)
-
+    
     # Dynamic globals - use as few as possible
     # att_type = {'divided_space_time': 'dst', 'space_only': 'so', 'joint_space_time': 'jst'}
     experiment_name = f"{args.experiment_name_prefix}_ws{dist.get_world_size()}_nc{args.num_captions}_ep{args.num_epochs}_ss{args.subsample_size}_nl{args.num_hidden_layers}_hs{args.hidden_size_encoder}_nf{args.num_frames_encoder}_ps{args.patch_size_encoder}_lr{args.learning_rate}_bs{args.batch_size}_rs{args.random_seed}"
@@ -183,7 +183,7 @@ def main():
 
     # DeepSpeed config
     ds_config = {
-        "train_micro_batch_size_per_gpu": args.batch_size // args.num_gpus,
+        "train_micro_batch_size_per_gpu": args.batch_size // dist.get_world_size(),
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "steps_per_print": args.steps_per_print,
         "zero_optimization": { "stage": args.zero_stage },
@@ -352,8 +352,7 @@ def main():
         ctx_len=1024,
         top_k=0,                # 0 means disabled
         top_p=1.0,              # 1.0 means disabled
-        temperature=1.0,
-    ):
+        temperature=1.0):
         """
         Autoregressive sampling with top-k / nucleus top-p and temperature.
         Compatible with DeepSpeed PipelineModule like greedy_decode_pipeline.
@@ -739,45 +738,100 @@ def main():
         dist_init_required=False,
     )
 
-    # Setup and initialize wandb
-    if deep_speed_model_engine.is_last_stage():
+    # # Setup and initialize wandb
+    # if deep_speed_model_engine.is_last_stage():
 
-        # This dict can be used for generating a report at the end.
-        # (print this and all of the train, val, and test results)
-        wandb_config = {
-                "architecture": "SpaceTimeGPT",
-                "data_dir": args.data_dir,
-                "num_epochs": args.num_epochs,
-                "num_captions": args.num_captions,
-                "world_size": dist.get_world_size(),
-                "num_gpus": args.num_gpus,
-                "seed": args.random_seed,
-                "beams": args.num_beams,
-                "batch_size": args.batch_size,
-                "microbatch_size": args.batch_size // args.num_gpus,
-                "subsample_size": args.subsample_size,
-                "num_frames_encoder": args.num_frames_encoder,
-                "hidden_size_encoder": args.hidden_size_encoder,
-                "num_hidden_layers": args.num_hidden_layers,
-                "min_caption_length": args.min_caption_length,
-                "max_caption_length": args.max_caption_length,
-                "temperature": args.temperature,
-                "pretrained_model": args.pretrained_model,
-                "gradient_accumulation_steps": args.gradient_accumulation_steps,
-                "steps_per_print": args.steps_per_print,
-                "zero_stage": args.zero_stage,
-                "fp16_enabled": args.fp16_enabled,
-                "fp16_autocast": args.fp16_autocast,
-                "attention_type_encoder": args.attention_type_encoder,
-            }
+    #     # This dict can be used for generating a report at the end.
+    #     # (print this and all of the train, val, and test results)
+    #     wandb_config = {
+    #             "architecture": "SpaceTimeGPT",
+    #             "data_dir": args.data_dir,
+    #             "num_epochs": args.num_epochs,
+    #             "num_captions": args.num_captions,
+    #             "world_size": dist.get_world_size(),
+    #             "num_gpus": dist.get_world_size(),
+    #             "seed": args.random_seed,
+    #             "beams": args.num_beams,
+    #             "batch_size": args.batch_size,
+    #             "microbatch_size": args.batch_size // dist.get_world_size(),
+    #             "subsample_size": args.subsample_size,
+    #             "num_frames_encoder": args.num_frames_encoder,
+    #             "hidden_size_encoder": args.hidden_size_encoder,
+    #             "num_hidden_layers": args.num_hidden_layers,
+    #             "min_caption_length": args.min_caption_length,
+    #             "max_caption_length": args.max_caption_length,
+    #             "temperature": args.temperature,
+    #             "pretrained_model": args.pretrained_model,
+    #             "gradient_accumulation_steps": args.gradient_accumulation_steps,
+    #             "steps_per_print": args.steps_per_print,
+    #             "zero_stage": args.zero_stage,
+    #             "fp16_enabled": args.fp16_enabled,
+    #             "fp16_autocast": args.fp16_autocast,
+    #             "attention_type_encoder": args.attention_type_encoder,
+    #         }
 
-        # Initialize wandb
-        wandb.init(
+    #     # Initialize wandb
+    #     wandb.init(
+    #         project="nairr",
+    #         name=experiment_name,
+    #         config=wandb_config,
+    #     )
+ 
+    # This dict can be used for generating a report at the end.
+    # (print this and all of the train, val, and test results)
+    wandb_config = {
+            "architecture": "SpaceTimeGPT",
+            "data_dir": args.data_dir,
+            "num_epochs": args.num_epochs,
+            "num_captions": args.num_captions,
+            "world_size": dist.get_world_size(),
+            "num_gpus": dist.get_world_size(),
+            "seed": args.random_seed,
+            "beams": args.num_beams,
+            "batch_size": args.batch_size,
+            "microbatch_size": args.batch_size // dist.get_world_size(),
+            "subsample_size": args.subsample_size,
+            "num_frames_encoder": args.num_frames_encoder,
+            "hidden_size_encoder": args.hidden_size_encoder,
+            "num_hidden_layers": args.num_hidden_layers,
+            "min_caption_length": args.min_caption_length,
+            "max_caption_length": args.max_caption_length,
+            "temperature": args.temperature,
+            "pretrained_model": args.pretrained_model,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "steps_per_print": args.steps_per_print,
+            "zero_stage": args.zero_stage,
+            "fp16_enabled": args.fp16_enabled,
+            "fp16_autocast": args.fp16_autocast,
+            "attention_type_encoder": args.attention_type_encoder,
+        }
+
+    run = wandb.init(
             project="nairr",
-            name=experiment_name,
+            name=f"{experiment_name}",
+            group=experiment_name,
             config=wandb_config,
+            id=experiment_name
         )
+    print(f"DEBUG: run_id = {run.id}")
+    # if deep_speed_model_engine.is_last_stage():
+    #     # Initialize wandb
+    #     run = wandb.init(
+    #         project="nairr",
+    #         name=f"{experiment_name}-rank{dist.get_rank()}",
+    #         group=experiment_name,
+    #         config=wandb_config,
+    #     )
+    # else:
+    #     wandb.init(
+    #         project="nairr",
+    #         name=f"{experiment_name}-rank{dist.get_rank()}",
+    #         group=experiment_name,
+    #         config=wandb_config,
+    #         id=run.id
+    #         )
 
+    # My attempt at DP + PP, doesnt seem to work? Not fully tested..
     if hasattr(deep_speed_model_engine, "mpu"):
         dp = deep_speed_model_engine.mpu.get_data_parallel_world_size()
         dp_rank = deep_speed_model_engine.mpu.get_data_parallel_rank()
@@ -785,6 +839,7 @@ def main():
         # fallback if running pure DP without pipeline engine
         dp = dist.get_world_size()
         dp_rank = dist.get_rank()
+    
     micro = ds_config['train_micro_batch_size_per_gpu']
     ga = ds_config['gradient_accumulation_steps']
 
@@ -794,8 +849,8 @@ def main():
     val_sampler  = DistributedSampler(val_dataset,  num_replicas=dp, rank=dp_rank, shuffle=False)
     test_sampler = DistributedSampler(test_dataset, num_replicas=dp, rank=dp_rank, shuffle=False)
 
-    val_dataloader  = DataLoader(val_dataset,  sampler=val_sampler,  batch_size=micro, collate_fn=default_collate, drop_last=False)
-    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=micro, collate_fn=default_collate, drop_last=False)
+    val_dataloader  = DataLoader(val_dataset,  sampler=val_sampler,  batch_size=micro, collate_fn=default_collate, drop_last=True)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=micro, collate_fn=default_collate, drop_last=True)
 
     # Resume from checkpoint if specified
     # TODO: needs to be tested
@@ -932,11 +987,12 @@ def main():
             metrics_dict["rouge_score"], rouge_scores = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
             metrics_dict["spice_score"], spice_scores = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
             wandb.log(metrics_dict)
-        
+    
+    wandb.finish()
     dist.barrier()
 
     if deep_speed_model_engine.is_last_stage():
-        wandb.finish()
+    #     wandb.finish()
 
         # Run the qualitative if we are doing that
         os.makedirs(experiment_output_dir, exist_ok=True)
