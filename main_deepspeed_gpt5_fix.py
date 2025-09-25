@@ -38,6 +38,8 @@ from pycocoevalcap.cider.cider import Cider
 from pycocoevalcap.spice.spice import Spice
 from torcheval.metrics.text import BLEUScore
 import math
+import html
+from model_tools.metrics import calculate_scores
 
 # Argument parser
 parser = argparse.ArgumentParser()
@@ -149,6 +151,11 @@ class NPZDataset(Dataset):
         file_path = os.path.join(self.data_dir, self.file_names[filename_index])
         data = np.load(file_path)
         return self.tokenizer.decode(data['arr_1'][caption_num], skip_special_tokens=True)
+    
+    def get_gt_captions_by_fileindex(self, filename_index):
+        file_path = os.path.join(self.data_dir, self.file_names[filename_index])
+        data = np.load(file_path)
+        return self.tokenizer.batch_decode(data['arr_1'], skip_special_tokens=True)
 
     def decode_metadata_tensor(self, metadata_tensor):
         """Convert metadata tensor back to filename and info"""
@@ -755,44 +762,47 @@ def main():
         dist_init_required=False,
     )
  
-    # This dict can be used for generating a report at the end.
-    # (print this and all of the train, val, and test results)
-    wandb_config = {
-            "architecture": "SpaceTimeGPT",
-            "data_dir": args.data_dir,
-            "num_epochs": args.num_epochs,
-            "num_captions": args.num_captions,
-            "world_size": dist.get_world_size(),
-            "num_gpus": dist.get_world_size(),
-            "seed": args.random_seed,
-            "beams": args.num_beams,
-            "batch_size": args.batch_size,
-            "microbatch_size": args.batch_size // dist.get_world_size(),
-            "subsample_size": args.subsample_size,
-            "num_frames_encoder": args.num_frames_encoder,
-            "hidden_size_encoder": args.hidden_size_encoder,
-            "encoder_num_hidden_layers": args.encoder_num_hidden_layers,
-            "decoder_num_hidden_layers": args.decoder_num_hidden_layers,
-            "min_caption_length": args.min_caption_length,
-            "max_caption_length": args.max_caption_length,
-            "temperature": args.temperature,
-            "pretrained_model": args.pretrained_model,
-            "gradient_accumulation_steps": args.gradient_accumulation_steps,
-            "steps_per_print": args.steps_per_print,
-            "zero_stage": args.zero_stage,
-            "fp16_enabled": args.fp16_enabled,
-            "fp16_autocast": args.fp16_autocast,
-            "attention_type_encoder": args.attention_type_encoder,
-        }
-    # Test on GPU SERVER to see if run uses the same graphs..
-    run = wandb.init(
-            project="nairr",
-            name=f"{experiment_name}",
-            group=experiment_name,
-            config=wandb_config,
-            id=experiment_name,
-            resume="must"
-        )
+    is_logger = deep_speed_model_engine.is_last_stage()
+
+    if is_logger:
+        # This dict can be used for generating a report at the end.
+        # (print this and all of the train, val, and test results)
+        wandb_config = {
+                "architecture": "SpaceTimeGPT",
+                "data_dir": args.data_dir,
+                "num_epochs": args.num_epochs,
+                "num_captions": args.num_captions,
+                "world_size": dist.get_world_size(),
+                "num_gpus": dist.get_world_size(),
+                "seed": args.random_seed,
+                "beams": args.num_beams,
+                "batch_size": args.batch_size,
+                "microbatch_size": args.batch_size // dist.get_world_size(),
+                "subsample_size": args.subsample_size,
+                "num_frames_encoder": args.num_frames_encoder,
+                "hidden_size_encoder": args.hidden_size_encoder,
+                "encoder_num_hidden_layers": args.encoder_num_hidden_layers,
+                "decoder_num_hidden_layers": args.decoder_num_hidden_layers,
+                "min_caption_length": args.min_caption_length,
+                "max_caption_length": args.max_caption_length,
+                "temperature": args.temperature,
+                "pretrained_model": args.pretrained_model,
+                "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                "steps_per_print": args.steps_per_print,
+                "zero_stage": args.zero_stage,
+                "fp16_enabled": args.fp16_enabled,
+                "fp16_autocast": args.fp16_autocast,
+                "attention_type_encoder": args.attention_type_encoder,
+            }
+        # Test on GPU SERVER to see if run uses the same graphs..
+        run = wandb.init(
+                project="nairr",
+                name=f"{experiment_name}",
+                group=experiment_name,
+                config=wandb_config,
+                id=experiment_name,
+                resume="must"
+            )
     
     micro = ds_config['train_micro_batch_size_per_gpu']
     ga = ds_config['gradient_accumulation_steps']
@@ -808,7 +818,7 @@ def main():
 
     train_dataloader = DataLoader(train_dataset,  sampler=train_sampler, batch_size=micro, collate_fn=default_collate, drop_last=True)
     val_dataloader = DataLoader(val_dataset,  sampler=val_sampler,  batch_size=micro, collate_fn=default_collate, drop_last=True)
-    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=1, collate_fn=default_collate, drop_last=True)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=micro, collate_fn=default_collate, drop_last=False)
     
     # Resume from checkpoint if specified
     # TODO: needs to be tested
@@ -836,14 +846,14 @@ def main():
             for step in range(train_steps_per_epoch):
                 loss = deep_speed_model_engine.train_batch(data_iter=train_iter)
 
-                if deep_speed_model_engine.is_last_stage():
+                if is_logger:
                     wandb.log({"Exp/Train Batch Loss️": loss.item()})
                     total_train_loss += loss.item()
 
                 if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
                     print(f"Train Batch Loss Step {step+1}/{train_steps_per_epoch}, Loss: {loss.item():.4f}" )
             
-            if deep_speed_model_engine.is_last_stage():
+            if is_logger:
                 print(f"Train Average Epoch {epoch} Loss: {(total_train_loss/train_steps_per_epoch)}")
                 wandb.log({f"Exp/Train Average Loss": (total_train_loss/train_steps_per_epoch) })
 
@@ -892,11 +902,11 @@ def main():
                 #     if deep_speed_model_engine.is_last_stage():
                 #         total_val_loss += loss.item()
 
-                #     if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
+                #     if is_logger and step % ds_config['steps_per_print'] == 0:
                 #         print(f"Val Batch Loss Step {step+1}/{val_steps_per_epoch}, Loss: {loss.item():.4f}" )
                 #         wandb.log({"Exp/Val Batch Loss": loss.item()})
 
-                # if deep_speed_model_engine.is_last_stage():
+                # if is_logger:
                 #     val_loss = total_val_loss / val_steps_per_epoch
                 #     print(f"Val Average Epoch {epoch} Loss: {val_loss}")
                 #     wandb.log({"Exp/Val Average Loss": val_loss})
@@ -904,16 +914,10 @@ def main():
     dist.barrier()
    
     if args.do_test:
-        predicted_captions = []
-        ground_truth_captions = []
-        all_filenames = []
+        pred_dict = {}         # {uid: [pred]}
+        gt_per_uid = {}        # {uid: [refs]}  (same refs repeated per uid is fine for metrics)
+        uid_to_filename = {}   # {uid: filename}
         uids = []
-        
-        # metric libs
-        bleu1_metric = BLEUScore(n_gram=1)
-        bleu2_metric = BLEUScore(n_gram=2)
-        bleu3_metric = BLEUScore(n_gram=3)
-        bleu4_metric = BLEUScore(n_gram=4)
 
         deep_speed_model_engine.eval()
         test_iter = iter(RepeatingLoader(test_dataloader))
@@ -932,50 +936,60 @@ def main():
                                         ctx_len=args.context_length)
             
             if deep_speed_model_engine.is_last_stage():
-                gts = [ test_dataset.get_gt_caption(m[2].item()) for m in metadata ]
-                predicted_captions.extend(greedy_preds)
-                ground_truth_captions.extend(gts)
-                for m in metadata:
+                for m, pred in zip(metadata, greedy_preds):
                     info = test_dataset.decode_metadata_tensor(m)
-                    # unique, stable key per sample (filename + caption_idx)
-                    uids.append(f"{info['filename']}::{info['caption_idx']}")
-                    all_filenames.append(info['filename'])
-            
-                if step % 100 == 0:
-                    print(f"[DEBUG] step: {step}\nfilename:{info['filename']}\ngreedy_preds: {greedy_preds}\ngts:{gts}")
+                    file_idx  = m[0].item()
+                    filename  = info["filename"]
+                    cap_idx   = info["caption_idx"]
+                    uid = f"{filename}::{cap_idx}"
 
-        if deep_speed_model_engine.is_last_stage():
-            metrics_dict = {}       
+                    refs = test_dataset.get_gt_captions_by_fileindex(file_idx)
 
-            ground_truth_captions_flattened = [str(x).replace('\n', ' ').strip() for x in ground_truth_captions]
-            predicted_captions_flattened = [str(x).replace('\n', ' ').strip() for x in predicted_captions]
-            # ground_truth_captions_dict = dict(zip(all_filenames, ground_truth_captions_flattened))
-            # predicted_captions_dict = dict((zip(all_filenames, predicted_captions_flattened)))
-            ground_truth_captions_dict = {k: [v] for k, v in zip(uids, ground_truth_captions_flattened)}
-            predicted_captions_dict    = {k: [v] for k, v in zip(uids, predicted_captions_flattened)}
+                    if uid not in pred_dict:
+                        pred_dict[uid] = [str(pred).replace("\n", " ").strip()]
+                        gt_per_uid[uid] = [r.replace("\n", " ").strip() for r in refs]
+                        uid_to_filename[uid] = filename
+                        uids.append(uid)
 
-            metrics_dict["blue1_score"] = bleu1_metric.update(predicted_captions, ground_truth_captions).compute().item()
-            metrics_dict["blue2_score"] = bleu2_metric.update(predicted_captions, ground_truth_captions).compute().item()
-            metrics_dict["blue3_score"] = bleu3_metric.update(predicted_captions, ground_truth_captions).compute().item()
-            metrics_dict["blue4_score"] = bleu4_metric.update(predicted_captions, ground_truth_captions).compute().item()
-            metrics_dict["cider_score"], cider_scores = Cider().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-            metrics_dict["meteor_score"], meteor_scores = Meteor().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-            metrics_dict["rouge_score"], rouge_scores = Rouge().compute_score(ground_truth_captions_dict, predicted_captions_dict)
-            metrics_dict["spice_score"], spice_scores = Spice().compute_score(ground_truth_captions_dict, predicted_captions_dict)
+                if step % 2 == 0 and uids:
+                    last_uid = uids[-1]
+                    print(f"[DEBUG] step: {step}/{test_steps_per_epoch} | uid: {last_uid}\n"
+                        f"pred: {pred_dict[last_uid][0]}\n"
+                        f"gts:  {gt_per_uid[last_uid]}")
+                    
+        if is_logger:
+            uids_eval = list(pred_dict.keys())
+            predicted_captions   = [pred_dict[u][0] for u in uids_eval]     # List[str]
+            ground_truth_captions = [gt_per_uid[u]  for u in uids_eval]     # List[List[str]]
+
+            cider_score, _, ciderD_score, _, bleu_score, _, meteor_score, _, rouge_score, _, spice_score, _ = calculate_scores(predicted_captions, ground_truth_captions)
+            bleu_1_score, bleu_2_score, bleu_3_score, bleu_4_score = bleu_score
+
+            metrics_dict = {}
+            metrics_dict["blue1_score"] = bleu_1_score
+            metrics_dict["blue2_score"] = bleu_2_score
+            metrics_dict["blue3_score"] = bleu_3_score
+            metrics_dict["blue4_score"] = bleu_4_score
+            metrics_dict["cider_score"] = cider_score
+            metrics_dict["ciderD_score"] = ciderD_score
+            metrics_dict["meteor_score"] = meteor_score
+            metrics_dict["rouge_score"] = rouge_score
+            metrics_dict["spice_score"] = spice_score
+            print(f"[METRICS]: {metrics_dict}")
             wandb.log(metrics_dict)
-    
-    wandb.finish()
+            wandb.finish()
     dist.barrier()
 
-    if deep_speed_model_engine.is_last_stage():
-    #     wandb.finish()
-
+    if args.do_test and deep_speed_model_engine.is_last_stage():
         # Run the qualitative if we are doing that
         os.makedirs(experiment_output_dir, exist_ok=True)
         with open(os.path.join(experiment_output_dir, experiment_name +".csv"), 'w') as f:
             f.write("uid,filename,pred,gt\n")
-            for i in range(len(uids)):
-                f.write(f"{uids[i]},{all_filenames[i]},{predicted_captions[i]},{ground_truth_captions[i]}\n")
+            for uid in uids:
+                filename  = uid_to_filename[uid]
+                pred      = pred_dict[uid][0]
+                gt_joined = " || ".join(gt_per_uid[uid])
+                f.write(f'{uid},{filename},{pred},{gt_joined}\n')
 
         mean = torch.tensor(image_processor.image_mean).view(1, 3, 1, 1)
         std = torch.tensor(image_processor.image_std).view(1, 3, 1, 1)
@@ -1003,16 +1017,25 @@ def main():
                     """)
             for i in range(min(len(uids), args.num_qualitative)):
                 uid = uids[i]
-                filename = all_filenames[i]
+                filename = uid_to_filename[uid]
                 npz_data = np.load(os.path.join(args.data_dir, "test", filename))
                 processed_images = torch.tensor(npz_data['arr_0'])
                 unprocessed_images = processed_images * std + mean
 
-                pred = predicted_captions_dict[uid][0]
-                gt   = ground_truth_captions_dict[uid][0]
+                pred = pred_dict[uid][0]
+                refs = gt_per_uid[uid]
 
-                f.write(f"<div class='sample'><p>{i}, {uid}<br>Predicted Caption: {pred}<br>Ground-Truth Caption: {gt}</p>\n<div class='grid-container'>\n")
-                # for j in range(npz_data['arr_0'].shape[0]):
+                pred_html = html.escape(pred)
+                refs_html = "".join(f"<li>{html.escape(r)}</li>" for r in refs)
+
+                f.write(
+                    f"<div class='sample'><p><b>{i}</b>, {html.escape(uid)}"
+                    f"<br><b>Predicted:</b> {pred_html}"
+                    f"<br><b>Ground Truths:</b></p>"
+                    f"<ul class='refs'>{refs_html}</ul>\n"
+                    f"<div class='grid-container'>\n"
+                )
+
                 for j in range(unprocessed_images.shape[0]):
                     an_image = unprocessed_images[j]
                     transform = transforms.ToPILImage()
