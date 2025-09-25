@@ -60,7 +60,7 @@ parser.add_argument('-dhl', '--decoder_num_hidden_layers', type=int, default=12,
 parser.add_argument('-cl', '--context_length', type=int, default=1024, help="Decoder context length for input and ouptput. (default: 1024)")
 parser.add_argument('--hidden_size_encoder', type=int, default=768, help="Encoder hidden size (default: 768)")
 parser.add_argument('--attention_type_encoder', type=str, choices=['divided_space_time', 'space_only', 'joint_space_time'], default='divided_space_time', help="Encoder attention type")
-parser.add_argument('--partition_method', type=str, choices=['uniform', 'paramters', 'type:transformers'], default='uniform', help="Deepspeed pipeline parallel partition mehtod (default: uniform)")
+parser.add_argument('--partition_method', type=str, choices=['uniform', 'parameters', 'type:transformers'], default='uniform', help="Deepspeed pipeline parallel partition mehtod (default: uniform)")
 parser.add_argument('--image_size_encoder', type=int, default=224, help="Image size (default: 224)")
 parser.add_argument('--intermediate_size_encoder', type=int, default=3072, help="Encoder intermediate size (default: 3072)")
 parser.add_argument('--num_frames_encoder', type=int, default=8, help="Number of frames (default: 8)")
@@ -96,7 +96,7 @@ parser.add_argument('-rs', '--random_seed', type=int, default=42, help="Random s
 parser.add_argument('-ql', '--num_qualitative', type=int, default=100, help="Number of qualitative results to run (0 disables) (default: 100)")
 parser.add_argument('-dd', '--data_dir', default=pathlib.Path('./data_dir/'), type=lambda p: pathlib.Path(p).resolve(strict=True),  help="Directory for input data")
 parser.add_argument('-od', '--output_dir', default=pathlib.Path('./output_artifacts/'), type=lambda p: pathlib.Path(p).resolve(strict=True),  help="Directory for input data")
-
+parser.add_argument('--use_pad_token', action='store_true', help="Whether to use a pad token. (default: pad_token=eos_token)")
 args = parser.parse_args()
 
 # Dataset class
@@ -174,6 +174,8 @@ def main():
     # Dynamic globals - use as few as possible
     # att_type = {'divided_space_time': 'dst', 'space_only': 'so', 'joint_space_time': 'jst'}
     experiment_name = f"{args.experiment_name_prefix}_ws{dist.get_world_size()}_nc{args.num_captions}_ep{args.num_epochs}_ss{args.subsample_size}_enl{args.encoder_num_hidden_layers}_dnl{args.decoder_num_hidden_layers}_dhs{args.n_embd_decoder}_ehs{args.hidden_size_encoder}_nf{args.num_frames_encoder}_ps{args.patch_size_encoder}_lr{args.learning_rate}_bs{args.batch_size}_rs{args.random_seed}"
+    # experiment_name = f"{args.experiment_name_prefix}_ws{dist.get_world_size()}_nc{args.num_captions}_ep{args.num_epochs}_ss{args.subsample_size}_nl{args.decoder_num_hidden_layers}_hs{args.hidden_size_encoder}_nf{args.num_frames_encoder}_ps{args.patch_size_encoder}_lr{args.learning_rate}_bs{args.batch_size}_rs{args.random_seed}"
+
     # experiment_name = f"{args.experiment_name_prefix}_ws{dist.get_world_size()}_nc{args.num_captions}_ep{args.num_epochs}_ss0.25_nl{args.num_hidden_layers}_hs{args.hidden_size_encoder}_nf{args.num_frames_encoder}_ps{args.patch_size_encoder}_lr{args.learning_rate}_bs{args.batch_size}_rs{args.random_seed}"
 
     # experiment_name = "placeholder_v3"
@@ -196,9 +198,17 @@ def main():
     image_processor = AutoImageProcessor.from_pretrained(args.image_preprocessor)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
 
-    # Configure tokenizer
+    # tokenizer config
     tokenizer.eos_token = tokenizer.eos_token or "<|endoftext|>"
-    tokenizer.pad_token = tokenizer.eos_token 
+    tokenizer.bos_token = tokenizer.eos_token
+    
+    # tokenizer.add_special_tokens({"bos_token": "<|startoftext|>"})
+    # tokenizer.pad_token = tokenizer.eos_token
+    if args.use_pad_token:
+        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+    else:
+        tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.pad_token = "<|pad|>"
     
     # https://huggingface.co/docs/transformers/en/model_doc/timesformer
     config_encoder = TimesformerConfig.from_pretrained(args.pretrained_encoder)
@@ -228,8 +238,11 @@ def main():
     config_decoder.num_beams = args.num_beams
     config_decoder.no_repeat_ngram_size = args.no_repeat_ngram_size
     config_decoder.early_stopping = args.early_stopping
-    config_decoder.pad_token_id = tokenizer.eos_token_id
-    config_decoder.bos_token_id = tokenizer.bos_token_id
+    config_decoder.pad_token_id = tokenizer.pad_token_id
+    print(f"[DEBUG] tokenizer.pad_token_id: {tokenizer.pad_token_id}\nconfig_decoder.pad_token_id: {config_decoder.pad_token_id}\ntokenizer.pad_token: {tokenizer.pad_token}")
+
+    # config_decoder.attn_implementation = "eager"
+    config_decoder.bos_token_id = tokenizer.bos_token_id or tokenizer.eos_token_id
     config_decoder.eos_token_id = tokenizer.eos_token_id
 
     # Create combined config and model
@@ -241,21 +254,19 @@ def main():
     if args.fresh_weights:
         hf_model = VisionEncoderDecoderModel(combined_config)
         hf_model.encoder = TimesformerModel.from_pretrained(args.pretrained_encoder, config=config_encoder, ignore_mismatched_sizes=True)
-        hf_model.decoder = GPT2LMHeadModel.from_pretrained(args.pretrained_decoder, config=config_decoder, ignore_mismatched_sizes=True)
+        hf_model.decoder = GPT2LMHeadModel.from_pretrained(args.pretrained_decoder, config=config_decoder, ignore_mismatched_sizes=True, attn_implementation="eager")
     elif args.pretrained_model is not None:
         hf_model = VisionEncoderDecoderModel.from_pretrained(args.pretrained_model)
     else:
         hf_model = VisionEncoderDecoderModel(combined_config)
-    # print(f"tokenizer.bos_token_id: {tokenizer.bos_token_id}")
 
-    # tokenizer config
-    tokenizer.bos_token = tokenizer.eos_token
-    tokenizer.pad_token = tokenizer.eos_token
+    if args.use_pad_token:
+        hf_model.decoder.resize_token_embeddings(len(tokenizer))
 
-    # decoder config ids
-    config_decoder.pad_token_id = tokenizer.eos_token_id
-    config_decoder.bos_token_id = tokenizer.bos_token_id
-    config_decoder.eos_token_id = tokenizer.eos_token_id
+    # # decoder config ids
+    # config_decoder.pad_token_id = tokenizer.pad_token_id
+    # config_decoder.bos_token_id = tokenizer.bos_token_id
+    # config_decoder.eos_token_id = tokenizer.eos_token_id
 
     # visionencoderdecoder config
     hf_model.config.decoder_start_token_id = tokenizer.bos_token_id
@@ -278,7 +289,7 @@ def main():
 
     train_dataset = NPZDataset(os.path.join(args.data_dir, 'train'), args.num_captions, args.subsample_size, tokenizer)
     val_dataset = NPZDataset(os.path.join(args.data_dir, 'val'), args.num_captions, args.subsample_size, tokenizer)
-    test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), 1, 1.0, tokenizer) # TODO: Change this back to args.subsample_size
+    test_dataset = NPZDataset(os.path.join(args.data_dir, 'test'), 1, args.subsample_size, tokenizer) # TODO: Change this back to args.subsample_size
     # val_sampler = DistributedSampler(val_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
     
     # -------------------------------------------------------------
@@ -288,8 +299,6 @@ def main():
     def greedy_decode_pipeline(engine, pixel_values, labels, metadata, tokenizer,
                                max_len=50, ctx_len=1024):
         is_last = engine.is_last_stage()
-        pp_group = None
-        # pp_group = engine.mpu.get_pipeline_model_parallel_group() if hasattr(engine, "mpu") else None
         last = (dist.get_world_size() - 1)
 
         device = pixel_values.device
@@ -313,24 +322,35 @@ def main():
 
             if is_last:
                 cur_len = seq.size(1)                     # real length BEFORE padding
-                next_tok = logits[:, cur_len-1, :].argmax(-1)
+                idx = min(cur_len, ctx_len) - 1   # time index inside the window
+                next_tok = logits[:, idx, :].argmax(-1)
+                
+                # probs for this step
+                # step_logits = logits[:, idx, :]                     # (B, V)
+                # step_probs = torch.softmax(step_logits, dim=-1)     # (B, V)
+
+                # top-5 per sample
+                # topk_probs, topk_idx = torch.topk(step_probs, k=5, dim=-1)  # both (B, 5)
+
+                # pretty-print (token + prob). Only print a couple of batch items to avoid spam.
+                # to_show = min(2, topk_idx.size(0))
+                # for b in range(to_show):
+                #     toks = tokenizer.convert_ids_to_tokens(topk_idx[b].tolist())
+                #     probs = topk_probs[b].tolist()
+                #     pairs = ", ".join([f"{t}:{p:.3f}" for t, p in zip(toks, probs)])
+                #     print(f"[STEP {cur_len-1}] sample {b} top5 => {pairs}")
+                # next_tok = logits[:, cur_len-1, :].argmax(-1)
             else:
                 next_tok = torch.empty(B, dtype=torch.long, device=device)
 
-            if pp_group is None:
-                dist.broadcast(next_tok, src=last)
-            else:
-                dist.broadcast(next_tok, src=last, group=pp_group)
+            dist.broadcast(next_tok, src=last)
             seq = torch.cat([seq, next_tok.unsqueeze(1)], dim=1)
 
             done = next_tok.eq(tokenizer.eos_token_id)
             finished |= done
             flag = finished.all().to(dtype=torch.bool)
-            if pp_group is None:
-                dist.broadcast(flag, src=last)
-            else:
-                dist.broadcast(flag, src=last, group=pp_group)
-            # dist.broadcast(flag, src=last, group=pp_group)
+            dist.broadcast(flag, src=last)
+            
             if flag.item():
                 break
 
@@ -512,29 +532,15 @@ def main():
     
     # Token embedding wrapper
     class DecTokenEmbedWrapper(nn.Module):
-        def __init__(self, wte, wpe, drop, pad_token_id):
+        def __init__(self, wte, wpe, drop, pad_token_id, bos_token_id):
             super().__init__()
             self.wte, self.wpe, self.drop = wte, wpe, drop
             self.pad_id = pad_token_id
+            self.bos_id = bos_token_id
 
         @property
         def weight(self):
             return self.wte.weight
-        
-        # def _valid_mask_from_labels(self, labels):
-        #     B, T = labels.shape
-        #     device = labels.device
-        #     is_pad = labels.eq(self.pad_id)
-        #     has_pad = is_pad.any(dim=1)
-        #     first_pad = torch.where(
-        #         has_pad,
-        #         is_pad.float().argmax(dim=1),
-        #         torch.full((B,), T, device=device, dtype=torch.long)
-        #     )
-        #     valid_len_after_shift = torch.clamp(first_pad + 1, max=T)
-        #     rng = torch.arange(T, device=device).unsqueeze(0).expand(B, T)
-        #     keep = rng < valid_len_after_shift.unsqueeze(1)   # (B, T) bool
-        #     return keep
 
         def forward(self, inputs):
             enc_hid, dec_or_lab, metadata = inputs
@@ -543,24 +549,22 @@ def main():
 
             # GENERATION if we see any -100 (sentinel for "not yet generated")
             is_generation = (dec_or_lab == -100).any()
+            
             # print(f"is_generation: {is_generation}")
             if not is_generation:
                 # ===== TRAINING (teacher forcing) =====
                 # dec_in = shift-right(labels) with BOS(=PAD) in front
                 dec_in = shift_tokens_right(dec_or_lab,
                                             pad_token_id=self.pad_id,
-                                            decoder_start_token_id=self.pad_id)
+                                            decoder_start_token_id=self.bos_id)
                 # For training (your reference): do NOT mask positions; loss covers all tokens
                 keep_inputs = torch.ones((B, T), dtype=torch.bool, device=device)
             else:
+                # print(f"is_generation? {is_generation}")
                 # ===== GENERATION (with padding) =====
                 # We expect dec_or_lab padded to ctx_len with -100 on the right
                 keep_inputs = dec_or_lab.ne(-100)                # True where tokens are "real"
                 dec_in = dec_or_lab.masked_fill(~keep_inputs, self.pad_id)  # replace -100 for embedding
-                # # Inference path: dec_or_lab is the running sequence (padded with -100)
-                # keep_inputs = dec_or_lab.ne(-100)
-                # # Replace -100 with pad for embedding lookup
-                # dec_in = dec_or_lab.masked_fill(~keep_inputs, self.pad_id)
             
             # Token + position embeddings
             pos_ids = torch.arange(T, device=device).unsqueeze(0)
@@ -594,12 +598,6 @@ def main():
             m = mask_2d[:, None, None, :].to(self.dtype)
             neg = -1e4 if self.dtype == torch.float16 else -1e9
             return (1.0 - m) * neg
-        
-        # def _causal_pad_mask(self, keep_2d, T, device):
-        #     neg = -1e4 if self.dtype == torch.float16 else -1e9
-        #     causal = (1.0 - torch.tril(torch.ones(T, T, device=device)))[None, None, ...] * neg
-        #     key_pad = (1.0 - keep_2d[:, None, None, :].to(self.dtype)) * neg
-        #     return causal + key_pad
 
         def forward(self, inputs):
             (enc_hid, dec_emb, enc_mask_2d,
@@ -608,14 +606,23 @@ def main():
             T = dec_emb.size(1)
             device = dec_emb.device
 
-            enc_attn_mask = self.invert_attention_mask(enc_mask_2d)
-            # decoder attention mask: 1.0 where valid tokens exist, 0.0 for padded (-100→pad_id) slots
-            # GPT-2 will combine this with the causal mask internally
-            # dec_attn_mask = keep_inputs.to(dtype=dec_emb.dtype)  # (B, T) float16/float32
-            neg = -1e4 if dec_emb.dtype == torch.float16 else -1e9
-            dec_attn_mask = (1.0 - keep_inputs.to(dec_emb.dtype))[:, None, None, :] * neg  # (B,1,1,T)
-            # dec_attn_mask = self._causal_pad_mask(keep_inputs, T, device)
-            
+            self_impl  = getattr(self.block.attn, "_attn_implementation",
+                     getattr(self.block, "_attn_implementation", "eager"))
+            cross_impl = getattr(getattr(self.block, "crossattention", None), "_attn_implementation", self_impl)
+
+            # self-attention mask
+            if self_impl == "sdpa":
+                dec_attn_mask = keep_inputs[:, None, None, :]          # (B,1,1,T) bool
+            else:
+                neg = -1e4 if dec_emb.dtype == torch.float16 else -1e9
+                dec_attn_mask = (1.0 - keep_inputs.to(dec_emb.dtype))[:, None, None, :] * neg
+
+            # cross-attention mask over encoder keys
+            if cross_impl == "sdpa":
+                enc_attn_mask = enc_mask_2d[:, None, None, :]          # (B,1,1,S) bool
+            else:
+                enc_attn_mask = self.invert_attention_mask(enc_mask_2d)  # (B,1,1,S) additive
+
             out = self.block(
                 dec_emb,
                 layer_past=None,
@@ -660,7 +667,8 @@ def main():
             hf_model.decoder.transformer.wte,
             hf_model.decoder.transformer.wpe,
             hf_model.decoder.transformer.drop,
-            tokenizer.pad_token_id
+            tokenizer.pad_token_id,
+            tokenizer.bos_token_id
         ))
         
         # Decoder blocks
@@ -709,6 +717,8 @@ def main():
     #     # hf_model.eval()
 
     #     summary(hf_model, input_size=[(512, 8, 3, 224, 224), (512, 1024)], dtypes=[torch.float, torch.long], col_names=["input_size", "output_size", "num_params", "trainable"], depth=4)
+    print("GPT-2 attention impl:",
+      getattr(hf_model.decoder.transformer, "_attn_implementation", "unknown"))
 
     # Convert to pipeline 
     blocks = to_pipeline_blocks_with_tied_weights(hf_model)
@@ -727,8 +737,6 @@ def main():
                     eps=1e-8,
                     weight_decay=args.learning_rate_decay)
 
-    
-
     # scheduler = get_scheduler(
     #     name="linear",
     #     optimizer=optimizer,
@@ -746,45 +754,6 @@ def main():
         config=ds_config,
         dist_init_required=False,
     )
-
-    # # Setup and initialize wandb
-    # if deep_speed_model_engine.is_last_stage():
-
-    #     # This dict can be used for generating a report at the end.
-    #     # (print this and all of the train, val, and test results)
-    #     wandb_config = {
-    #             "architecture": "SpaceTimeGPT",
-    #             "data_dir": args.data_dir,
-    #             "num_epochs": args.num_epochs,
-    #             "num_captions": args.num_captions,
-    #             "world_size": dist.get_world_size(),
-    #             "num_gpus": dist.get_world_size(),
-    #             "seed": args.random_seed,
-    #             "beams": args.num_beams,
-    #             "batch_size": args.batch_size,
-    #             "microbatch_size": args.batch_size // dist.get_world_size(),
-    #             "subsample_size": args.subsample_size,
-    #             "num_frames_encoder": args.num_frames_encoder,
-    #             "hidden_size_encoder": args.hidden_size_encoder,
-    #             "num_hidden_layers": args.num_hidden_layers,
-    #             "min_caption_length": args.min_caption_length,
-    #             "max_caption_length": args.max_caption_length,
-    #             "temperature": args.temperature,
-    #             "pretrained_model": args.pretrained_model,
-    #             "gradient_accumulation_steps": args.gradient_accumulation_steps,
-    #             "steps_per_print": args.steps_per_print,
-    #             "zero_stage": args.zero_stage,
-    #             "fp16_enabled": args.fp16_enabled,
-    #             "fp16_autocast": args.fp16_autocast,
-    #             "attention_type_encoder": args.attention_type_encoder,
-    #         }
-
-    #     # Initialize wandb
-    #     wandb.init(
-    #         project="nairr",
-    #         name=experiment_name,
-    #         config=wandb_config,
-    #     )
  
     # This dict can be used for generating a report at the end.
     # (print this and all of the train, val, and test results)
@@ -815,87 +784,68 @@ def main():
             "fp16_autocast": args.fp16_autocast,
             "attention_type_encoder": args.attention_type_encoder,
         }
-
+    # Test on GPU SERVER to see if run uses the same graphs..
     run = wandb.init(
             project="nairr",
             name=f"{experiment_name}",
             group=experiment_name,
             config=wandb_config,
-            id=experiment_name
+            id=experiment_name,
+            resume="must"
         )
-    # if deep_speed_model_engine.is_last_stage():
-    #     # Initialize wandb
-    #     run = wandb.init(
-    #         project="nairr",
-    #         name=f"{experiment_name}-rank{dist.get_rank()}",
-    #         group=experiment_name,
-    #         config=wandb_config,
-    #     )
-    # else:
-    #     wandb.init(
-    #         project="nairr",
-    #         name=f"{experiment_name}-rank{dist.get_rank()}",
-    #         group=experiment_name,
-    #         config=wandb_config,
-    #         id=run.id
-    #         )
-
-    # # My attempt at DP + PP, doesnt seem to work? Not fully tested..
-    # if hasattr(deep_speed_model_engine, "mpu"):
-    #     dp = deep_speed_model_engine.mpu.get_data_parallel_world_size()
-    #     dp_rank = deep_speed_model_engine.mpu.get_data_parallel_rank()
-    # else:
-    #     # fallback if running pure DP without pipeline engine
-    #     dp = dist.get_world_size()
-    #     dp_rank = dist.get_rank()
     
     micro = ds_config['train_micro_batch_size_per_gpu']
     ga = ds_config['gradient_accumulation_steps']
 
-    steps_per_epoch = len(train_dataset) // (dist.get_world_size() * micro * ga)
-
+    # steps_per_epoch = len(train_dataset) // (dist.get_world_size() * micro * ga)
+    
     # Build samplers/loaders using DP only; batch_size is per-rank
     # val_sampler  = DistributedSampler(val_dataset,  num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
     # test_sampler = DistributedSampler(test_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
+    train_sampler = SequentialSampler(train_dataset)
     val_sampler = SequentialSampler(val_dataset)
     test_sampler = SequentialSampler(test_dataset)
 
-    val_dataloader  = DataLoader(val_dataset,  sampler=val_sampler,  batch_size=micro, collate_fn=default_collate, drop_last=True)
-    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=micro, collate_fn=default_collate, drop_last=True)
-
+    train_dataloader = DataLoader(train_dataset,  sampler=train_sampler, batch_size=micro, collate_fn=default_collate, drop_last=True)
+    val_dataloader = DataLoader(val_dataset,  sampler=val_sampler,  batch_size=micro, collate_fn=default_collate, drop_last=True)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=1, collate_fn=default_collate, drop_last=True)
+    
     # Resume from checkpoint if specified
     # TODO: needs to be tested
     if args.resume_from_checkpoint is not None:
         checkpoint_path = os.path.join(experiment_output_dir, "checkpoints")
         deep_speed_model_engine.load_checkpoint(checkpoint_path, tag=f"epoch_{args.resume_from_checkpoint}")
-
+        start = args.resume_from_checkpoint + 1
+        epochs = list(range(start, start + args.num_epochs))
+    else:
+        epochs = list(range(args.num_epochs))
     ##################################################
     # Training loop with validation after each epoch
     if args.do_train:
 
-        for epoch in range(args.num_epochs):
+        for epoch in epochs:
             # steps_per_epoch = len(train_dataset) // (
             #     args.batch_size * dist.get_world_size() * ds_config['gradient_accumulation_steps']
             # )
-            
+            train_steps_per_epoch = len(train_dataloader) // ga
             deep_speed_model_engine.train()
-            
+            train_iter = iter(RepeatingLoader(train_dataloader))
             if deep_speed_model_engine.is_last_stage():
                 total_train_loss = 0.0 
 
-            for step in range(steps_per_epoch):
-                loss = deep_speed_model_engine.train_batch()
+            for step in range(train_steps_per_epoch):
+                loss = deep_speed_model_engine.train_batch(data_iter=train_iter)
 
                 if deep_speed_model_engine.is_last_stage():
                     wandb.log({"Exp/Train Batch Loss️": loss.item()})
                     total_train_loss += loss.item()
 
                 if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
-                    print(f"Train Batch Loss Step {step+1}/{steps_per_epoch}, Loss: {loss.item():.4f}" )
+                    print(f"Train Batch Loss Step {step+1}/{train_steps_per_epoch}, Loss: {loss.item():.4f}" )
             
             if deep_speed_model_engine.is_last_stage():
-                print(f"Train Average Epoch {epoch} Loss: {(total_train_loss/steps_per_epoch)}")
-                wandb.log({f"Exp/Train Average Loss": (total_train_loss/steps_per_epoch) })
+                print(f"Train Average Epoch {epoch} Loss: {(total_train_loss/train_steps_per_epoch)}")
+                wandb.log({f"Exp/Train Average Loss": (total_train_loss/train_steps_per_epoch) })
 
             dist.barrier()
             
@@ -912,27 +862,44 @@ def main():
                 deep_speed_model_engine.eval()
                 val_iter = iter(RepeatingLoader(val_dataloader))
 
+                ((val_pix, val_labels, val_meta), _) = next(val_iter)
+                val_pix = val_pix.to(device)
+
+                # Run greedy decode through the pipeline (all ranks must call this)
+                greedy_preds = greedy_decode_pipeline(
+                    deep_speed_model_engine,
+                    val_pix, val_labels, val_meta, tokenizer,
+                    max_len=100,
+                    ctx_len=1024
+                )
+
+                # Only the last pipeline stage has the strings; log/print there
+                if deep_speed_model_engine.is_last_stage():
+                    gts = [val_dataset.get_gt_caption(m[2].item()) for m in val_meta]
+                    print(f"[VAL GREEDY] pred: {greedy_preds}")
+                    print(f"[VAL GREEDY] gt : {gts}")
+                    
                 # num_val_batches = len(val_dataset) // (
                 #     ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size()
                 # )
-                val_steps_per_epoch = len(val_dataset) // (dist.get_world_size() * micro)
+                # val_steps_per_epoch = len(val_dataloader)
 
-                total_val_loss = 0.0
-                for step in range(val_steps_per_epoch):
-                    loss, logits = deep_speed_model_engine.eval_batch(data_iter=val_iter,return_logits=True)
-                    # print(f"DEBUG: logits type: {type(logits)}, loss: {loss.item()}")
+                # total_val_loss = 0.0
+                # for step in range(val_steps_per_epoch):
+                #     loss, logits = deep_speed_model_engine.eval_batch(data_iter=val_iter,return_logits=True)
+                #     # print(f"DEBUG: logits type: {type(logits)}, loss: {loss.item()}")
 
-                    if deep_speed_model_engine.is_last_stage():
-                        total_val_loss += loss.item()
+                #     if deep_speed_model_engine.is_last_stage():
+                #         total_val_loss += loss.item()
 
-                    if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
-                        print(f"Val Batch Loss Step {step+1}/{val_steps_per_epoch}, Loss: {loss.item():.4f}" )
-                        wandb.log({"Exp/Val Batch Loss": loss.item()})
+                #     if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
+                #         print(f"Val Batch Loss Step {step+1}/{val_steps_per_epoch}, Loss: {loss.item():.4f}" )
+                #         wandb.log({"Exp/Val Batch Loss": loss.item()})
 
-                if deep_speed_model_engine.is_last_stage():
-                    val_loss = total_val_loss / val_steps_per_epoch
-                    print(f"Val Average Epoch {epoch} Loss: {val_loss}")
-                    wandb.log({"Exp/Val Average Loss": val_loss})
+                # if deep_speed_model_engine.is_last_stage():
+                #     val_loss = total_val_loss / val_steps_per_epoch
+                #     print(f"Val Average Epoch {epoch} Loss: {val_loss}")
+                #     wandb.log({"Exp/Val Average Loss": val_loss})
 
     dist.barrier()
    
@@ -951,7 +918,7 @@ def main():
         deep_speed_model_engine.eval()
         test_iter = iter(RepeatingLoader(test_dataloader))
         # num_test_batches = len(test_dataset) // (ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size())
-        test_steps_per_epoch = len(test_dataset) // (dist.get_world_size() * micro)
+        test_steps_per_epoch = len(test_dataloader)
 
         for step in range(test_steps_per_epoch):
             ((pixel_values,labels,metadata), _) = next(test_iter)
