@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# export CUDA_VISIBLE_DEVICES="3,4,0"
+export CUDA_VISIBLE_DEVICES="3,4,0"
 # export MASTER_ADDR=130.212.4.133
 # export MASTER_PORT=29500
 # export NCCL_DEBUG=INFO
@@ -11,15 +11,17 @@
 ZERO_STAGE=1
 NUM_EPOCHS=2
 NUM_CAPTIONS=10
-SUBSET_SIZE=0.10
+SUBSET_SIZE=0.001
 
-NUM_HIDDEN_LAYERS=12
+ENCODER_NUM_HIDDEN_LAYERS=12 # 
+DECODER_NUM_HIDDEN_LAYERS=12 # 12x768, 25x1600, 40x1600, 80x1600, 160x1600
 HIDDEN_SIZE_ENCODER=768
-GRADIENT_ACCUMULATION_STEPS=4
+HIDDEN_SIZE_DECODER=768
+GRADIENT_ACCUMULATION_STEPS=1
 
-EXPERIMENT_NAME="VATEX-psc"
-DATA_DIR="/ocean/projects/cis240146p/shared/data/VATEX_8_frames"
-OUTPUT_DIR="/ocean/projects/cis240146p/scotta/training_artifacts/"
+EXPERIMENT_NAME="VATEX-TESTING_v4"
+DATA_DIR="/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames"
+OUTPUT_DIR="/data2/juve/yo/"
 
 NUM_NODES=1   # Number of nodes
 NUM_GPU=3     # Number of GPUs per node
@@ -36,7 +38,7 @@ TOKENIZER="gpt2"
 
 # torchrun --nproc_per_node=3 --nnodes=1 --node_rank=0 main_deepspeed.py  --num_gpus $NUM_GPU \
     # --pretrained_model $PRETRAINED_MODEL \
-deepspeed main_deepspeed_gpt5_refactor.py --num_gpus $NUM_GPU \
+deepspeed main_deepspeed_gpt5_fix.py --num_gpus $NUM_GPU \
     --world_size $WORLD_SIZE -ep $NUM_EPOCHS -ss $SUBSET_SIZE --num_captions $NUM_CAPTIONS \
     --experiment_name $EXPERIMENT_NAME --batch_size $BATCH_SIZE \
     --data_dir $DATA_DIR --output_dir $OUTPUT_DIR \
@@ -44,7 +46,9 @@ deepspeed main_deepspeed_gpt5_refactor.py --num_gpus $NUM_GPU \
     --pretrained_decoder $PRETRAINED_DEC \
     --image_preprocessor $IMAGE_PP \
     --tokenizer $TOKENIZER --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
-    --num_hidden_layers $NUM_HIDDEN_LAYERS --hidden_size_encoder $HIDDEN_SIZE_ENCODER \
+    --decoder_num_hidden_layers $DECODER_NUM_HIDDEN_LAYERS --hidden_size_encoder $HIDDEN_SIZE_ENCODER \
+    --n_embd_decoder $HIDDEN_SIZE_DECODER \
+    --encoder_num_hidden_layers $ENCODER_NUM_HIDDEN_LAYERS \
     --zero_stage $ZERO_STAGE \
     --fp16_enabled --early_stopping \
     --fresh_weights \

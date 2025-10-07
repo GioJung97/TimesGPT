@@ -724,8 +724,8 @@ def main():
     #     # hf_model.eval()
 
     #     summary(hf_model, input_size=[(512, 8, 3, 224, 224), (512, 1024)], dtypes=[torch.float, torch.long], col_names=["input_size", "output_size", "num_params", "trainable"], depth=4)
-    print("GPT-2 attention impl:",
-      getattr(hf_model.decoder.transformer, "_attn_implementation", "unknown"))
+    # print("GPT-2 attention impl:",
+    #   getattr(hf_model.decoder.transformer, "_attn_implementation", "unknown"))
 
     # Convert to pipeline 
     blocks = to_pipeline_blocks_with_tied_weights(hf_model)
@@ -743,22 +743,36 @@ def main():
                     betas=(0.9, 0.999),
                     eps=1e-8,
                     weight_decay=args.learning_rate_decay)
+
+    micro = ds_config['train_micro_batch_size_per_gpu']
+    ga = ds_config['gradient_accumulation_steps']
+
+    train_sampler = SequentialSampler(train_dataset)
+    val_sampler = SequentialSampler(val_dataset)
+    test_sampler = SequentialSampler(test_dataset)
+
+    train_dataloader = DataLoader(train_dataset,  sampler=train_sampler, batch_size=micro, collate_fn=default_collate, drop_last=True)
+    val_dataloader = DataLoader(val_dataset,  sampler=val_sampler,  batch_size=micro, collate_fn=default_collate, drop_last=True)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=micro, collate_fn=default_collate, drop_last=False)
     
+    train_steps_per_epoch = len(train_dataloader) // ga
+    total_updates = train_steps_per_epoch * args.num_epochs
+
     # TODO: TEST SCHEDULER
-    # scheduler = get_scheduler(
-    #     name="linear",
-    #     optimizer=optimizer,
-    #     num_warmup_steps=0,
-    #     num_training_steps=total_updates,
-    # )
+    scheduler = get_scheduler(
+        name="linear",
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=total_updates,
+    )
 
     # Initialize DeepSpeed
-    deep_speed_model_engine, optimizer, train_dataloader, scheduler  = deepspeed.initialize(
+    deep_speed_model_engine, optimizer, ds_train_dataloader, pipeline_scheduler  = deepspeed.initialize(
         model=hf_model,
         optimizer=optimizer,
         model_parameters=[p for p in hf_model.parameters() if p.requires_grad],
         training_data=train_dataset,
-        # lr_scheduler=scheduler,
+        lr_scheduler=scheduler,
         config=ds_config,
         dist_init_required=False,
     )
@@ -802,24 +816,24 @@ def main():
                 group=experiment_name,
                 config=wandb_config,
                 id=experiment_name,
-                resume="must"
+                # resume="must"
             )
     
-    micro = ds_config['train_micro_batch_size_per_gpu']
-    ga = ds_config['gradient_accumulation_steps']
+    # micro = ds_config['train_micro_batch_size_per_gpu']
+    # ga = ds_config['gradient_accumulation_steps']
 
     # steps_per_epoch = len(train_dataset) // (dist.get_world_size() * micro * ga)
     
     # Build samplers/loaders using DP only; batch_size is per-rank
     # val_sampler  = DistributedSampler(val_dataset,  num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
     # test_sampler = DistributedSampler(test_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(), shuffle=False)
-    train_sampler = SequentialSampler(train_dataset)
-    val_sampler = SequentialSampler(val_dataset)
-    test_sampler = SequentialSampler(test_dataset)
+    # train_sampler = SequentialSampler(train_dataset)
+    # val_sampler = SequentialSampler(val_dataset)
+    # test_sampler = SequentialSampler(test_dataset)
 
-    train_dataloader = DataLoader(train_dataset,  sampler=train_sampler, batch_size=micro, collate_fn=default_collate, drop_last=True)
-    val_dataloader = DataLoader(val_dataset,  sampler=val_sampler,  batch_size=micro, collate_fn=default_collate, drop_last=True)
-    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=micro, collate_fn=default_collate, drop_last=False)
+    # train_dataloader = DataLoader(train_dataset,  sampler=train_sampler, batch_size=micro, collate_fn=default_collate, drop_last=True)
+    # val_dataloader = DataLoader(val_dataset,  sampler=val_sampler,  batch_size=micro, collate_fn=default_collate, drop_last=True)
+    # test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=micro, collate_fn=default_collate, drop_last=True)
     
     # Resume from checkpoint if specified
     # TODO: needs to be tested
@@ -830,6 +844,7 @@ def main():
         epochs = list(range(start, start + args.num_epochs))
     else:
         epochs = list(range(args.num_epochs))
+        
     ##################################################
     # Training loop with validation after each epoch
     if args.do_train:
@@ -850,10 +865,15 @@ def main():
                 if is_logger:
                     wandb.log({"Exp/Train Batch Loss️": loss.item()})
                     total_train_loss += loss.item()
+                    # print(f"pipeline_scheduler.get_lr(): {pipeline_scheduler.get_lr()[0]}")
+                    wandb.log({"Exp/Train Current Learning Rate": pipeline_scheduler.get_lr()[0]})
+
 
                 if deep_speed_model_engine.is_last_stage() and step % ds_config['steps_per_print'] == 0:
                     print(f"Train Batch Loss Step {step+1}/{train_steps_per_epoch}, Loss: {loss.item():.4f}" )
-            
+
+                # pipeline_scheduler.step()
+                
             if is_logger:
                 print(f"Train Average Epoch {epoch} Loss: {(total_train_loss/train_steps_per_epoch)}")
                 wandb.log({f"Exp/Train Average Loss": (total_train_loss/train_steps_per_epoch) })
@@ -873,44 +893,43 @@ def main():
                 deep_speed_model_engine.eval()
                 val_iter = iter(RepeatingLoader(val_dataloader))
 
-                ((val_pix, val_labels, val_meta), _) = next(val_iter)
-                val_pix = val_pix.to(device)
+                # ((val_pix, val_labels, val_meta), _) = next(val_iter)
+                # val_pix = val_pix.to(device)
 
                 # Run greedy decode through the pipeline (all ranks must call this)
-                greedy_preds = greedy_decode_pipeline(
-                    deep_speed_model_engine,
-                    val_pix, val_labels, val_meta, tokenizer,
-                    max_len=100,
-                    ctx_len=1024
-                )
+                # greedy_preds = greedy_decode_pipeline(
+                #     deep_speed_model_engine,
+                #     val_pix, val_labels, val_meta, tokenizer,
+                #     max_len=100,
+                #     ctx_len=1024
+                # )
 
                 # Only the last pipeline stage has the strings; log/print there
-                if deep_speed_model_engine.is_last_stage():
-                    gts = [val_dataset.get_gt_caption(m[2].item()) for m in val_meta]
-                    print(f"[VAL GREEDY] pred: {greedy_preds}")
-                    print(f"[VAL GREEDY] gt : {gts}")
+                # if deep_speed_model_engine.is_last_stage():
+                #     gts = [val_dataset.get_gt_caption(m[2].item()) for m in val_meta]
+                #     print(f"[VAL GREEDY] pred: {greedy_preds}")
+                #     print(f"[VAL GREEDY] gt : {gts}")
                     
                 # num_val_batches = len(val_dataset) // (
                 #     ds_config['train_micro_batch_size_per_gpu'] * dist.get_world_size()
                 # )
-                # val_steps_per_epoch = len(val_dataloader)
+                val_steps_per_epoch = len(val_dataloader)
 
-                # total_val_loss = 0.0
-                # for step in range(val_steps_per_epoch):
-                #     loss, logits = deep_speed_model_engine.eval_batch(data_iter=val_iter,return_logits=True)
-                #     # print(f"DEBUG: logits type: {type(logits)}, loss: {loss.item()}")
+                total_val_loss = 0.0
+                for step in range(val_steps_per_epoch):
+                    loss, logits = deep_speed_model_engine.eval_batch(data_iter=val_iter,return_logits=True)
 
-                #     if deep_speed_model_engine.is_last_stage():
-                #         total_val_loss += loss.item()
+                    if deep_speed_model_engine.is_last_stage():
+                        total_val_loss += loss.item()
 
-                #     if is_logger and step % ds_config['steps_per_print'] == 0:
-                #         print(f"Val Batch Loss Step {step+1}/{val_steps_per_epoch}, Loss: {loss.item():.4f}" )
-                #         wandb.log({"Exp/Val Batch Loss": loss.item()})
+                    if is_logger and step % ds_config['steps_per_print'] == 0:
+                        print(f"Val Batch Loss Step {step+1}/{val_steps_per_epoch}, Loss: {loss.item():.4f}" )
+                        wandb.log({"Exp/Val Batch Loss": loss.item()})
 
-                # if is_logger:
-                #     val_loss = total_val_loss / val_steps_per_epoch
-                #     print(f"Val Average Epoch {epoch} Loss: {val_loss}")
-                #     wandb.log({"Exp/Val Average Loss": val_loss})
+                if is_logger:
+                    val_loss = total_val_loss / val_steps_per_epoch
+                    print(f"Val Average Epoch {epoch} Loss: {val_loss}")
+                    wandb.log({"Exp/Val Average Loss": val_loss})
 
     dist.barrier()
    
@@ -967,12 +986,11 @@ def main():
                     pred      = pred_dict[uid][0]
                     gt_joined = " || ".join(gt_per_uid[uid])
                     f.write(f'{uid},{filename},{pred},{gt_joined}\n')
-                    
+
             uids_eval = list(pred_dict.keys())
             predicted_captions   = [pred_dict[u][0] for u in uids_eval]     # List[str]
             ground_truth_captions = [gt_per_uid[u]  for u in uids_eval]     # List[List[str]]
 
-            # TODO: FIX METRICS
             cider_score, _, ciderD_score, _, bleu_score, _, meteor_score, _, rouge_score, _, spice_score, _ = calculate_scores(predicted_captions, ground_truth_captions)
             bleu_1_score, bleu_2_score, bleu_3_score, bleu_4_score = bleu_score
 
@@ -991,7 +1009,7 @@ def main():
             wandb.finish()
     dist.barrier()
 
-    if args.do_test and is_logger:
+    if args.do_test and deep_speed_model_engine.is_last_stage():
         # Run the qualitative if we are doing that
         # os.makedirs(experiment_output_dir, exist_ok=True)
         # with open(os.path.join(experiment_output_dir, experiment_name +".csv"), 'w') as f:
