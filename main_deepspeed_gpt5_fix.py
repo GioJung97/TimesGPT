@@ -743,7 +743,8 @@ def main():
                     betas=(0.9, 0.999),
                     eps=1e-8,
                     weight_decay=args.learning_rate_decay)
-
+    
+    # TODO: TEST SCHEDULER
     # scheduler = get_scheduler(
     #     name="linear",
     #     optimizer=optimizer,
@@ -958,10 +959,20 @@ def main():
                         f"gts:  {gt_per_uid[last_uid]}")
                     
         if is_logger:
+            os.makedirs(experiment_output_dir, exist_ok=True)
+            with open(os.path.join(experiment_output_dir, experiment_name +".csv"), 'w') as f:
+                f.write("uid,filename,pred,gt\n")
+                for uid in uids:
+                    filename  = uid_to_filename[uid]
+                    pred      = pred_dict[uid][0]
+                    gt_joined = " || ".join(gt_per_uid[uid])
+                    f.write(f'{uid},{filename},{pred},{gt_joined}\n')
+                    
             uids_eval = list(pred_dict.keys())
             predicted_captions   = [pred_dict[u][0] for u in uids_eval]     # List[str]
             ground_truth_captions = [gt_per_uid[u]  for u in uids_eval]     # List[List[str]]
 
+            # TODO: FIX METRICS
             cider_score, _, ciderD_score, _, bleu_score, _, meteor_score, _, rouge_score, _, spice_score, _ = calculate_scores(predicted_captions, ground_truth_captions)
             bleu_1_score, bleu_2_score, bleu_3_score, bleu_4_score = bleu_score
 
@@ -980,16 +991,16 @@ def main():
             wandb.finish()
     dist.barrier()
 
-    if args.do_test and deep_speed_model_engine.is_last_stage():
+    if args.do_test and is_logger:
         # Run the qualitative if we are doing that
-        os.makedirs(experiment_output_dir, exist_ok=True)
-        with open(os.path.join(experiment_output_dir, experiment_name +".csv"), 'w') as f:
-            f.write("uid,filename,pred,gt\n")
-            for uid in uids:
-                filename  = uid_to_filename[uid]
-                pred      = pred_dict[uid][0]
-                gt_joined = " || ".join(gt_per_uid[uid])
-                f.write(f'{uid},{filename},{pred},{gt_joined}\n')
+        # os.makedirs(experiment_output_dir, exist_ok=True)
+        # with open(os.path.join(experiment_output_dir, experiment_name +".csv"), 'w') as f:
+        #     f.write("uid,filename,pred,gt\n")
+        #     for uid in uids:
+        #         filename  = uid_to_filename[uid]
+        #         pred      = pred_dict[uid][0]
+        #         gt_joined = " || ".join(gt_per_uid[uid])
+        #         f.write(f'{uid},{filename},{pred},{gt_joined}\n')
 
         mean = torch.tensor(image_processor.image_mean).view(1, 3, 1, 1)
         std = torch.tensor(image_processor.image_std).view(1, 3, 1, 1)
