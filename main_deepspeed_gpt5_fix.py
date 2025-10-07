@@ -47,7 +47,7 @@ parser.add_argument('-ep', '--num_epochs', type=int, default=4, help="Number of 
 parser.add_argument('-lr', '--learning_rate', type=float, default=0.0000005, help="Learning rate (default: 0.0000005)")
 parser.add_argument('--local_rank', type=int, default=0, help="The rank of this machine. (default=0)")
 parser.add_argument('--world_size', type=int, default=1, help="The total number of GPUs available to this job, across all nodes available to this job. (default=1)")
-parser.add_argument('-dc', '--learning_rate_decay', type=float, default=0.01, help="Learning rate decay (default: 0.000000005)")
+parser.add_argument('-dc', '--optimizer_decay', type=float, default=0.01, help="Optimizer rate decay (default: 0.01)")
 parser.add_argument('-bs', '--batch_size', type=int, default=1, help="Batch size (default: 1)")
 parser.add_argument('-pf', '--pretrained_model', default=None, type=str, help="Pretrained model path")
 parser.add_argument('-fw', '--fresh_weights', action="store_true", help="Start from HF base models")
@@ -742,7 +742,7 @@ def main():
                     lr=args.learning_rate, 
                     betas=(0.9, 0.999),
                     eps=1e-8,
-                    weight_decay=args.learning_rate_decay)
+                    weight_decay=args.optimizer_decay)
 
     micro = ds_config['train_micro_batch_size_per_gpu']
     ga = ds_config['gradient_accumulation_steps']
