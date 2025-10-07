@@ -971,7 +971,7 @@ def main():
                         uid_to_filename[uid] = filename
                         uids.append(uid)
 
-                if step % 2 == 0 and uids:
+                if step % 1 == 0 and uids:
                     last_uid = uids[-1]
                     print(f"[DEBUG] step: {step}/{test_steps_per_epoch} | uid: {last_uid}\n"
                         f"pred: {pred_dict[last_uid][0]}\n"
