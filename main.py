@@ -59,6 +59,8 @@ parser.add_argument('-de', '--pretrained_decoder', type=str, default=None, help=
 parser.add_argument('-ip', '--image_preprocessor', type=str, default=None, help="Image preprocessor model")
 parser.add_argument('-to', '--tokenizer', type=str, default=None, help="Tokenizer model")
 parser.add_argument('-ehl', '--encoder_num_hidden_layers', type=int, default=12, help="Encoder layers (default: 12)")
+parser.add_argument('-dnh', '--decoder_num_heads', type=int, default=12, help="Decoder Attention Heads (default: 12)")
+parser.add_argument('-enh', '--encoder_num_heads', type=int, default=12, help="Decoder Attention Heads (default: 12)")
 parser.add_argument('-dhl', '--decoder_num_hidden_layers', type=int, default=12, help="Encoder layers (default: 12)")
 parser.add_argument('-cl', '--context_length', type=int, default=1024, help="Decoder context length for input and ouptput. (default: 1024)")
 parser.add_argument('--hidden_size_encoder', type=int, default=768, help="Encoder hidden size (default: 768)")
@@ -232,7 +234,7 @@ def main():
     config_encoder.hidden_size = args.hidden_size_encoder
     config_encoder.intermediate_size = args.hidden_size_encoder * 4
     config_encoder.num_hidden_layers = args.encoder_num_hidden_layers
-    config_encoder.num_attention_heads = args.encoder_num_hidden_layers
+    config_encoder.num_attention_heads = args.encoder_num_heads
     # config_encoder.intermediate_size = args.intermediate_size_encoder
     config_encoder.attention_type = args.attention_type_encoder
 
@@ -241,7 +243,7 @@ def main():
     config_decoder.n_positions = args.context_length
     config_decoder.n_embd = args.n_embd_decoder
     config_decoder.n_layer = args.decoder_num_hidden_layers
-    config_decoder.n_head = args.decoder_num_hidden_layers
+    config_decoder.n_head = args.decoder_num_heads
     config_decoder.add_cross_attention = True
     config_decoder.is_decoder = True
     config_decoder.use_cache = False # set to True to be sliding attention window, set to False to make sure we get an error if we exceed our contenxt length
@@ -679,8 +681,8 @@ def main():
         for i, enc_block in enumerate(hf_model.encoder.encoder.layer):
             blocks.append(EncBlockWrapper(enc_block))
             # if i < args.num_adapters:
-            if i < 4:
-                blocks.append(Adapter())
+            # if i < 4:
+            #     blocks.append(Adapter())
               
         blocks.append(EncLayerNormWrapper(hf_model.encoder.layernorm))
 
@@ -953,10 +955,10 @@ def main():
 
                     if deep_speed_model_engine.is_last_stage():
                         total_val_loss += loss.item()
+                        wandb.log({"Exp/Val Batch Loss": loss.item()})
 
                     if is_logger and step % ds_config['steps_per_print'] == 0:
                         print(f"Val Batch Loss Step {step+1}/{val_steps_per_epoch}, Loss: {loss.item():.4f}" )
-                        wandb.log({"Exp/Val Batch Loss": loss.item()})
 
                 if is_logger:
                     val_loss = total_val_loss / val_steps_per_epoch
