@@ -753,7 +753,7 @@ def main():
 
     train_dataloader = DataLoader(train_dataset,  sampler=train_sampler, batch_size=micro, collate_fn=default_collate, drop_last=True)
     val_dataloader = DataLoader(val_dataset,  sampler=val_sampler,  batch_size=micro, collate_fn=default_collate, drop_last=True)
-    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=micro, collate_fn=default_collate, drop_last=False)
+    test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=micro, collate_fn=default_collate, drop_last=True)
     
     train_steps_per_epoch = len(train_dataloader) // ga
     total_updates = train_steps_per_epoch * args.num_epochs
@@ -971,7 +971,7 @@ def main():
                         uid_to_filename[uid] = filename
                         uids.append(uid)
 
-                if step % 2 == 0 and uids:
+                if step % 50 == 0 and uids:
                     last_uid = uids[-1]
                     print(f"[DEBUG] step: {step}/{test_steps_per_epoch} | uid: {last_uid}\n"
                         f"pred: {pred_dict[last_uid][0]}\n"

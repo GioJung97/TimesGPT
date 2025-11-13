@@ -10,20 +10,20 @@ from cider.PyDataFormat.loadData import LoadData
 from collections import defaultdict
 import random, re
 import string
-from nltk.tokenize import word_tokenize
-from lexicalrichness import LexicalRichness
-from nltk.stem import WordNetLemmatizer
-from nltk.corpus import stopwords
-import contractions
+# from nltk.tokenize import word_tokenize
+# from lexicalrichness import LexicalRichness
+# from nltk.stem import WordNetLemmatizer
+# from nltk.corpus import stopwords
+# import contractions
 
 # Using english stopwords
-stopWord = stopwords.words('english')
+# stopWord = stopwords.words('english')
 
-# Lemmatization
-lemma = WordNetLemmatizer()
+# # Lemmatization
+# lemma = WordNetLemmatizer()
 
-lexical_metrics = ['words', 'terms', 'ttr', 'rttr', 'cttr', 'msttr', 'mattr', 'mtld', 'hdd', 'vocd', 'herdan',
-           'summer', 'dugast', 'maas', 'yulek', 'yulei', 'herdanvm', 'simpsond']
+# lexical_metrics = ['words', 'terms', 'ttr', 'rttr', 'cttr', 'msttr', 'mattr', 'mtld', 'hdd', 'vocd', 'herdan',
+#            'summer', 'dugast', 'maas', 'yulek', 'yulei', 'herdanvm', 'simpsond']
 
 def generate_caption_dicts(ground_truth_captions, predicted_captions):
     gts_dict = defaultdict(list)
@@ -31,7 +31,7 @@ def generate_caption_dicts(ground_truth_captions, predicted_captions):
     seen_captions = {}
     for idx, caps in enumerate(ground_truth_captions):
         if isinstance(caps, list):
-            print(f"caps: {caps}")
+            # print(f"caps: {caps}")
             for caption in caps:
 
                 gts_dict[str(idx)].append({'caption': caption}) 
@@ -108,126 +108,126 @@ def calculate_scores(predicted_captions, ground_truth_captions):
     # spice_scores = None
     return cider_score, cider_scores, ciderD_score, ciderD_scores, bleu_score, bleu_scores, meteor_score, meteor_scores, rouge_score, rouge_scores, spice_score, spice_scores
 
-def get_lexical_metric(text, metric='mtld'):
-    lex = LexicalRichness(text)
-    word_count = lex.words
-    term_count = lex.terms
+# def get_lexical_metric(text, metric='mtld'):
+#     lex = LexicalRichness(text)
+#     word_count = lex.words
+#     term_count = lex.terms
 
-    if metric == 'words':
-        return lex.words
+#     if metric == 'words':
+#         return lex.words
     
-    elif metric == 'terms':
-        return lex.terms
+#     elif metric == 'terms':
+#         return lex.terms
     
-    elif metric == 'ttr':
-        return lex.ttr
+#     elif metric == 'ttr':
+#         return lex.ttr
     
-    elif metric == 'rttr':
-        return lex.rttr
+#     elif metric == 'rttr':
+#         return lex.rttr
     
-    elif metric == 'cttr':
-        return lex.cttr
+#     elif metric == 'cttr':
+#         return lex.cttr
     
-    elif metric == 'msttr':
-        segment_window=25   # size of each segment
-        if word_count == 1: segment_window = None
-        elif word_count <= 25: segment_window = word_count//2
-        return lex.msttr(segment_window=segment_window)
+#     elif metric == 'msttr':
+#         segment_window=25   # size of each segment
+#         if word_count == 1: segment_window = None
+#         elif word_count <= 25: segment_window = word_count//2
+#         return lex.msttr(segment_window=segment_window)
     
-    elif metric == 'mattr':
-        window_size=25  # Size of each sliding window
-        if word_count == 1: window_size = 1
-        elif word_count <= 25: window_size = word_count//2
-        return lex.mattr(window_size=window_size)
+#     elif metric == 'mattr':
+#         window_size=25  # Size of each sliding window
+#         if word_count == 1: window_size = 1
+#         elif word_count <= 25: window_size = word_count//2
+#         return lex.mattr(window_size=window_size)
     
-    elif metric == 'mtld':
-        return lex.mtld(threshold=0.72)
+#     elif metric == 'mtld':
+#         return lex.mtld(threshold=0.72)
     
-    elif metric == 'hdd':
-        draws=42
-        if word_count == 1: draws = 1
-        elif word_count <= 42: draws = word_count//2
-        return lex.hdd(draws=draws)
+#     elif metric == 'hdd':
+#         draws=42
+#         if word_count == 1: draws = 1
+#         elif word_count <= 42: draws = word_count//2
+#         return lex.hdd(draws=draws)
     
-    elif metric == 'vocd':
-        return lex.vocd(ntokens=50, # Maximum number for the token/word size in the random samplings
-                        within_sample=100, # Number of samples
-                        iterations=3) # Number of times to repeat steps 1 to 3 before averaging
+#     elif metric == 'vocd':
+#         return lex.vocd(ntokens=50, # Maximum number for the token/word size in the random samplings
+#                         within_sample=100, # Number of samples
+#                         iterations=3) # Number of times to repeat steps 1 to 3 before averaging
     
-    elif metric == 'herdan':
-        if word_count == 1: return None
-        return lex.Herdan
+#     elif metric == 'herdan':
+#         if word_count == 1: return None
+#         return lex.Herdan
     
-    elif metric == 'summer':
-        if word_count == 1: return None
-        return lex.Summer
+#     elif metric == 'summer':
+#         if word_count == 1: return None
+#         return lex.Summer
     
-    elif metric == 'dugast':
-        if term_count == word_count: return None
-        return lex.Dugast
+#     elif metric == 'dugast':
+#         if term_count == word_count: return None
+#         return lex.Dugast
     
-    elif metric == 'maas':
-        if word_count == 1: return None
-        return lex.Maas
+#     elif metric == 'maas':
+#         if word_count == 1: return None
+#         return lex.Maas
     
-    elif metric == 'yulek':
-        return lex.yulek
+#     elif metric == 'yulek':
+#         return lex.yulek
     
-    elif metric == 'yulei':
-        return lex.yulei
+#     elif metric == 'yulei':
+#         return lex.yulei
     
-    elif metric == 'herdanvm':
-        return lex.herdanvm
+#     elif metric == 'herdanvm':
+#         return lex.herdanvm
     
-    elif metric == 'simpsond':
-        return lex.simpsond
+#     elif metric == 'simpsond':
+#         return lex.simpsond
 
-def nlp_pipeline(text):
+# def nlp_pipeline(text):
     
-    # Lowering Text
-    text = text.lower()
+#     # Lowering Text
+#     text = text.lower()
 
-    # Handle Contractions
-    text = contractions.fix(text)
+#     # Handle Contractions
+#     text = contractions.fix(text)
 
-    # Remove Punctuation
-    text = text.translate(str.maketrans('', '', string.punctuation))
+#     # Remove Punctuation
+#     text = text.translate(str.maketrans('', '', string.punctuation))
 
-    # Remove Non-Alphanumeric Characters
-    text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
+#     # Remove Non-Alphanumeric Characters
+#     text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
 
-    # Lemmatization
-    text = word_tokenize(text)
-    text = [lemma.lemmatize(word) for word in text]
+#     # Lemmatization
+#     text = word_tokenize(text)
+#     text = [lemma.lemmatize(word) for word in text]
 
-    # Remove Stopwords                                                                                                                    
-    text = " ".join([word for word in text if not word in stopWord])
-    # print(text)
+#     # Remove Stopwords                                                                                                                    
+#     text = " ".join([word for word in text if not word in stopWord])
+#     # print(text)
 
-    return text
+#     return text
 
-def computer_lexical_metrics(predicted_captions, n):
-    # pre-process predicted captions
-    nlp_parsed_predicted_captions = []
-    for predicted_caption in predicted_captions:
-        nlp_parsed_predicted_captions.append(nlp_pipeline(predicted_caption))
+# def computer_lexical_metrics(predicted_captions, n):
+#     # pre-process predicted captions
+#     nlp_parsed_predicted_captions = []
+#     for predicted_caption in predicted_captions:
+#         nlp_parsed_predicted_captions.append(nlp_pipeline(predicted_caption))
 
-    # build metric reults
-    metric_results = {}
-    for metric in lexical_metrics:
-        for _, predicted_caption in enumerate(nlp_parsed_predicted_captions):
-            try:
-                computed_metric = get_lexical_metric(predicted_caption, metric)
-            except Exception as e:
-                # error_file.write(f"Metric: {metric}\n")
-                # error_file.write(f"Error occurred at index: {index}\n")
-                # error_file.write(f"Text: {predicted_caption}\n")
-                # error_file.write(f"Error: {e}\n\n")
-                computed_metric = e
-            # SHOULD I AGGREGATE SCORES PER PREDICTED CAPTION???
-            if metric_results[metric] == None:
-                metric_results[metric] = computed_metric
-            else:
-                metric_results[metric] += computed_metric
+#     # build metric reults
+#     metric_results = {}
+#     for metric in lexical_metrics:
+#         for _, predicted_caption in enumerate(nlp_parsed_predicted_captions):
+#             try:
+#                 computed_metric = get_lexical_metric(predicted_caption, metric)
+#             except Exception as e:
+#                 # error_file.write(f"Metric: {metric}\n")
+#                 # error_file.write(f"Error occurred at index: {index}\n")
+#                 # error_file.write(f"Text: {predicted_caption}\n")
+#                 # error_file.write(f"Error: {e}\n\n")
+#                 computed_metric = e
+#             # SHOULD I AGGREGATE SCORES PER PREDICTED CAPTION???
+#             if metric_results[metric] == None:
+#                 metric_results[metric] = computed_metric
+#             else:
+#                 metric_results[metric] += computed_metric
 
-        return metric_results
+#         return metric_results
