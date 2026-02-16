@@ -1,5 +1,0 @@
-deepspeed
-transformers
-torch
-torchvision
-tqdm

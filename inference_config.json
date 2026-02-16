@@ -1,6 +1,0 @@
-{
-    "tensor_parallel": {
-        "tp_size": 4
-    },
-    "replace_with_kernel_inject": false
-}
