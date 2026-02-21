@@ -65,7 +65,7 @@ parser.add_argument('-dhl', '--decoder_num_hidden_layers', type=int, default=12,
 parser.add_argument('-cl', '--context_length', type=int, default=1024, help="Decoder context length for input and ouptput. (default: 1024)")
 parser.add_argument('--hidden_size_encoder', type=int, default=768, help="Encoder hidden size (default: 768)")
 parser.add_argument('--attention_type_encoder', type=str, choices=['divided_space_time', 'space_only', 'joint_space_time'], default='divided_space_time', help="Encoder attention type")
-parser.add_argument('--partition_method', type=str, choices=['uniform', 'parameters', 'type:transformers'], default='uniform', help="Deepspeed pipeline parallel partition mehtod (default: uniform)")
+parser.add_argument('--partition_method', type=str, choices=['uniform', 'parameters', 'type:transformers'], default='parameters', help="Deepspeed pipeline parallel partition mehtod (default: uniform)")
 parser.add_argument('--image_size_encoder', type=int, default=224, help="Image size (default: 224)")
 parser.add_argument('--intermediate_size_encoder', type=int, default=3072, help="Encoder intermediate size (default: 3072)")
 parser.add_argument('--num_frames_encoder', type=int, default=8, help="Number of frames (default: 8)")
@@ -326,6 +326,8 @@ def main():
 
         metadata = metadata.to(device)
         labels   = labels.to(device)  # unused during eval
+        print(f"[DEBUG] shape of labels: {labels.shape}")
+        print(f"########################################################")
 
         for _ in range(max_len):
             dec_in = seq
@@ -335,7 +337,7 @@ def main():
                 dec_in = dec_in[:, -ctx_len:]
 
             batch_iter = iter(RepeatingLoader([((pixel_values, dec_in, metadata), labels)]))
-            _, logits = engine.eval_batch(batch_iter, return_logits=True, compute_loss=True, bcast_loss=True)
+            _, logits = engine.eval_batch(batch_iter, return_logits=True, compute_loss=True, bcast_loss=False)
 
             if is_last:
                 cur_len = seq.size(1)                     # real length BEFORE padding

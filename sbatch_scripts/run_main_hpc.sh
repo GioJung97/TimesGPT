@@ -1,31 +1,9 @@
-#!/bin/bash 
+#!/bin/bash
 
-#SBATCH -N 1
-#SBATCH -p GPU
-#SBATCH -t 00:45:00
-#SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:h100-80:8
-#SBATCH --cpus-per-task=10
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=jbarajas
-#SBATCH --output=/ocean/projects/cis240146p/shared/jbarajas/nairr/sbatch_scripts/slurm_output/%j.out
-#SBATCH --job-name ref_run_2nodes_16gpus_100p
-#SBATCH --reservation=GPUcis240146p
-#SBATCH --nodelist=w002
-
-# Show commands
-# set -x
-
-# Setup conda env and change to correct director
-module load AI/pytorch_23.02-1.13.1-py3
-module load cuda/11.7.1
-conda activate /ocean/projects/cis240146p/shared/jbarajas/conda/envs/psc-h100
-cd /ocean/projects/cis240146p/shared/jbarajas/nairr # home dir on ocean/
-
-###########################
+# ref_run_h100_2nodes_16gpus_100p
 
 NUM_GPU=8    # Number of GPUs per node
-NUM_NODES=1   # Number of nodes
+NUM_NODES=2   # Number of nodes
 # MICRO_BATCH=1 # PER GPU
 
 ZERO_STAGE=1
@@ -38,16 +16,18 @@ SUBSET_SIZE=1.0
 ENCODER_NUM_HIDDEN_LAYERS=12 # 
 DECODER_NUM_HIDDEN_LAYERS=24 # 12x768, 25x1600, 40x1600, 80x1600, 160x1600
 
-ENCODER_NUM_HEADS=12
-DECODER_NUM_HEADS=24
+ENCODER_NUM_HEADS=24
+DECODER_NUM_HEADS=12
 
 HIDDEN_SIZE_ENCODER=768
 HIDDEN_SIZE_DECODER=768
-GRADIENT_ACCUMULATION_STEPS=50
+GRADIENT_ACCUMULATION_STEPS=5
 
 EXPERIMENT_NAME="VATEX-psc-H100-run"
-DATA_DIR="/ocean/projects/cis240146p/shared/data/VATEX_8_frames"
-OUTPUT_DIR="/ocean/projects/cis240146p/shared/jbarajas/training_artifacts"
+# DATA_DIR="/ocean/projects/cis240146p/shared/data/VATEX_8_frames"
+# OUTPUT_DIR="/ocean/projects/cis240146p/shared/jbarajas/training_artifacts"
+DATA_DIR="/data2/juve/dataset/vatex/npz_datasets/VATEX_8_frames"
+OUTPUT_DOR="/data2/gio/timesgpt_test"
 
 WORLD_SIZE=$((NUM_NODES * NUM_GPU))
 # BATCH_SIZE=$((WORLD_SIZE * MICRO_BATCH)) # Total batch size acrross all GPUs and nodes
